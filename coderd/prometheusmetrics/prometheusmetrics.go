@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/xerrors"
 	"tailscale.com/tailcfg"
 
 	"cdr.dev/slog"
@@ -22,12 +23,13 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/tailnet"
+	"github.com/coder/quartz"
 )
 
 const defaultRefreshRate = time.Minute
 
 // ActiveUsers tracks the number of users that have authenticated within the past hour.
-func ActiveUsers(ctx context.Context, registerer prometheus.Registerer, db database.Store, duration time.Duration) (func(), error) {
+func ActiveUsers(ctx context.Context, logger slog.Logger, registerer prometheus.Registerer, db database.Store, duration time.Duration) (func(), error) {
 	if duration == 0 {
 		duration = defaultRefreshRate
 	}
@@ -58,6 +60,7 @@ func ActiveUsers(ctx context.Context, registerer prometheus.Registerer, db datab
 
 			apiKeys, err := db.GetAPIKeysLastUsedAfter(ctx, dbtime.Now().Add(-1*time.Hour))
 			if err != nil {
+				logger.Error(ctx, "get api keys for active users prometheus metric", slog.Error(err))
 				continue
 			}
 			distinctUsers := map[uuid.UUID]struct{}{}
@@ -73,16 +76,80 @@ func ActiveUsers(ctx context.Context, registerer prometheus.Registerer, db datab
 	}, nil
 }
 
+// Users tracks the total number of registered users, partitioned by status.
+func Users(ctx context.Context, logger slog.Logger, clk quartz.Clock, registerer prometheus.Registerer, db database.Store, duration time.Duration) (func(), error) {
+	if duration == 0 {
+		// It's not super important this tracks real-time.
+		duration = defaultRefreshRate * 5
+	}
+
+	gauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "coderd",
+		Subsystem: "api",
+		Name:      "total_user_count",
+		Help:      "The total number of registered users, partitioned by status.",
+	}, []string{"status"})
+	err := registerer.Register(gauge)
+	if err != nil {
+		return nil, xerrors.Errorf("register total_user_count gauge: %w", err)
+	}
+
+	ctx, cancelFunc := context.WithCancel(ctx)
+	done := make(chan struct{})
+	ticker := clk.NewTicker(duration)
+	go func() {
+		defer close(done)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			gauge.Reset()
+			//nolint:gocritic // This is a system service that needs full access
+			//to the users table.
+			users, err := db.GetUsers(dbauthz.AsSystemRestricted(ctx), database.GetUsersParams{})
+			if err != nil {
+				logger.Error(ctx, "get all users for prometheus metrics", slog.Error(err))
+				continue
+			}
+
+			for _, user := range users {
+				gauge.WithLabelValues(string(user.Status)).Inc()
+			}
+		}
+	}()
+	return func() {
+		cancelFunc()
+		<-done
+	}, nil
+}
+
 // Workspaces tracks the total number of workspaces with labels on status.
 func Workspaces(ctx context.Context, logger slog.Logger, registerer prometheus.Registerer, db database.Store, duration time.Duration) (func(), error) {
 	if duration == 0 {
 		duration = defaultRefreshRate
 	}
 
-	workspaceLatestBuildTotals := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	// TODO: deprecated: remove in the future
+	// See: https://github.com/coder/coder/issues/12999
+	// Deprecation reason: gauge metrics should avoid suffix `_total``
+	workspaceLatestBuildTotalsDeprecated := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "coderd",
 		Subsystem: "api",
 		Name:      "workspace_latest_build_total",
+		Help:      "DEPRECATED: use coderd_api_workspace_latest_build instead",
+	}, []string{"status"})
+	if err := registerer.Register(workspaceLatestBuildTotalsDeprecated); err != nil {
+		return nil, err
+	}
+
+	workspaceLatestBuildTotals := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "coderd",
+		Subsystem: "api",
+		Name:      "workspace_latest_build",
 		Help:      "The current number of workspace builds by status.",
 	}, []string{"status"})
 	if err := registerer.Register(workspaceLatestBuildTotals); err != nil {
@@ -107,9 +174,9 @@ func Workspaces(ctx context.Context, logger slog.Logger, registerer prometheus.R
 			if errors.Is(err, sql.ErrNoRows) {
 				// clear all series if there are no database entries
 				workspaceLatestBuildTotals.Reset()
+			} else {
+				logger.Warn(ctx, "failed to load latest workspace builds", slog.Error(err))
 			}
-
-			logger.Warn(ctx, "failed to load latest workspace builds", slog.Error(err))
 			return
 		}
 		jobIDs := make([]uuid.UUID, 0, len(builds))
@@ -131,6 +198,8 @@ func Workspaces(ctx context.Context, logger slog.Logger, registerer prometheus.R
 		for _, job := range jobs {
 			status := codersdk.ProvisionerJobStatus(job.JobStatus)
 			workspaceLatestBuildTotals.WithLabelValues(string(status)).Add(1)
+			// TODO: deprecated: remove in the future
+			workspaceLatestBuildTotalsDeprecated.WithLabelValues(string(status)).Add(1)
 		}
 	}
 
@@ -151,7 +220,7 @@ func Workspaces(ctx context.Context, logger slog.Logger, registerer prometheus.R
 
 		workspaceLatestBuildStatuses.Reset()
 		for _, w := range ws {
-			workspaceLatestBuildStatuses.WithLabelValues(string(w.LatestBuildStatus), w.TemplateName, w.TemplateVersionName.String, w.Username, string(w.LatestBuildTransition)).Add(1)
+			workspaceLatestBuildStatuses.WithLabelValues(string(w.LatestBuildStatus), w.TemplateName, w.TemplateVersionName.String, w.OwnerUsername, string(w.LatestBuildTransition)).Add(1)
 		}
 	}
 
@@ -373,7 +442,8 @@ func Agents(ctx context.Context, logger slog.Logger, registerer prometheus.Regis
 	}, nil
 }
 
-func AgentStats(ctx context.Context, logger slog.Logger, registerer prometheus.Registerer, db database.Store, initialCreateAfter time.Time, duration time.Duration, aggregateByLabels []string) (func(), error) {
+// nolint:revive // This will be removed alongside the workspaceusage experiment
+func AgentStats(ctx context.Context, logger slog.Logger, registerer prometheus.Registerer, db database.Store, initialCreateAfter time.Time, duration time.Duration, aggregateByLabels []string, usage bool) (func(), error) {
 	if duration == 0 {
 		duration = defaultRefreshRate
 	}
@@ -505,7 +575,20 @@ func AgentStats(ctx context.Context, logger slog.Logger, registerer prometheus.R
 			timer := prometheus.NewTimer(metricsCollectorAgentStats)
 
 			checkpoint := time.Now()
-			stats, err := db.GetWorkspaceAgentStatsAndLabels(ctx, createdAfter)
+			var (
+				stats []database.GetWorkspaceAgentStatsAndLabelsRow
+				err   error
+			)
+			if usage {
+				var agentUsageStats []database.GetWorkspaceAgentUsageStatsAndLabelsRow
+				agentUsageStats, err = db.GetWorkspaceAgentUsageStatsAndLabels(ctx, createdAfter)
+				stats = make([]database.GetWorkspaceAgentStatsAndLabelsRow, 0, len(agentUsageStats))
+				for _, agentUsageStat := range agentUsageStats {
+					stats = append(stats, database.GetWorkspaceAgentStatsAndLabelsRow(agentUsageStat))
+				}
+			} else {
+				stats, err = db.GetWorkspaceAgentStatsAndLabels(ctx, createdAfter)
+			}
 			if err != nil {
 				logger.Error(ctx, "can't get agent stats", slog.Error(err))
 			} else {

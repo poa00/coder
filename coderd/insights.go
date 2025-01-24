@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coder/coder/v2/coderd/database/dbtime"
+
 	"github.com/google/uuid"
 	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
@@ -17,6 +19,7 @@ import (
 	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/httpapi"
 	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/policy"
 	"github.com/coder/coder/v2/coderd/util/slice"
 	"github.com/coder/coder/v2/codersdk"
 )
@@ -29,10 +32,11 @@ const insightsTimeLayout = time.RFC3339
 // @Security CoderSessionToken
 // @Produce json
 // @Tags Insights
+// @Param tz_offset query int true "Time-zone offset (e.g. -2)"
 // @Success 200 {object} codersdk.DAUsResponse
 // @Router /insights/daus [get]
 func (api *API) deploymentDAUs(rw http.ResponseWriter, r *http.Request) {
-	if !api.Authorize(r, rbac.ActionRead, rbac.ResourceDeploymentValues) {
+	if !api.Authorize(r, policy.ActionRead, rbac.ResourceDeploymentConfig) {
 		httpapi.Forbidden(rw)
 		return
 	}
@@ -87,7 +91,7 @@ func (api *API) returnDAUsInternal(rw http.ResponseWriter, r *http.Request, temp
 	}
 	for _, row := range rows {
 		resp.Entries = append(resp.Entries, codersdk.DAUEntry{
-			Date:   row.StartTime.Format(time.DateOnly),
+			Date:   row.StartTime.In(loc).Format(time.DateOnly),
 			Amount: int(row.ActiveUsers),
 		})
 	}
@@ -99,8 +103,9 @@ func (api *API) returnDAUsInternal(rw http.ResponseWriter, r *http.Request, temp
 // @Security CoderSessionToken
 // @Produce json
 // @Tags Insights
-// @Param before query int true "Start time"
-// @Param after query int true "End time"
+// @Param start_time query string true "Start time" format(date-time)
+// @Param end_time query string true "End time" format(date-time)
+// @Param template_ids query []string false "Template IDs" collectionFormat(csv)
 // @Success 200 {object} codersdk.UserActivityInsightsResponse
 // @Router /insights/user-activity [get]
 func (api *API) insightsUserActivity(rw http.ResponseWriter, r *http.Request) {
@@ -201,8 +206,9 @@ func (api *API) insightsUserActivity(rw http.ResponseWriter, r *http.Request) {
 // @Security CoderSessionToken
 // @Produce json
 // @Tags Insights
-// @Param before query int true "Start time"
-// @Param after query int true "End time"
+// @Param start_time query string true "Start time" format(date-time)
+// @Param end_time query string true "End time" format(date-time)
+// @Param template_ids query []string false "Template IDs" collectionFormat(csv)
 // @Success 200 {object} codersdk.UserLatencyInsightsResponse
 // @Router /insights/user-latency [get]
 func (api *API) insightsUserLatency(rw http.ResponseWriter, r *http.Request) {
@@ -288,13 +294,76 @@ func (api *API) insightsUserLatency(rw http.ResponseWriter, r *http.Request) {
 	httpapi.Write(ctx, rw, http.StatusOK, resp)
 }
 
+// @Summary Get insights about user status counts
+// @ID get-insights-about-user-status-counts
+// @Security CoderSessionToken
+// @Produce json
+// @Tags Insights
+// @Param tz_offset query int true "Time-zone offset (e.g. -2)"
+// @Success 200 {object} codersdk.GetUserStatusCountsResponse
+// @Router /insights/user-status-counts [get]
+func (api *API) insightsUserStatusCounts(rw http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	p := httpapi.NewQueryParamParser()
+	vals := r.URL.Query()
+	tzOffset := p.Int(vals, 0, "tz_offset")
+	interval := p.Int(vals, int((24 * time.Hour).Seconds()), "interval")
+	p.ErrorExcessParams(vals)
+
+	if len(p.Errors) > 0 {
+		httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
+			Message:     "Query parameters have invalid values.",
+			Validations: p.Errors,
+		})
+		return
+	}
+
+	loc := time.FixedZone("", tzOffset*3600)
+	nextHourInLoc := dbtime.Now().Truncate(time.Hour).Add(time.Hour).In(loc)
+	sixtyDaysAgo := dbtime.StartOfDay(nextHourInLoc).AddDate(0, 0, -60)
+
+	rows, err := api.Database.GetUserStatusCounts(ctx, database.GetUserStatusCountsParams{
+		StartTime: sixtyDaysAgo,
+		EndTime:   nextHourInLoc,
+		Interval:  int32(interval),
+	})
+	if err != nil {
+		if httpapi.IsUnauthorizedError(err) {
+			httpapi.Forbidden(rw)
+			return
+		}
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error fetching user status counts over time.",
+			Detail:  err.Error(),
+		})
+		return
+	}
+
+	resp := codersdk.GetUserStatusCountsResponse{
+		StatusCounts: make(map[codersdk.UserStatus][]codersdk.UserStatusChangeCount),
+	}
+
+	for _, row := range rows {
+		status := codersdk.UserStatus(row.Status)
+		resp.StatusCounts[status] = append(resp.StatusCounts[status], codersdk.UserStatusChangeCount{
+			Date:  row.Date,
+			Count: row.Count,
+		})
+	}
+
+	httpapi.Write(ctx, rw, http.StatusOK, resp)
+}
+
 // @Summary Get insights about templates
 // @ID get-insights-about-templates
 // @Security CoderSessionToken
 // @Produce json
 // @Tags Insights
-// @Param before query int true "Start time"
-// @Param after query int true "End time"
+// @Param start_time query string true "Start time" format(date-time)
+// @Param end_time query string true "End time" format(date-time)
+// @Param interval query string true "Interval" enums(week,day)
+// @Param template_ids query []string false "Template IDs" collectionFormat(csv)
 // @Success 200 {object} codersdk.TemplateInsightsResponse
 // @Router /insights/templates [get]
 func (api *API) insightsTemplates(rw http.ResponseWriter, r *http.Request) {
@@ -542,6 +611,7 @@ func convertTemplateInsightsApps(usage database.GetTemplateInsightsRow, appUsage
 			Slug:        app.Slug,
 			Icon:        app.Icon,
 			Seconds:     app.UsageSeconds,
+			TimesUsed:   app.TimesUsed,
 		})
 	}
 

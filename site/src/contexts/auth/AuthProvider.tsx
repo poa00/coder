@@ -1,142 +1,136 @@
-import {
-  createContext,
-  type FC,
-  type PropsWithChildren,
-  useCallback,
-  useContext,
-} from "react";
-import { useMutation, useQuery, useQueryClient } from "react-query";
 import { isApiError } from "api/errors";
 import { checkAuthorization } from "api/queries/authCheck";
 import {
-  authMethods,
-  hasFirstUser,
-  login,
-  logout,
-  me,
-  updateProfile as updateProfileOptions,
+	hasFirstUser,
+	login,
+	logout,
+	me,
+	updateProfile as updateProfileOptions,
 } from "api/queries/users";
-import type {
-  AuthMethods,
-  UpdateUserProfileRequest,
-  User,
-} from "api/typesGenerated";
+import type { UpdateUserProfileRequest, User } from "api/typesGenerated";
 import { displaySuccess } from "components/GlobalSnackbar/utils";
-import { permissionsToCheck, type Permissions } from "./permissions";
+import { useEmbeddedMetadata } from "hooks/useEmbeddedMetadata";
+import {
+	type FC,
+	type PropsWithChildren,
+	createContext,
+	useCallback,
+	useContext,
+} from "react";
+import { useMutation, useQuery, useQueryClient } from "react-query";
+import { type Permissions, permissionsToCheck } from "./permissions";
 
 export type AuthContextValue = {
-  isLoading: boolean;
-  isSignedOut: boolean;
-  isSigningOut: boolean;
-  isConfiguringTheFirstUser: boolean;
-  isSignedIn: boolean;
-  isSigningIn: boolean;
-  isUpdatingProfile: boolean;
-  user: User | undefined;
-  permissions: Permissions | undefined;
-  authMethods: AuthMethods | undefined;
-  organizationId: string | undefined;
-  signInError: unknown;
-  updateProfileError: unknown;
-  signOut: () => void;
-  signIn: (email: string, password: string) => Promise<void>;
-  updateProfile: (data: UpdateUserProfileRequest) => void;
+	isLoading: boolean;
+	isSignedOut: boolean;
+	isSigningOut: boolean;
+	isConfiguringTheFirstUser: boolean;
+	isSignedIn: boolean;
+	isSigningIn: boolean;
+	isUpdatingProfile: boolean;
+	user: User | undefined;
+	permissions: Permissions | undefined;
+	signInError: unknown;
+	updateProfileError: unknown;
+	signOut: () => void;
+	signIn: (email: string, password: string) => Promise<void>;
+	updateProfile: (data: UpdateUserProfileRequest) => void;
 };
 
 export const AuthContext = createContext<AuthContextValue | undefined>(
-  undefined,
+	undefined,
 );
 
 export const AuthProvider: FC<PropsWithChildren> = ({ children }) => {
-  const queryClient = useQueryClient();
-  const meOptions = me();
-  const userQuery = useQuery(meOptions);
-  const authMethodsQuery = useQuery(authMethods());
-  const hasFirstUserQuery = useQuery(hasFirstUser());
-  const permissionsQuery = useQuery({
-    ...checkAuthorization({ checks: permissionsToCheck }),
-    enabled: userQuery.data !== undefined,
-  });
+	const { metadata } = useEmbeddedMetadata();
+	const userMetadataState = metadata.user;
 
-  const loginMutation = useMutation(
-    login({ checks: permissionsToCheck }, queryClient),
-  );
-  const logoutMutation = useMutation(logout(queryClient));
-  const updateProfileMutation = useMutation({
-    ...updateProfileOptions("me"),
+	const meOptions = me(userMetadataState);
+	const userQuery = useQuery(meOptions);
+	const hasFirstUserQuery = useQuery(hasFirstUser(userMetadataState));
 
-    onSuccess: (user) => {
-      queryClient.setQueryData(meOptions.queryKey, user);
-      displaySuccess("Updated settings.");
-    },
-  });
+	const permissionsQuery = useQuery({
+		...checkAuthorization({ checks: permissionsToCheck }),
+		enabled: userQuery.data !== undefined,
+	});
 
-  const isSignedOut =
-    userQuery.isError &&
-    isApiError(userQuery.error) &&
-    userQuery.error.response.status === 401;
-  const isSigningOut = logoutMutation.isLoading;
-  const isLoading =
-    authMethodsQuery.isLoading ||
-    userQuery.isLoading ||
-    hasFirstUserQuery.isLoading ||
-    (userQuery.isSuccess && permissionsQuery.isLoading);
-  const isConfiguringTheFirstUser =
-    !hasFirstUserQuery.isLoading && !hasFirstUserQuery.data;
-  const isSignedIn = userQuery.isSuccess && userQuery.data !== undefined;
-  const isSigningIn = loginMutation.isLoading;
-  const isUpdatingProfile = updateProfileMutation.isLoading;
+	const queryClient = useQueryClient();
+	const loginMutation = useMutation(
+		login({ checks: permissionsToCheck }, queryClient),
+	);
 
-  const signOut = useCallback(() => {
-    logoutMutation.mutate();
-  }, [logoutMutation]);
+	const logoutMutation = useMutation(logout(queryClient));
+	const updateProfileMutation = useMutation({
+		...updateProfileOptions("me"),
+		onSuccess: (user) => {
+			queryClient.setQueryData(meOptions.queryKey, user);
+			displaySuccess("Updated settings.");
+		},
+	});
 
-  const signIn = useCallback(
-    async (email: string, password: string) => {
-      await loginMutation.mutateAsync({ email, password });
-    },
-    [loginMutation],
-  );
+	const isSignedOut =
+		userQuery.isError &&
+		isApiError(userQuery.error) &&
+		userQuery.error.response.status === 401;
+	const isSigningOut = logoutMutation.isLoading;
+	const isLoading =
+		userQuery.isLoading ||
+		hasFirstUserQuery.isLoading ||
+		(userQuery.isSuccess && permissionsQuery.isLoading);
+	const isConfiguringTheFirstUser =
+		!hasFirstUserQuery.isLoading && !hasFirstUserQuery.data;
+	const isSignedIn = userQuery.isSuccess && userQuery.data !== undefined;
+	const isSigningIn = loginMutation.isLoading;
+	const isUpdatingProfile = updateProfileMutation.isLoading;
 
-  const updateProfile = useCallback(
-    (req: UpdateUserProfileRequest) => {
-      updateProfileMutation.mutate(req);
-    },
-    [updateProfileMutation],
-  );
+	const signOut = useCallback(() => {
+		logoutMutation.mutate();
+	}, [logoutMutation]);
 
-  return (
-    <AuthContext.Provider
-      value={{
-        isLoading,
-        isSignedOut,
-        isSigningOut,
-        isConfiguringTheFirstUser,
-        isSignedIn,
-        isSigningIn,
-        isUpdatingProfile,
-        signOut,
-        signIn,
-        updateProfile,
-        user: userQuery.data,
-        permissions: permissionsQuery.data as Permissions | undefined,
-        authMethods: authMethodsQuery.data,
-        signInError: loginMutation.error,
-        updateProfileError: updateProfileMutation.error,
-        organizationId: userQuery.data?.organization_ids[0],
-      }}
-    >
-      {children}
-    </AuthContext.Provider>
-  );
+	const signIn = useCallback(
+		async (email: string, password: string) => {
+			await loginMutation.mutateAsync({ email, password });
+		},
+		[loginMutation],
+	);
+
+	const updateProfile = useCallback(
+		(req: UpdateUserProfileRequest) => {
+			updateProfileMutation.mutate(req);
+		},
+		[updateProfileMutation],
+	);
+
+	return (
+		<AuthContext.Provider
+			value={{
+				isLoading,
+				isSignedOut,
+				isSigningOut,
+				isConfiguringTheFirstUser,
+				isSignedIn,
+				isSigningIn,
+				isUpdatingProfile,
+				signOut,
+				signIn,
+				updateProfile,
+				user: userQuery.data,
+				permissions: permissionsQuery.data as Permissions | undefined,
+				signInError: loginMutation.error,
+				updateProfileError: updateProfileMutation.error,
+			}}
+		>
+			{children}
+		</AuthContext.Provider>
+	);
 };
 
 export const useAuthContext = () => {
-  const context = useContext(AuthContext);
+	const context = useContext(AuthContext);
 
-  if (!context) {
-    throw new Error("useAuth should be used inside of <AuthProvider />");
-  }
+	if (!context) {
+		throw new Error("useAuth should be used inside of <AuthProvider />");
+	}
 
-  return context;
+	return context;
 };

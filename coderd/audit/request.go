@@ -16,9 +16,11 @@ import (
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
+
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/httpmw"
+	"github.com/coder/coder/v2/coderd/idpsync"
 	"github.com/coder/coder/v2/coderd/tracing"
 )
 
@@ -31,7 +33,7 @@ type RequestParams struct {
 	OrganizationID   uuid.UUID
 	Request          *http.Request
 	Action           database.AuditAction
-	AdditionalFields json.RawMessage
+	AdditionalFields interface{}
 }
 
 type Request[T Auditable] struct {
@@ -51,16 +53,23 @@ type Request[T Auditable] struct {
 	Action database.AuditAction
 }
 
+// UpdateOrganizationID can be used if the organization ID is not known
+// at the initiation of an audit log request.
+func (r *Request[T]) UpdateOrganizationID(id uuid.UUID) {
+	r.params.OrganizationID = id
+}
+
 type BackgroundAuditParams[T Auditable] struct {
 	Audit Auditor
 	Log   slog.Logger
 
-	UserID           uuid.UUID
-	RequestID        uuid.UUID
-	Status           int
-	Action           database.AuditAction
-	OrganizationID   uuid.UUID
-	IP               string
+	UserID         uuid.UUID
+	RequestID      uuid.UUID
+	Status         int
+	Action         database.AuditAction
+	OrganizationID uuid.UUID
+	IP             string
+	// todo: this should automatically marshal an interface{} instead of accepting a raw message.
 	AdditionalFields json.RawMessage
 
 	New T
@@ -75,7 +84,7 @@ func ResourceTarget[T Auditable](tgt T) string {
 		return typed.Name
 	case database.User:
 		return typed.Username
-	case database.Workspace:
+	case database.WorkspaceTable:
 		return typed.Name
 	case database.WorkspaceBuild:
 		// this isn't used
@@ -99,14 +108,35 @@ func ResourceTarget[T Auditable](tgt T) string {
 		return string(typed.ToLoginType)
 	case database.HealthSettings:
 		return "" // no target?
+	case database.NotificationsSettings:
+		return "" // no target?
 	case database.OAuth2ProviderApp:
 		return typed.Name
 	case database.OAuth2ProviderAppSecret:
 		return typed.DisplaySecret
+	case database.CustomRole:
+		return typed.Name
+	case database.AuditableOrganizationMember:
+		return typed.Username
+	case database.Organization:
+		return typed.Name
+	case database.NotificationTemplate:
+		return typed.Name
+	case idpsync.OrganizationSyncSettings:
+		return "Organization Sync"
+	case idpsync.GroupSyncSettings:
+		return "Organization Group Sync"
+	case idpsync.RoleSyncSettings:
+		return "Organization Role Sync"
 	default:
 		panic(fmt.Sprintf("unknown resource %T for ResourceTarget", tgt))
 	}
 }
+
+// noID can be used for resources that do not have an uuid.
+// An example is singleton configuration resources.
+// 51A51C = "Static"
+var noID = uuid.MustParse("51A51C00-0000-0000-0000-000000000000")
 
 func ResourceID[T Auditable](tgt T) uuid.UUID {
 	switch typed := any(tgt).(type) {
@@ -116,7 +146,7 @@ func ResourceID[T Auditable](tgt T) uuid.UUID {
 		return typed.ID
 	case database.User:
 		return typed.ID
-	case database.Workspace:
+	case database.WorkspaceTable:
 		return typed.ID
 	case database.WorkspaceBuild:
 		return typed.ID
@@ -136,10 +166,27 @@ func ResourceID[T Auditable](tgt T) uuid.UUID {
 	case database.HealthSettings:
 		// Artificial ID for auditing purposes
 		return typed.ID
+	case database.NotificationsSettings:
+		// Artificial ID for auditing purposes
+		return typed.ID
 	case database.OAuth2ProviderApp:
 		return typed.ID
 	case database.OAuth2ProviderAppSecret:
 		return typed.ID
+	case database.CustomRole:
+		return typed.ID
+	case database.AuditableOrganizationMember:
+		return typed.UserID
+	case database.Organization:
+		return typed.ID
+	case database.NotificationTemplate:
+		return typed.ID
+	case idpsync.OrganizationSyncSettings:
+		return noID // Deployment all uses the same org sync settings
+	case idpsync.GroupSyncSettings:
+		return noID // Org field on audit log has org id
+	case idpsync.RoleSyncSettings:
+		return noID // Org field on audit log has org id
 	default:
 		panic(fmt.Sprintf("unknown resource %T for ResourceID", tgt))
 	}
@@ -153,7 +200,7 @@ func ResourceType[T Auditable](tgt T) database.ResourceType {
 		return database.ResourceTypeTemplateVersion
 	case database.User:
 		return database.ResourceTypeUser
-	case database.Workspace:
+	case database.WorkspaceTable:
 		return database.ResourceTypeWorkspace
 	case database.WorkspaceBuild:
 		return database.ResourceTypeWorkspaceBuild
@@ -171,10 +218,26 @@ func ResourceType[T Auditable](tgt T) database.ResourceType {
 		return database.ResourceTypeConvertLogin
 	case database.HealthSettings:
 		return database.ResourceTypeHealthSettings
+	case database.NotificationsSettings:
+		return database.ResourceTypeNotificationsSettings
 	case database.OAuth2ProviderApp:
 		return database.ResourceTypeOauth2ProviderApp
 	case database.OAuth2ProviderAppSecret:
 		return database.ResourceTypeOauth2ProviderAppSecret
+	case database.CustomRole:
+		return database.ResourceTypeCustomRole
+	case database.AuditableOrganizationMember:
+		return database.ResourceTypeOrganizationMember
+	case database.Organization:
+		return database.ResourceTypeOrganization
+	case database.NotificationTemplate:
+		return database.ResourceTypeNotificationTemplate
+	case idpsync.OrganizationSyncSettings:
+		return database.ResourceTypeIdpSyncSettingsOrganization
+	case idpsync.RoleSyncSettings:
+		return database.ResourceTypeIdpSyncSettingsRole
+	case idpsync.GroupSyncSettings:
+		return database.ResourceTypeIdpSyncSettingsGroup
 	default:
 		panic(fmt.Sprintf("unknown resource %T for ResourceType", typed))
 	}
@@ -187,7 +250,7 @@ func ResourceRequiresOrgID[T Auditable]() bool {
 	switch any(tgt).(type) {
 	case database.Template, database.TemplateVersion:
 		return true
-	case database.Workspace, database.WorkspaceBuild:
+	case database.WorkspaceTable, database.WorkspaceBuild:
 		return true
 	case database.AuditableGroup:
 		return true
@@ -207,10 +270,27 @@ func ResourceRequiresOrgID[T Auditable]() bool {
 	case database.HealthSettings:
 		// Artificial ID for auditing purposes
 		return false
+	case database.NotificationsSettings:
+		// Artificial ID for auditing purposes
+		return false
 	case database.OAuth2ProviderApp:
 		return false
 	case database.OAuth2ProviderAppSecret:
 		return false
+	case database.CustomRole:
+		return true
+	case database.AuditableOrganizationMember:
+		return true
+	case database.Organization:
+		return true
+	case database.NotificationTemplate:
+		return false
+	case idpsync.OrganizationSyncSettings:
+		return false
+	case idpsync.GroupSyncSettings:
+		return true
+	case idpsync.RoleSyncSettings:
+		return true
 	default:
 		panic(fmt.Sprintf("unknown resource %T for ResourceRequiresOrgID", tgt))
 	}
@@ -231,6 +311,26 @@ func requireOrgID[T Auditable](ctx context.Context, id uuid.UUID, log slog.Logge
 		)
 	}
 	return id
+}
+
+// InitRequestWithCancel returns a commit function with a boolean arg.
+// If the arg is false, future calls to commit() will not create an audit log
+// entry.
+func InitRequestWithCancel[T Auditable](w http.ResponseWriter, p *RequestParams) (*Request[T], func(commit bool)) {
+	req, commitF := InitRequest[T](w, p)
+	canceled := false
+	return req, func(commit bool) {
+		// Once 'commit=false' is called, block
+		// any future commit attempts.
+		if !commit {
+			canceled = true
+			return
+		}
+		// If it was ever canceled, block any commits
+		if !canceled {
+			commitF()
+		}
+	}
 }
 
 // InitRequest initializes an audit log for a request. It returns a function
@@ -275,8 +375,15 @@ func InitRequest[T Auditable](w http.ResponseWriter, p *RequestParams) (*Request
 			}
 		}
 
-		if p.AdditionalFields == nil {
-			p.AdditionalFields = json.RawMessage("{}")
+		additionalFieldsRaw := json.RawMessage("{}")
+
+		if p.AdditionalFields != nil {
+			data, err := json.Marshal(p.AdditionalFields)
+			if err != nil {
+				p.Log.Warn(logCtx, "marshal additional fields", slog.Error(err))
+			} else {
+				additionalFieldsRaw = json.RawMessage(data)
+			}
 		}
 
 		var userID uuid.UUID
@@ -311,7 +418,7 @@ func InitRequest[T Auditable](w http.ResponseWriter, p *RequestParams) (*Request
 			Diff:             diffRaw,
 			StatusCode:       int32(sw.Status),
 			RequestID:        httpmw.RequestID(p.Request),
-			AdditionalFields: p.AdditionalFields,
+			AdditionalFields: additionalFieldsRaw,
 			OrganizationID:   requireOrgID[T](logCtx, p.OrganizationID, p.Log),
 		}
 		err := p.Audit.Export(ctx, auditLog)

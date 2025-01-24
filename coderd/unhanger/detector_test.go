@@ -9,21 +9,26 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 
-	"cdr.dev/slog/sloggers/slogtest"
+	"cdr.dev/slog"
+	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbgen"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
+	"github.com/coder/coder/v2/coderd/provisionerdserver"
+	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/unhanger"
 	"github.com/coder/coder/v2/provisionersdk"
 	"github.com/coder/coder/v2/testutil"
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m, testutil.GoleakOptions...)
 }
 
 func TestDetectorNoJobs(t *testing.T) {
@@ -32,12 +37,12 @@ func TestDetectorNoJobs(t *testing.T) {
 	var (
 		ctx        = testutil.Context(t, testutil.WaitLong)
 		db, pubsub = dbtestutil.NewDB(t)
-		log        = slogtest.Make(t, nil)
+		log        = testutil.Logger(t)
 		tickCh     = make(chan time.Time)
 		statsCh    = make(chan unhanger.Stats)
 	)
 
-	detector := unhanger.New(ctx, db, pubsub, log, tickCh).WithStatsChannel(statsCh)
+	detector := unhanger.New(ctx, wrapDBAuthz(db, log), pubsub, log, tickCh).WithStatsChannel(statsCh)
 	detector.Start()
 	tickCh <- time.Now()
 
@@ -55,7 +60,7 @@ func TestDetectorNoHungJobs(t *testing.T) {
 	var (
 		ctx        = testutil.Context(t, testutil.WaitLong)
 		db, pubsub = dbtestutil.NewDB(t)
-		log        = slogtest.Make(t, nil)
+		log        = testutil.Logger(t)
 		tickCh     = make(chan time.Time)
 		statsCh    = make(chan unhanger.Stats)
 	)
@@ -84,7 +89,7 @@ func TestDetectorNoHungJobs(t *testing.T) {
 		})
 	}
 
-	detector := unhanger.New(ctx, db, pubsub, log, tickCh).WithStatsChannel(statsCh)
+	detector := unhanger.New(ctx, wrapDBAuthz(db, log), pubsub, log, tickCh).WithStatsChannel(statsCh)
 	detector.Start()
 	tickCh <- now
 
@@ -102,7 +107,7 @@ func TestDetectorHungWorkspaceBuild(t *testing.T) {
 	var (
 		ctx        = testutil.Context(t, testutil.WaitLong)
 		db, pubsub = dbtestutil.NewDB(t)
-		log        = slogtest.Make(t, nil)
+		log        = testutil.Logger(t)
 		tickCh     = make(chan time.Time)
 		statsCh    = make(chan unhanger.Stats)
 	)
@@ -127,7 +132,7 @@ func TestDetectorHungWorkspaceBuild(t *testing.T) {
 			},
 			CreatedBy: user.ID,
 		})
-		workspace = dbgen.Workspace(t, db, database.Workspace{
+		workspace = dbgen.Workspace(t, db, database.WorkspaceTable{
 			OwnerID:        user.ID,
 			OrganizationID: org.ID,
 			TemplateID:     template.ID,
@@ -190,7 +195,7 @@ func TestDetectorHungWorkspaceBuild(t *testing.T) {
 	t.Log("previous job ID: ", previousWorkspaceBuildJob.ID)
 	t.Log("current job ID: ", currentWorkspaceBuildJob.ID)
 
-	detector := unhanger.New(ctx, db, pubsub, log, tickCh).WithStatsChannel(statsCh)
+	detector := unhanger.New(ctx, wrapDBAuthz(db, log), pubsub, log, tickCh).WithStatsChannel(statsCh)
 	detector.Start()
 	tickCh <- now
 
@@ -224,7 +229,7 @@ func TestDetectorHungWorkspaceBuildNoOverrideState(t *testing.T) {
 	var (
 		ctx        = testutil.Context(t, testutil.WaitLong)
 		db, pubsub = dbtestutil.NewDB(t)
-		log        = slogtest.Make(t, nil)
+		log        = testutil.Logger(t)
 		tickCh     = make(chan time.Time)
 		statsCh    = make(chan unhanger.Stats)
 	)
@@ -249,7 +254,7 @@ func TestDetectorHungWorkspaceBuildNoOverrideState(t *testing.T) {
 			},
 			CreatedBy: user.ID,
 		})
-		workspace = dbgen.Workspace(t, db, database.Workspace{
+		workspace = dbgen.Workspace(t, db, database.WorkspaceTable{
 			OwnerID:        user.ID,
 			OrganizationID: org.ID,
 			TemplateID:     template.ID,
@@ -313,7 +318,7 @@ func TestDetectorHungWorkspaceBuildNoOverrideState(t *testing.T) {
 	t.Log("previous job ID: ", previousWorkspaceBuildJob.ID)
 	t.Log("current job ID: ", currentWorkspaceBuildJob.ID)
 
-	detector := unhanger.New(ctx, db, pubsub, log, tickCh).WithStatsChannel(statsCh)
+	detector := unhanger.New(ctx, wrapDBAuthz(db, log), pubsub, log, tickCh).WithStatsChannel(statsCh)
 	detector.Start()
 	tickCh <- now
 
@@ -347,7 +352,7 @@ func TestDetectorHungWorkspaceBuildNoOverrideStateIfNoExistingBuild(t *testing.T
 	var (
 		ctx        = testutil.Context(t, testutil.WaitLong)
 		db, pubsub = dbtestutil.NewDB(t)
-		log        = slogtest.Make(t, nil)
+		log        = testutil.Logger(t)
 		tickCh     = make(chan time.Time)
 		statsCh    = make(chan unhanger.Stats)
 	)
@@ -371,7 +376,7 @@ func TestDetectorHungWorkspaceBuildNoOverrideStateIfNoExistingBuild(t *testing.T
 			},
 			CreatedBy: user.ID,
 		})
-		workspace = dbgen.Workspace(t, db, database.Workspace{
+		workspace = dbgen.Workspace(t, db, database.WorkspaceTable{
 			OwnerID:        user.ID,
 			OrganizationID: org.ID,
 			TemplateID:     template.ID,
@@ -406,7 +411,7 @@ func TestDetectorHungWorkspaceBuildNoOverrideStateIfNoExistingBuild(t *testing.T
 
 	t.Log("current job ID: ", currentWorkspaceBuildJob.ID)
 
-	detector := unhanger.New(ctx, db, pubsub, log, tickCh).WithStatsChannel(statsCh)
+	detector := unhanger.New(ctx, wrapDBAuthz(db, log), pubsub, log, tickCh).WithStatsChannel(statsCh)
 	detector.Start()
 	tickCh <- now
 
@@ -440,7 +445,7 @@ func TestDetectorHungOtherJobTypes(t *testing.T) {
 	var (
 		ctx        = testutil.Context(t, testutil.WaitLong)
 		db, pubsub = dbtestutil.NewDB(t)
-		log        = slogtest.Make(t, nil)
+		log        = testutil.Logger(t)
 		tickCh     = make(chan time.Time)
 		statsCh    = make(chan unhanger.Stats)
 	)
@@ -469,29 +474,42 @@ func TestDetectorHungOtherJobTypes(t *testing.T) {
 			Type:           database.ProvisionerJobTypeTemplateVersionImport,
 			Input:          []byte("{}"),
 		})
-
-		// Template dry-run job.
-		templateDryRunJob = dbgen.ProvisionerJob(t, db, pubsub, database.ProvisionerJob{
-			CreatedAt: tenMinAgo,
-			UpdatedAt: sixMinAgo,
-			StartedAt: sql.NullTime{
-				Time:  tenMinAgo,
-				Valid: true,
-			},
+		_ = dbgen.TemplateVersion(t, db, database.TemplateVersion{
 			OrganizationID: org.ID,
-			InitiatorID:    user.ID,
-			Provisioner:    database.ProvisionerTypeEcho,
-			StorageMethod:  database.ProvisionerStorageMethodFile,
-			FileID:         file.ID,
-			Type:           database.ProvisionerJobTypeTemplateVersionDryRun,
-			Input:          []byte("{}"),
+			JobID:          templateImportJob.ID,
+			CreatedBy:      user.ID,
 		})
 	)
+
+	// Template dry-run job.
+	dryRunVersion := dbgen.TemplateVersion(t, db, database.TemplateVersion{
+		OrganizationID: org.ID,
+		CreatedBy:      user.ID,
+	})
+	input, err := json.Marshal(provisionerdserver.TemplateVersionDryRunJob{
+		TemplateVersionID: dryRunVersion.ID,
+	})
+	require.NoError(t, err)
+	templateDryRunJob := dbgen.ProvisionerJob(t, db, pubsub, database.ProvisionerJob{
+		CreatedAt: tenMinAgo,
+		UpdatedAt: sixMinAgo,
+		StartedAt: sql.NullTime{
+			Time:  tenMinAgo,
+			Valid: true,
+		},
+		OrganizationID: org.ID,
+		InitiatorID:    user.ID,
+		Provisioner:    database.ProvisionerTypeEcho,
+		StorageMethod:  database.ProvisionerStorageMethodFile,
+		FileID:         file.ID,
+		Type:           database.ProvisionerJobTypeTemplateVersionDryRun,
+		Input:          input,
+	})
 
 	t.Log("template import job ID: ", templateImportJob.ID)
 	t.Log("template dry-run job ID: ", templateDryRunJob.ID)
 
-	detector := unhanger.New(ctx, db, pubsub, log, tickCh).WithStatsChannel(statsCh)
+	detector := unhanger.New(ctx, wrapDBAuthz(db, log), pubsub, log, tickCh).WithStatsChannel(statsCh)
 	detector.Start()
 	tickCh <- now
 
@@ -531,7 +549,7 @@ func TestDetectorHungCanceledJob(t *testing.T) {
 	var (
 		ctx        = testutil.Context(t, testutil.WaitLong)
 		db, pubsub = dbtestutil.NewDB(t)
-		log        = slogtest.Make(t, nil)
+		log        = testutil.Logger(t)
 		tickCh     = make(chan time.Time)
 		statsCh    = make(chan unhanger.Stats)
 	)
@@ -564,11 +582,16 @@ func TestDetectorHungCanceledJob(t *testing.T) {
 			Type:           database.ProvisionerJobTypeTemplateVersionImport,
 			Input:          []byte("{}"),
 		})
+		_ = dbgen.TemplateVersion(t, db, database.TemplateVersion{
+			OrganizationID: org.ID,
+			JobID:          templateImportJob.ID,
+			CreatedBy:      user.ID,
+		})
 	)
 
 	t.Log("template import job ID: ", templateImportJob.ID)
 
-	detector := unhanger.New(ctx, db, pubsub, log, tickCh).WithStatsChannel(statsCh)
+	detector := unhanger.New(ctx, wrapDBAuthz(db, log), pubsub, log, tickCh).WithStatsChannel(statsCh)
 	detector.Start()
 	tickCh <- now
 
@@ -628,7 +651,7 @@ func TestDetectorPushesLogs(t *testing.T) {
 			var (
 				ctx        = testutil.Context(t, testutil.WaitLong)
 				db, pubsub = dbtestutil.NewDB(t)
-				log        = slogtest.Make(t, nil)
+				log        = testutil.Logger(t)
 				tickCh     = make(chan time.Time)
 				statsCh    = make(chan unhanger.Stats)
 			)
@@ -657,6 +680,11 @@ func TestDetectorPushesLogs(t *testing.T) {
 					Type:           database.ProvisionerJobTypeTemplateVersionImport,
 					Input:          []byte("{}"),
 				})
+				_ = dbgen.TemplateVersion(t, db, database.TemplateVersion{
+					OrganizationID: org.ID,
+					JobID:          templateImportJob.ID,
+					CreatedBy:      user.ID,
+				})
 			)
 
 			t.Log("template import job ID: ", templateImportJob.ID)
@@ -678,7 +706,7 @@ func TestDetectorPushesLogs(t *testing.T) {
 				require.Len(t, logs, 10)
 			}
 
-			detector := unhanger.New(ctx, db, pubsub, log, tickCh).WithStatsChannel(statsCh)
+			detector := unhanger.New(ctx, wrapDBAuthz(db, log), pubsub, log, tickCh).WithStatsChannel(statsCh)
 			detector.Start()
 
 			// Create pubsub subscription to listen for new log events.
@@ -741,7 +769,7 @@ func TestDetectorMaxJobsPerRun(t *testing.T) {
 	var (
 		ctx        = testutil.Context(t, testutil.WaitLong)
 		db, pubsub = dbtestutil.NewDB(t)
-		log        = slogtest.Make(t, nil)
+		log        = testutil.Logger(t)
 		tickCh     = make(chan time.Time)
 		statsCh    = make(chan unhanger.Stats)
 		org        = dbgen.Organization(t, db, database.Organization{})
@@ -752,7 +780,7 @@ func TestDetectorMaxJobsPerRun(t *testing.T) {
 	// Create unhanger.MaxJobsPerRun + 1 hung jobs.
 	now := time.Now()
 	for i := 0; i < unhanger.MaxJobsPerRun+1; i++ {
-		dbgen.ProvisionerJob(t, db, pubsub, database.ProvisionerJob{
+		pj := dbgen.ProvisionerJob(t, db, pubsub, database.ProvisionerJob{
 			CreatedAt: now.Add(-time.Hour),
 			UpdatedAt: now.Add(-time.Hour),
 			StartedAt: sql.NullTime{
@@ -767,9 +795,14 @@ func TestDetectorMaxJobsPerRun(t *testing.T) {
 			Type:           database.ProvisionerJobTypeTemplateVersionImport,
 			Input:          []byte("{}"),
 		})
+		_ = dbgen.TemplateVersion(t, db, database.TemplateVersion{
+			OrganizationID: org.ID,
+			JobID:          pj.ID,
+			CreatedBy:      user.ID,
+		})
 	}
 
-	detector := unhanger.New(ctx, db, pubsub, log, tickCh).WithStatsChannel(statsCh)
+	detector := unhanger.New(ctx, wrapDBAuthz(db, log), pubsub, log, tickCh).WithStatsChannel(statsCh)
 	detector.Start()
 	tickCh <- now
 
@@ -787,4 +820,15 @@ func TestDetectorMaxJobsPerRun(t *testing.T) {
 
 	detector.Close()
 	detector.Wait()
+}
+
+// wrapDBAuthz adds our Authorization/RBAC around the given database store, to
+// ensure the unhanger has the right permissions to do its work.
+func wrapDBAuthz(db database.Store, logger slog.Logger) database.Store {
+	return dbauthz.New(
+		db,
+		rbac.NewStrictCachingAuthorizer(prometheus.NewRegistry()),
+		logger,
+		coderdtest.AccessControlStorePointer(),
+	)
 }

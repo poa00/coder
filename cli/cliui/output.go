@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/jedib0t/go-pretty/v6/table"
 	"golang.org/x/xerrors"
 
 	"github.com/coder/serpent"
@@ -64,8 +65,8 @@ func (f *OutputFormatter) AttachOptions(opts *serpent.OptionSet) {
 			Flag:          "output",
 			FlagShorthand: "o",
 			Default:       f.formats[0].ID(),
-			Value:         serpent.StringOf(&f.formatID),
-			Description:   "Output format. Available formats: " + strings.Join(formatNames, ", ") + ".",
+			Value:         serpent.EnumOf(&f.formatID, formatNames...),
+			Description:   "Output format.",
 		},
 	)
 }
@@ -135,15 +136,19 @@ func (f *tableFormat) AttachOptions(opts *serpent.OptionSet) {
 			Flag:          "column",
 			FlagShorthand: "c",
 			Default:       strings.Join(f.defaultColumns, ","),
-			Value:         serpent.StringArrayOf(&f.columns),
-			Description:   "Columns to display in table output. Available columns: " + strings.Join(f.allColumns, ", ") + ".",
+			Value:         serpent.EnumArrayOf(&f.columns, f.allColumns...),
+			Description:   "Columns to display in table output.",
 		},
 	)
 }
 
 // Format implements OutputFormat.
 func (f *tableFormat) Format(_ context.Context, data any) (string, error) {
-	return DisplayTable(data, f.sort, f.columns)
+	headers := make(table.Row, len(f.allColumns))
+	for i, header := range f.allColumns {
+		headers[i] = header
+	}
+	return renderTable(data, f.sort, headers, f.columns)
 }
 
 type jsonFormat struct{}

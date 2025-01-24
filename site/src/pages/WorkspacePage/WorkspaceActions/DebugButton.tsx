@@ -1,47 +1,39 @@
-import DebugIcon from "@mui/icons-material/BugReportOutlined";
-import ButtonGroup from "@mui/material/ButtonGroup";
-import type { FC } from "react";
 import type { Workspace } from "api/typesGenerated";
 import { TopbarButton } from "components/FullPageLayout/Topbar";
+import { BugIcon } from "lucide-react";
+import type { FC } from "react";
 import { BuildParametersPopover } from "./BuildParametersPopover";
 import type { ActionButtonProps } from "./Buttons";
 
 type DebugButtonProps = Omit<ActionButtonProps, "loading"> & {
-  workspace: Workspace;
-  enableBuildParameters: boolean;
+	workspace: Workspace;
+	enableBuildParameters: boolean;
 };
 
 export const DebugButton: FC<DebugButtonProps> = ({
-  handleAction,
-  workspace,
-  enableBuildParameters,
+	handleAction,
+	workspace,
+	enableBuildParameters,
 }) => {
-  const mainAction = (
-    <TopbarButton startIcon={<DebugIcon />} onClick={() => handleAction()}>
-      Debug
-    </TopbarButton>
-  );
+	const mainAction = (
+		<TopbarButton onClick={() => handleAction()}>
+			<BugIcon />
+			Debug
+		</TopbarButton>
+	);
 
-  if (!enableBuildParameters) {
-    return mainAction;
-  }
+	if (!enableBuildParameters) {
+		return mainAction;
+	}
 
-  return (
-    <ButtonGroup
-      variant="outlined"
-      css={{
-        // Workaround to make the border transitions smoothly on button groups
-        "& > button:hover + button": {
-          borderLeft: "1px solid #FFF",
-        },
-      }}
-    >
-      {mainAction}
-      <BuildParametersPopover
-        label="Debug with build parameters"
-        workspace={workspace}
-        onSubmit={handleAction}
-      />
-    </ButtonGroup>
-  );
+	return (
+		<div className="flex gap-1 items-center">
+			{mainAction}
+			<BuildParametersPopover
+				label="Debug with build parameters"
+				workspace={workspace}
+				onSubmit={handleAction}
+			/>
+		</div>
+	);
 };

@@ -7,6 +7,9 @@ USAGE:
   flag
 
 OPTIONS:
+  -O, --org string, $CODER_ORGANIZATION
+          Select which organization (uuid or name) to use.
+
       --default-ttl duration (default: 24h)
           Specify a default TTL for workspaces created from this template. It is
           the default time before shutdown - workspaces created from this
@@ -51,7 +54,9 @@ OPTIONS:
       --require-active-version bool (default: false)
           Requires workspace builds to use the active template version. This
           setting does not apply to template admins. This is an enterprise-only
-          feature.
+          feature. See
+          https://coder.com/docs/admin/templates/managing-templates#require-automatic-updates-enterprise
+          for more details.
 
       --var string-array
           Alias of --variable.

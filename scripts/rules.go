@@ -467,3 +467,59 @@ func withTimezoneUTC(m dsl.Matcher) {
 	).Report(`Setting database timezone to UTC may mask timezone-related bugs.`).
 		At(m["tz"])
 }
+
+// workspaceActivity ensures that updating workspace activity is only done in the workspacestats package.
+//
+//nolint:unused,deadcode,varnamelen
+func workspaceActivity(m dsl.Matcher) {
+	m.Import("github.com/coder/coder/v2/coderd/database")
+	m.Match(
+		`$_.ActivityBumpWorkspace($_, $_)`,
+		`$_.UpdateWorkspaceLastUsedAt($_, $_)`,
+		`$_.BatchUpdateWorkspaceLastUsedAt($_, $_)`,
+		`$_.UpdateTemplateWorkspacesLastUsedAt($_, $_)`,
+		`$_.InsertWorkspaceAgentStats($_, $_)`,
+		`$_.InsertWorkspaceAppStats($_, $_)`,
+	).Where(
+		!m.File().PkgPath.Matches(`workspacestats`) &&
+			!m.File().PkgPath.Matches(`dbauthz$`) &&
+			!m.File().PkgPath.Matches(`dbgen$`) &&
+			!m.File().Name.Matches(`_test\.go$`),
+	).Report("Updating workspace activity should always be done in the workspacestats package.")
+}
+
+// noExecInAgent ensures that packages under agent/ don't use exec.Command or
+// exec.CommandContext directly.
+//
+//nolint:unused,deadcode,varnamelen
+func noExecInAgent(m dsl.Matcher) {
+	m.Import("os/exec")
+	m.Match(
+		`exec.Command($*_)`,
+		`exec.CommandContext($*_)`,
+	).
+		Where(
+			m.File().PkgPath.Matches("/agent/") &&
+				!m.File().PkgPath.Matches("/agentexec") &&
+				!m.File().Name.Matches(`_test\.go$`),
+		).
+		Report("The agent and its subpackages should not use exec.Command or exec.CommandContext directly. Consider using an agentexec.Execer instead.")
+}
+
+// noPTYInAgent ensures that packages under agent/ don't use pty.Command or
+// pty.CommandContext directly.
+//
+//nolint:unused,deadcode,varnamelen
+func noPTYInAgent(m dsl.Matcher) {
+	m.Import("github.com/coder/coder/v2/pty")
+	m.Match(
+		`pty.Command($*_)`,
+		`pty.CommandContext($*_)`,
+	).
+		Where(
+			m.File().PkgPath.Matches(`/agent/`) &&
+				!m.File().PkgPath.Matches(`/agentexec`) &&
+				!m.File().Name.Matches(`_test\.go$`),
+		).
+		Report("The agent and its subpackages should not use pty.Command or pty.CommandContext directly. Consider using an agentexec.Execer instead.")
+}

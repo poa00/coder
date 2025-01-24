@@ -3,13 +3,10 @@ package tailnet
 import (
 	"context"
 	"database/sql"
-	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/coder/coder/v2/tailnet/proto"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
@@ -21,26 +18,34 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/pubsub"
 	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/policy"
 	agpl "github.com/coder/coder/v2/tailnet"
+	"github.com/coder/coder/v2/tailnet/proto"
+	"github.com/coder/quartz"
 )
 
 const (
-	EventHeartbeats    = "tailnet_coordinator_heartbeat"
-	eventPeerUpdate    = "tailnet_peer_update"
-	eventTunnelUpdate  = "tailnet_tunnel_update"
-	HeartbeatPeriod    = time.Second * 2
-	MissedHeartbeats   = 3
-	numQuerierWorkers  = 10
-	numBinderWorkers   = 10
-	numTunnelerWorkers = 10
-	dbMaxBackoff       = 10 * time.Second
-	cleanupPeriod      = time.Hour
+	EventHeartbeats        = "tailnet_coordinator_heartbeat"
+	eventPeerUpdate        = "tailnet_peer_update"
+	eventTunnelUpdate      = "tailnet_tunnel_update"
+	eventReadyForHandshake = "tailnet_ready_for_handshake"
+	HeartbeatPeriod        = time.Second * 2
+	MissedHeartbeats       = 3
+	numQuerierWorkers      = 10
+	numBinderWorkers       = 10
+	numTunnelerWorkers     = 10
+	numHandshakerWorkers   = 5
+	dbMaxBackoff           = 10 * time.Second
+	cleanupPeriod          = time.Hour
 )
 
 // pgCoord is a postgres-backed coordinator
 //
-//	                 ┌──────────┐
-//	    ┌────────────► tunneler ├──────────┐
+//	                 ┌────────────┐
+//	    ┌────────────► handshaker ├────────┐
+//	    │            └────────────┘        │
+//	    │            ┌──────────┐          │
+//	    ├────────────► tunneler ├──────────┤
 //	    │            └──────────┘          │
 //	    │                                  │
 //	┌────────┐       ┌────────┐        ┌───▼───┐
@@ -78,25 +83,27 @@ type pgCoord struct {
 	newConnections   chan *connIO
 	closeConnections chan *connIO
 	tunnelerCh       chan tunnel
+	handshakerCh     chan readyForHandshake
 	id               uuid.UUID
 
 	cancel    context.CancelFunc
 	closeOnce sync.Once
 	closed    chan struct{}
 
-	binder   *binder
-	tunneler *tunneler
-	querier  *querier
+	binder     *binder
+	tunneler   *tunneler
+	handshaker *handshaker
+	querier    *querier
 }
 
 var pgCoordSubject = rbac.Subject{
 	ID: uuid.Nil.String(),
 	Roles: rbac.Roles([]rbac.Role{
 		{
-			Name:        "tailnetcoordinator",
+			Identifier:  rbac.RoleIdentifier{Name: "tailnetcoordinator"},
 			DisplayName: "Tailnet Coordinator",
-			Site: rbac.Permissions(map[string][]rbac.Action{
-				rbac.ResourceTailnetCoordinator.Type: {rbac.WildcardSymbol},
+			Site: rbac.Permissions(map[string][]policy.Action{
+				rbac.ResourceTailnetCoordinator.Type: {policy.WildcardSymbol},
 			}),
 			Org:  map[string][]rbac.Permission{},
 			User: []rbac.Permission{},
@@ -108,11 +115,16 @@ var pgCoordSubject = rbac.Subject{
 // NewPGCoord creates a high-availability coordinator that stores state in the PostgreSQL database and
 // receives notifications of updates via the pubsub.
 func NewPGCoord(ctx context.Context, logger slog.Logger, ps pubsub.Pubsub, store database.Store) (agpl.Coordinator, error) {
-	return newPGCoordInternal(ctx, logger, ps, store)
+	return newPGCoordInternal(ctx, logger, ps, store, quartz.NewReal())
+}
+
+// NewTestPGCoord is only used in testing to pass a clock.Clock in.
+func NewTestPGCoord(ctx context.Context, logger slog.Logger, ps pubsub.Pubsub, store database.Store, clk quartz.Clock) (agpl.Coordinator, error) {
+	return newPGCoordInternal(ctx, logger, ps, store, clk)
 }
 
 func newPGCoordInternal(
-	ctx context.Context, logger slog.Logger, ps pubsub.Pubsub, store database.Store,
+	ctx context.Context, logger slog.Logger, ps pubsub.Pubsub, store database.Store, clk quartz.Clock,
 ) (
 	*pgCoord, error,
 ) {
@@ -126,13 +138,11 @@ func newPGCoordInternal(
 	ccCh := make(chan *connIO)
 	// for communicating subscriptions with the tunneler
 	sCh := make(chan tunnel)
+	// for communicating ready for handshakes with the handshaker
+	rfhCh := make(chan readyForHandshake)
 	// signals when first heartbeat has been sent, so it's safe to start binding.
 	fHB := make(chan struct{})
 
-	// we need to arrange for the querier to stop _after_ the tunneler and binder, since we delete
-	// the coordinator when the querier stops (via the heartbeats).  If the tunneler and binder are
-	// still running, they could run afoul of foreign key constraints.
-	querierCtx, querierCancel := context.WithCancel(dbauthz.As(context.Background(), pgCoordSubject))
 	c := &pgCoord{
 		ctx:              ctx,
 		cancel:           cancel,
@@ -145,24 +155,14 @@ func newPGCoordInternal(
 		closeConnections: ccCh,
 		tunneler:         newTunneler(ctx, logger, id, store, sCh, fHB),
 		tunnelerCh:       sCh,
+		handshaker:       newHandshaker(ctx, logger, id, ps, rfhCh, fHB),
+		handshakerCh:     rfhCh,
 		id:               id,
-		querier:          newQuerier(querierCtx, logger, id, ps, store, id, cCh, ccCh, numQuerierWorkers, fHB),
+		querier:          newQuerier(ctx, logger, id, ps, store, id, cCh, ccCh, numQuerierWorkers, fHB, clk),
 		closed:           make(chan struct{}),
 	}
-	go func() {
-		// when the main context is canceled, or the coordinator closed, the binder and tunneler
-		// always eventually stop.  Once they stop it's safe to cancel the querier context, which
-		// has the effect of deleting the coordinator from the database and ceasing heartbeats.
-		c.binder.workerWG.Wait()
-		c.tunneler.workerWG.Wait()
-		querierCancel()
-	}()
 	logger.Info(ctx, "starting coordinator")
 	return c, nil
-}
-
-func (c *pgCoord) ServeMultiAgent(id uuid.UUID) agpl.MultiAgentConn {
-	return agpl.ServeMultiAgent(c, c.logger, id)
 }
 
 func (c *pgCoord) Node(id uuid.UUID) *agpl.Node {
@@ -208,18 +208,14 @@ func (c *pgCoord) Node(id uuid.UUID) *agpl.Node {
 	return node
 }
 
-func (c *pgCoord) ServeClient(conn net.Conn, id uuid.UUID, agent uuid.UUID) error {
-	return agpl.ServeClientV1(c.ctx, c.logger, c, conn, id, agent)
-}
-
-func (c *pgCoord) ServeAgent(conn net.Conn, id uuid.UUID, name string) error {
-	return agpl.ServeAgentV1(c.ctx, c.logger, c, conn, id, name)
-}
-
 func (c *pgCoord) Close() error {
 	c.logger.Info(c.ctx, "closing coordinator")
 	c.cancel()
 	c.closeOnce.Do(func() { close(c.closed) })
+	c.querier.wait()
+	c.binder.wait()
+	c.tunneler.workerWG.Wait()
+	c.handshaker.workerWG.Wait()
 	return nil
 }
 
@@ -242,7 +238,7 @@ func (c *pgCoord) Coordinate(
 		close(resps)
 		return reqs, resps
 	}
-	cIO := newConnIO(c.ctx, ctx, logger, c.bindings, c.tunnelerCh, reqs, resps, id, name, a)
+	cIO := newConnIO(c.ctx, ctx, logger, c.bindings, c.tunnelerCh, c.handshakerCh, reqs, resps, id, name, a)
 	err := agpl.SendCtx(c.ctx, c.newConnections, cIO)
 	if err != nil {
 		// this can only happen if the context is canceled, no need to log
@@ -466,6 +462,7 @@ type binder struct {
 	workQ  *workQ[bKey]
 
 	workerWG sync.WaitGroup
+	close    chan struct{}
 }
 
 func newBinder(ctx context.Context,
@@ -483,6 +480,7 @@ func newBinder(ctx context.Context,
 		bindings:      bindings,
 		latest:        make(map[bKey]binding),
 		workQ:         newWorkQ[bKey](ctx),
+		close:         make(chan struct{}),
 	}
 	go b.handleBindings()
 	// add to the waitgroup immediately to avoid any races waiting for it before
@@ -494,6 +492,26 @@ func newBinder(ctx context.Context,
 			go b.worker()
 		}
 	}()
+
+	go func() {
+		defer close(b.close)
+		<-b.ctx.Done()
+		b.logger.Debug(b.ctx, "binder exiting, waiting for workers")
+
+		b.workerWG.Wait()
+
+		b.logger.Debug(b.ctx, "updating peers to lost")
+
+		ctx, cancel := context.WithTimeout(dbauthz.As(context.Background(), pgCoordSubject), time.Second*15)
+		defer cancel()
+		err := b.store.UpdateTailnetPeerStatusByCoordinator(ctx, database.UpdateTailnetPeerStatusByCoordinatorParams{
+			CoordinatorID: b.coordinatorID,
+			Status:        database.TailnetStatusLost,
+		})
+		if err != nil {
+			b.logger.Error(b.ctx, "update peer status to lost", slog.Error(err))
+		}
+	}()
 	return b
 }
 
@@ -501,7 +519,7 @@ func (b *binder) handleBindings() {
 	for {
 		select {
 		case <-b.ctx.Done():
-			b.logger.Debug(b.ctx, "binder exiting", slog.Error(b.ctx.Err()))
+			b.logger.Debug(b.ctx, "binder exiting")
 			return
 		case bnd := <-b.bindings:
 			b.storeBinding(bnd)
@@ -613,6 +631,10 @@ func (b *binder) retrieveBinding(bk bKey) binding {
 	return bnd
 }
 
+func (b *binder) wait() {
+	<-b.close
+}
+
 // mapper tracks data sent to a peer, and sends updates based on changes read from the database.
 type mapper struct {
 	ctx    context.Context
@@ -626,8 +648,6 @@ type mapper struct {
 
 	c *connIO
 
-	// latest is the most recent, unfiltered snapshot of the mappings we know about
-	latest []mapping
 	// sent is the state of mappings we have actually enqueued; used to compute diffs for updates.
 	sent map[uuid.UUID]mapping
 
@@ -660,11 +680,11 @@ func (m *mapper) run() {
 			return
 		case mappings := <-m.mappings:
 			m.logger.Debug(m.ctx, "got new mappings")
-			m.latest = mappings
+			m.c.setLatestMapping(mappings)
 			best = m.bestMappings(mappings)
 		case <-m.update:
 			m.logger.Debug(m.ctx, "triggered update")
-			best = m.bestMappings(m.latest)
+			best = m.bestMappings(m.c.getLatestMapping())
 		}
 		update := m.bestToUpdate(best)
 		if update == nil {
@@ -786,6 +806,8 @@ type querier struct {
 
 	workQ *workQ[querierWorkKey]
 
+	wg sync.WaitGroup
+
 	heartbeats *heartbeats
 	updates    <-chan hbUpdate
 
@@ -804,6 +826,7 @@ func newQuerier(ctx context.Context,
 	closeConnections chan *connIO,
 	numWorkers int,
 	firstHeartbeat chan struct{},
+	clk quartz.Clock,
 ) *querier {
 	updates := make(chan hbUpdate)
 	q := &querier{
@@ -815,13 +838,14 @@ func newQuerier(ctx context.Context,
 		newConnections:   newConnections,
 		closeConnections: closeConnections,
 		workQ:            newWorkQ[querierWorkKey](ctx),
-		heartbeats:       newHeartbeats(ctx, logger, ps, store, self, updates, firstHeartbeat),
+		heartbeats:       newHeartbeats(ctx, logger, ps, store, self, updates, firstHeartbeat, clk),
 		mappers:          make(map[mKey]*mapper),
 		updates:          updates,
 		healthy:          true, // assume we start healthy
 	}
 	q.subscribe()
 
+	q.wg.Add(2 + numWorkers)
 	go func() {
 		<-firstHeartbeat
 		go q.handleIncoming()
@@ -833,7 +857,13 @@ func newQuerier(ctx context.Context,
 	return q
 }
 
+func (q *querier) wait() {
+	q.wg.Wait()
+	q.heartbeats.wg.Wait()
+}
+
 func (q *querier) handleIncoming() {
+	defer q.wg.Done()
 	for {
 		select {
 		case <-q.ctx.Done():
@@ -910,6 +940,7 @@ func (q *querier) cleanupConn(c *connIO) {
 }
 
 func (q *querier) worker() {
+	defer q.wg.Done()
 	eb := backoff.NewExponentialBackOff()
 	eb.MaxElapsedTime = 0 // retry indefinitely
 	eb.MaxInterval = dbMaxBackoff
@@ -1067,6 +1098,28 @@ func (q *querier) subscribe() {
 		}()
 		q.logger.Info(q.ctx, "subscribed to tunnel updates")
 
+		var cancelRFH context.CancelFunc
+		err = backoff.Retry(func() error {
+			cancelFn, err := q.pubsub.SubscribeWithErr(eventReadyForHandshake, q.listenReadyForHandshake)
+			if err != nil {
+				q.logger.Warn(q.ctx, "failed to subscribe to ready for handshakes", slog.Error(err))
+				return err
+			}
+			cancelRFH = cancelFn
+			return nil
+		}, bkoff)
+		if err != nil {
+			if q.ctx.Err() == nil {
+				q.logger.Error(q.ctx, "code bug: retry failed before context canceled", slog.Error(err))
+			}
+			return
+		}
+		defer func() {
+			q.logger.Info(q.ctx, "canceling ready for handshake subscription")
+			cancelRFH()
+		}()
+		q.logger.Info(q.ctx, "subscribed to ready for handshakes")
+
 		// unblock the outer function from returning
 		subscribed <- struct{}{}
 
@@ -1112,6 +1165,7 @@ func (q *querier) listenTunnel(_ context.Context, msg []byte, err error) {
 	}
 	if err != nil {
 		q.logger.Warn(q.ctx, "unhandled pubsub error", slog.Error(err))
+		return
 	}
 	peers, err := parseTunnelUpdate(string(msg))
 	if err != nil {
@@ -1133,6 +1187,36 @@ func (q *querier) listenTunnel(_ context.Context, msg []byte, err error) {
 	}
 }
 
+func (q *querier) listenReadyForHandshake(_ context.Context, msg []byte, err error) {
+	if err != nil && !xerrors.Is(err, pubsub.ErrDroppedMessages) {
+		q.logger.Warn(q.ctx, "unhandled pubsub error", slog.Error(err))
+		return
+	}
+
+	to, from, err := parseReadyForHandshake(string(msg))
+	if err != nil {
+		q.logger.Error(q.ctx, "failed to parse ready for handshake", slog.F("msg", string(msg)), slog.Error(err))
+		return
+	}
+
+	mk := mKey(to)
+	q.mu.Lock()
+	mpr, ok := q.mappers[mk]
+	q.mu.Unlock()
+	if !ok {
+		q.logger.Debug(q.ctx, "ignoring ready for handshake because we have no mapper",
+			slog.F("peer_id", to))
+		return
+	}
+
+	_ = mpr.c.Enqueue(&proto.CoordinateResponse{
+		PeerUpdates: []*proto.CoordinateResponse_PeerUpdate{{
+			Id:   from[:],
+			Kind: proto.CoordinateResponse_PeerUpdate_READY_FOR_HANDSHAKE,
+		}},
+	})
+}
+
 func (q *querier) resyncPeerMappings() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -1142,6 +1226,7 @@ func (q *querier) resyncPeerMappings() {
 }
 
 func (q *querier) handleUpdates() {
+	defer q.wg.Done()
 	for {
 		select {
 		case <-q.ctx.Done():
@@ -1223,6 +1308,21 @@ func parsePeerUpdate(msg string) (peer uuid.UUID, err error) {
 		return uuid.Nil, xerrors.Errorf("failed to parse peer update message UUID: %w", err)
 	}
 	return peer, nil
+}
+
+func parseReadyForHandshake(msg string) (to uuid.UUID, from uuid.UUID, err error) {
+	parts := strings.Split(msg, ",")
+	if len(parts) != 2 {
+		return uuid.Nil, uuid.Nil, xerrors.Errorf("expected 2 parts separated by comma")
+	}
+	ids := make([]uuid.UUID, 2)
+	for i, part := range parts {
+		ids[i], err = uuid.Parse(part)
+		if err != nil {
+			return uuid.Nil, uuid.Nil, xerrors.Errorf("failed to parse UUID: %w", err)
+		}
+	}
+	return ids[0], ids[1], nil
 }
 
 // mKey identifies a set of node mappings we want to query.
@@ -1372,10 +1472,12 @@ type heartbeats struct {
 
 	lock         sync.RWMutex
 	coordinators map[uuid.UUID]time.Time
-	timer        *time.Timer
+	timer        *quartz.Timer
 
-	// overwritten in tests, but otherwise constant
-	cleanupPeriod time.Duration
+	wg sync.WaitGroup
+
+	// for testing
+	clock quartz.Clock
 }
 
 func newHeartbeats(
@@ -1383,6 +1485,7 @@ func newHeartbeats(
 	ps pubsub.Pubsub, store database.Store,
 	self uuid.UUID, update chan<- hbUpdate,
 	firstHeartbeat chan<- struct{},
+	clk quartz.Clock,
 ) *heartbeats {
 	h := &heartbeats{
 		ctx:            ctx,
@@ -1393,8 +1496,9 @@ func newHeartbeats(
 		update:         update,
 		firstHeartbeat: firstHeartbeat,
 		coordinators:   make(map[uuid.UUID]time.Time),
-		cleanupPeriod:  cleanupPeriod,
+		clock:          clk,
 	}
+	h.wg.Add(3)
 	go h.subscribe()
 	go h.sendBeats()
 	go h.cleanupLoop()
@@ -1409,15 +1513,23 @@ func (h *heartbeats) filter(mappings []mapping) []mapping {
 		ok := m.coordinator == h.self
 		if !ok {
 			_, ok = h.coordinators[m.coordinator]
+			if !ok {
+				// If a mapping exists to a coordinator lost to heartbeats,
+				// still add the mapping as LOST. If a coordinator misses
+				// heartbeats but a client is still connected to it, this may be
+				// the only mapping available for it. Newer mappings will take
+				// precedence.
+				m.kind = proto.CoordinateResponse_PeerUpdate_LOST
+			}
 		}
-		if ok {
-			out = append(out, m)
-		}
+
+		out = append(out, m)
 	}
 	return out
 }
 
 func (h *heartbeats) subscribe() {
+	defer h.wg.Done()
 	eb := backoff.NewExponentialBackOff()
 	eb.MaxElapsedTime = 0 // retry indefinitely
 	eb.MaxInterval = dbMaxBackoff
@@ -1475,11 +1587,11 @@ func (h *heartbeats) recvBeat(id uuid.UUID) {
 			_ = agpl.SendCtx(h.ctx, h.update, hbUpdate{filter: filterUpdateUpdated})
 		}()
 	}
-	h.coordinators[id] = time.Now()
+	h.coordinators[id] = h.clock.Now("heartbeats", "recvBeat")
 
 	if h.timer == nil {
 		// this can only happen for the very first beat
-		h.timer = time.AfterFunc(MissedHeartbeats*HeartbeatPeriod, h.checkExpiry)
+		h.timer = h.clock.AfterFunc(MissedHeartbeats*HeartbeatPeriod, h.checkExpiry, "heartbeats", "recvBeat")
 		h.logger.Debug(h.ctx, "set initial heartbeat timeout")
 		return
 	}
@@ -1493,24 +1605,30 @@ func (h *heartbeats) resetExpiryTimerWithLock() {
 			oldestTime = t
 		}
 	}
-	d := time.Until(oldestTime.Add(MissedHeartbeats * HeartbeatPeriod))
-	h.logger.Debug(h.ctx, "computed oldest heartbeat", slog.F("oldest", oldestTime), slog.F("time_to_expiry", d))
-	// only reschedule if it's in the future.
-	if d > 0 {
-		h.timer.Reset(d)
+	d := h.clock.Until(
+		oldestTime.Add(MissedHeartbeats*HeartbeatPeriod),
+		"heartbeats", "resetExpiryTimerWithLock",
+	)
+	if len(h.coordinators) == 0 {
+		return
 	}
+	h.logger.Debug(h.ctx, "computed oldest heartbeat", slog.F("oldest", oldestTime), slog.F("time_to_expiry", d))
+	if d < 0 {
+		d = 0
+	}
+	h.timer.Reset(d, "heartbeats", "resetExpiryTimerWithLock")
 }
 
 func (h *heartbeats) checkExpiry() {
 	h.logger.Debug(h.ctx, "checking heartbeat expiry")
 	h.lock.Lock()
 	defer h.lock.Unlock()
-	now := time.Now()
+	now := h.clock.Now()
 	expired := false
 	for id, t := range h.coordinators {
 		lastHB := now.Sub(t)
 		h.logger.Debug(h.ctx, "last heartbeat from coordinator", slog.F("other_coordinator_id", id), slog.F("last_heartbeat", lastHB))
-		if lastHB > MissedHeartbeats*HeartbeatPeriod {
+		if lastHB >= MissedHeartbeats*HeartbeatPeriod {
 			expired = true
 			delete(h.coordinators, id)
 			h.logger.Info(h.ctx, "coordinator failed heartbeat check", slog.F("other_coordinator_id", id), slog.F("last_heartbeat", lastHB))
@@ -1527,21 +1645,16 @@ func (h *heartbeats) checkExpiry() {
 }
 
 func (h *heartbeats) sendBeats() {
+	defer h.wg.Done()
 	// send an initial heartbeat so that other coordinators can start using our bindings right away.
 	h.sendBeat()
 	close(h.firstHeartbeat) // signal binder it can start writing
-	defer h.sendDelete()
-	tkr := time.NewTicker(HeartbeatPeriod)
-	defer tkr.Stop()
-	for {
-		select {
-		case <-h.ctx.Done():
-			h.logger.Debug(h.ctx, "ending heartbeats", slog.Error(h.ctx.Err()))
-			return
-		case <-tkr.C:
-			h.sendBeat()
-		}
-	}
+	tkr := h.clock.TickerFunc(h.ctx, HeartbeatPeriod, func() error {
+		h.sendBeat()
+		return nil
+	}, "heartbeats", "sendBeats")
+	err := tkr.Wait()
+	h.logger.Debug(h.ctx, "ending heartbeats", slog.Error(err))
 }
 
 func (h *heartbeats) sendBeat() {
@@ -1566,30 +1679,15 @@ func (h *heartbeats) sendBeat() {
 	h.failedHeartbeats = 0
 }
 
-func (h *heartbeats) sendDelete() {
-	// here we don't want to use the main context, since it will have been canceled
-	ctx := dbauthz.As(context.Background(), pgCoordSubject)
-	err := h.store.DeleteCoordinator(ctx, h.self)
-	if err != nil {
-		h.logger.Error(h.ctx, "failed to send coordinator delete", slog.Error(err))
-		return
-	}
-	h.logger.Debug(h.ctx, "deleted coordinator")
-}
-
 func (h *heartbeats) cleanupLoop() {
+	defer h.wg.Done()
 	h.cleanup()
-	tkr := time.NewTicker(h.cleanupPeriod)
-	defer tkr.Stop()
-	for {
-		select {
-		case <-h.ctx.Done():
-			h.logger.Debug(h.ctx, "ending cleanupLoop", slog.Error(h.ctx.Err()))
-			return
-		case <-tkr.C:
-			h.cleanup()
-		}
-	}
+	tkr := h.clock.TickerFunc(h.ctx, cleanupPeriod, func() error {
+		h.cleanup()
+		return nil
+	}, "heartbeats", "cleanupLoop")
+	err := tkr.Wait()
+	h.logger.Debug(h.ctx, "ending cleanupLoop", slog.Error(err))
 }
 
 // cleanup issues a DB command to clean out any old expired coordinators or lost peer state.  The

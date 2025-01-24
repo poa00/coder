@@ -10,7 +10,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/codersdk"
@@ -46,8 +45,9 @@ func TestBlockNonBrowser(t *testing.T) {
 			},
 		})
 		r := setupWorkspaceAgent(t, client, user, 0)
+		ctx := testutil.Context(t, testutil.WaitShort)
 		//nolint:gocritic // Testing that even the owner gets blocked.
-		_, err := workspacesdk.New(client).DialAgent(context.Background(), r.sdkAgent.ID, nil)
+		_, err := workspacesdk.New(client).DialAgent(ctx, r.sdkAgent.ID, nil)
 		var apiErr *codersdk.Error
 		require.ErrorAs(t, err, &apiErr)
 		require.Equal(t, http.StatusConflict, apiErr.StatusCode())
@@ -65,8 +65,9 @@ func TestBlockNonBrowser(t *testing.T) {
 			},
 		})
 		r := setupWorkspaceAgent(t, client, user, 0)
+		ctx := testutil.Context(t, testutil.WaitShort)
 		//nolint:gocritic // Testing RBAC is not the point of this test.
-		conn, err := workspacesdk.New(client).DialAgent(context.Background(), r.sdkAgent.ID, nil)
+		conn, err := workspacesdk.New(client).DialAgent(ctx, r.sdkAgent.ID, nil)
 		require.NoError(t, err)
 		_ = conn.Close()
 	})
@@ -122,7 +123,7 @@ func setupWorkspaceAgent(t *testing.T, client *codersdk.Client, user codersdk.Cr
 	})
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 	agentClient := agentsdk.New(client.URL)
 	agentClient.SDK.HTTPClient = &http.Client{
@@ -136,7 +137,7 @@ func setupWorkspaceAgent(t *testing.T, client *codersdk.Client, user codersdk.Cr
 	agentClient.SetSessionToken(authToken)
 	agnt := agent.New(agent.Options{
 		Client: agentClient,
-		Logger: slogtest.Make(t, nil).Named("agent"),
+		Logger: testutil.Logger(t).Named("agent"),
 	})
 	t.Cleanup(func() {
 		_ = agnt.Close()

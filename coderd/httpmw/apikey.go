@@ -24,6 +24,7 @@ import (
 	"github.com/coder/coder/v2/coderd/httpapi"
 	"github.com/coder/coder/v2/coderd/promoauth"
 	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/rolestore"
 	"github.com/coder/coder/v2/codersdk"
 )
 
@@ -81,6 +82,7 @@ const (
 
 type ExtractAPIKeyConfig struct {
 	DB                          database.Store
+	ActivateDormantUser         func(ctx context.Context, u database.User) (database.User, error)
 	OAuth2Configs               *OAuth2Configs
 	RedirectToLogin             bool
 	DisableSessionExpiryRefresh bool
@@ -375,7 +377,7 @@ func ExtractAPIKey(rw http.ResponseWriter, r *http.Request, cfg ExtractAPIKeyCon
 				OAuthExpiry:            link.OAuthExpiry,
 				// Refresh should keep the same debug context because we use
 				// the original claims for the group/role sync.
-				DebugContext: link.DebugContext,
+				Claims: link.Claims,
 			})
 			if err != nil {
 				return write(http.StatusInternalServerError, codersdk.Response{
@@ -405,8 +407,7 @@ func ExtractAPIKey(rw http.ResponseWriter, r *http.Request, cfg ExtractAPIKeyCon
 	// If the key is valid, we also fetch the user roles and status.
 	// The roles are used for RBAC authorize checks, and the status
 	// is to block 'suspended' users from accessing the platform.
-	//nolint:gocritic // system needs to update user roles
-	roles, err := cfg.DB.GetAuthorizationUserRoles(dbauthz.AsSystemRestricted(ctx), key.UserID)
+	actor, userStatus, err := UserRBACSubject(ctx, cfg.DB, key.UserID, rbac.ScopeName(key.Scope))
 	if err != nil {
 		return write(http.StatusUnauthorized, codersdk.Response{
 			Message: internalErrorMessage,
@@ -414,43 +415,63 @@ func ExtractAPIKey(rw http.ResponseWriter, r *http.Request, cfg ExtractAPIKeyCon
 		})
 	}
 
-	if roles.Status == database.UserStatusDormant {
-		// If coder confirms that the dormant user is valid, it can switch their account to active.
-		// nolint:gocritic
-		u, err := cfg.DB.UpdateUserStatus(dbauthz.AsSystemRestricted(ctx), database.UpdateUserStatusParams{
-			ID:        key.UserID,
-			Status:    database.UserStatusActive,
-			UpdatedAt: dbtime.Now(),
+	if userStatus == database.UserStatusDormant && cfg.ActivateDormantUser != nil {
+		id, _ := uuid.Parse(actor.ID)
+		user, err := cfg.ActivateDormantUser(ctx, database.User{
+			ID:       id,
+			Username: actor.FriendlyName,
+			Status:   userStatus,
 		})
 		if err != nil {
 			return write(http.StatusInternalServerError, codersdk.Response{
 				Message: internalErrorMessage,
-				Detail:  fmt.Sprintf("can't activate a dormant user: %s", err.Error()),
+				Detail:  fmt.Sprintf("update user status: %s", err.Error()),
 			})
 		}
-		roles.Status = u.Status
+		userStatus = user.Status
 	}
 
-	if roles.Status != database.UserStatusActive {
+	if userStatus != database.UserStatusActive {
 		return write(http.StatusUnauthorized, codersdk.Response{
-			Message: fmt.Sprintf("User is not active (status = %q). Contact an admin to reactivate your account.", roles.Status),
+			Message: fmt.Sprintf("User is not active (status = %q). Contact an admin to reactivate your account.", userStatus),
 		})
 	}
-
-	// Actor is the user's authorization context.
-	actor := rbac.Subject{
-		FriendlyName: roles.Username,
-		ID:           key.UserID.String(),
-		Roles:        rbac.RoleNames(roles.Roles),
-		Groups:       roles.Groups,
-		Scope:        rbac.ScopeName(key.Scope),
-	}.WithCachedASTValue()
 
 	if cfg.PostAuthAdditionalHeadersFunc != nil {
 		cfg.PostAuthAdditionalHeadersFunc(actor, rw.Header())
 	}
 
 	return key, &actor, true
+}
+
+// UserRBACSubject fetches a user's rbac.Subject from the database. It pulls all roles from both
+// site and organization scopes. It also pulls the groups, and the user's status.
+func UserRBACSubject(ctx context.Context, db database.Store, userID uuid.UUID, scope rbac.ExpandableScope) (rbac.Subject, database.UserStatus, error) {
+	//nolint:gocritic // system needs to update user roles
+	roles, err := db.GetAuthorizationUserRoles(dbauthz.AsSystemRestricted(ctx), userID)
+	if err != nil {
+		return rbac.Subject{}, "", xerrors.Errorf("get authorization user roles: %w", err)
+	}
+
+	roleNames, err := roles.RoleNames()
+	if err != nil {
+		return rbac.Subject{}, "", xerrors.Errorf("expand role names: %w", err)
+	}
+
+	//nolint:gocritic // Permission to lookup custom roles the user has assigned.
+	rbacRoles, err := rolestore.Expand(dbauthz.AsSystemRestricted(ctx), db, roleNames)
+	if err != nil {
+		return rbac.Subject{}, "", xerrors.Errorf("expand role names: %w", err)
+	}
+
+	actor := rbac.Subject{
+		FriendlyName: roles.Username,
+		ID:           userID.String(),
+		Roles:        rbacRoles,
+		Groups:       roles.Groups,
+		Scope:        scope,
+	}.WithCachedASTValue()
+	return actor, roles.Status, nil
 }
 
 // APITokenFromRequest returns the api token from the request.

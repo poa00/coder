@@ -28,7 +28,7 @@ func TestStatePull(t *testing.T) {
 		owner := coderdtest.CreateFirstUser(t, client)
 		templateAdmin, taUser := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID, rbac.RoleTemplateAdmin())
 		wantState := []byte("some state")
-		r := dbfake.WorkspaceBuild(t, store, database.Workspace{
+		r := dbfake.WorkspaceBuild(t, store, database.WorkspaceTable{
 			OrganizationID: owner.OrganizationID,
 			OwnerID:        taUser.ID,
 		}).
@@ -49,7 +49,7 @@ func TestStatePull(t *testing.T) {
 		owner := coderdtest.CreateFirstUser(t, client)
 		templateAdmin, taUser := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID, rbac.RoleTemplateAdmin())
 		wantState := []byte("some state")
-		r := dbfake.WorkspaceBuild(t, store, database.Workspace{
+		r := dbfake.WorkspaceBuild(t, store, database.WorkspaceTable{
 			OrganizationID: owner.OrganizationID,
 			OwnerID:        taUser.ID,
 		}).
@@ -69,7 +69,7 @@ func TestStatePull(t *testing.T) {
 		owner := coderdtest.CreateFirstUser(t, client)
 		_, taUser := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID, rbac.RoleTemplateAdmin())
 		wantState := []byte("some state")
-		r := dbfake.WorkspaceBuild(t, store, database.Workspace{
+		r := dbfake.WorkspaceBuild(t, store, database.WorkspaceTable{
 			OrganizationID: owner.OrganizationID,
 			OwnerID:        taUser.ID,
 		}).
@@ -100,7 +100,7 @@ func TestStatePush(t *testing.T) {
 		})
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, templateAdmin, owner.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, templateAdmin, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 		stateFile, err := os.CreateTemp(t.TempDir(), "")
 		require.NoError(t, err)
@@ -126,7 +126,7 @@ func TestStatePush(t *testing.T) {
 		})
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, templateAdmin, owner.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, templateAdmin, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 		inv, root := clitest.New(t, "state", "push", "--build", strconv.Itoa(int(workspace.LatestBuild.BuildNumber)), workspace.Name, "-")
 		clitest.SetupConfig(t, templateAdmin, root)
@@ -146,7 +146,7 @@ func TestStatePush(t *testing.T) {
 		})
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, templateAdmin, owner.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, templateAdmin, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 		inv, root := clitest.New(t, "state", "push",
 			"--build", strconv.Itoa(int(workspace.LatestBuild.BuildNumber)),

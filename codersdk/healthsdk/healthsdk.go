@@ -105,8 +105,6 @@ type HealthcheckReport struct {
 	Healthy bool `json:"healthy"`
 	// Severity indicates the status of Coder health.
 	Severity health.Severity `json:"severity" enums:"ok,warning,error"`
-	// FailingSections is a list of sections that have failed their healthcheck.
-	FailingSections []HealthSection `json:"failing_sections"`
 
 	DERP               DERPHealthReport         `json:"derp"`
 	AccessURL          AccessURLReport          `json:"access_url"`
@@ -133,7 +131,7 @@ func (r *HealthcheckReport) Summarize(docsURL string) []string {
 
 // BaseReport holds fields common to various health reports.
 type BaseReport struct {
-	Error     *string          `json:"error"`
+	Error     *string          `json:"error,omitempty"`
 	Severity  health.Severity  `json:"severity" enums:"ok,warning,error"`
 	Warnings  []health.Message `json:"warnings"`
 	Dismissed bool             `json:"dismissed"`
@@ -187,8 +185,8 @@ type DERPHealthReport struct {
 	// Healthy is deprecated and left for backward compatibility purposes, use `Severity` instead.
 	Healthy      bool                      `json:"healthy"`
 	Regions      map[int]*DERPRegionReport `json:"regions"`
-	Netcheck     *netcheck.Report          `json:"netcheck"`
-	NetcheckErr  *string                   `json:"netcheck_err"`
+	Netcheck     *netcheck.Report          `json:"netcheck,omitempty"`
+	NetcheckErr  *string                   `json:"netcheck_err,omitempty"`
 	NetcheckLogs []string                  `json:"netcheck_logs"`
 }
 
@@ -198,7 +196,7 @@ type DERPRegionReport struct {
 	Healthy     bool                `json:"healthy"`
 	Severity    health.Severity     `json:"severity" enums:"ok,warning,error"`
 	Warnings    []health.Message    `json:"warnings"`
-	Error       *string             `json:"error"`
+	Error       *string             `json:"error,omitempty"`
 	Region      *tailcfg.DERPRegion `json:"region"`
 	NodeReports []*DERPNodeReport   `json:"node_reports"`
 }
@@ -209,7 +207,7 @@ type DERPNodeReport struct {
 	Healthy  bool             `json:"healthy"`
 	Severity health.Severity  `json:"severity" enums:"ok,warning,error"`
 	Warnings []health.Message `json:"warnings"`
-	Error    *string          `json:"error"`
+	Error    *string          `json:"error,omitempty"`
 
 	Node *tailcfg.DERPNode `json:"node"`
 
@@ -268,4 +266,17 @@ type WorkspaceProxyReport struct {
 	Healthy bool `json:"healthy"`
 	BaseReport
 	WorkspaceProxies codersdk.RegionsResponse[codersdk.WorkspaceProxy] `json:"workspace_proxies"`
+}
+
+// @typescript-ignore ClientNetcheckReport
+type ClientNetcheckReport struct {
+	DERP       DERPHealthReport `json:"derp"`
+	Interfaces InterfacesReport `json:"interfaces"`
+}
+
+// @typescript-ignore AgentNetcheckReport
+type AgentNetcheckReport struct {
+	BaseReport
+	NetInfo    *tailcfg.NetInfo `json:"net_info"`
+	Interfaces InterfacesReport `json:"interfaces"`
 }

@@ -31,6 +31,7 @@ func (r *RootCmd) templateCreate() *serpent.Command {
 		dormancyAutoDeletion time.Duration
 
 		uploadFlags templateUploadFlags
+		orgContext  = NewOrganizationContext()
 	)
 	client := new(codersdk.Client)
 	cmd := &serpent.Command{
@@ -68,12 +69,12 @@ func (r *RootCmd) templateCreate() *serpent.Command {
 				}
 			}
 
-			organization, err := CurrentOrganization(r, inv, client)
+			organization, err := orgContext.Selected(inv, client)
 			if err != nil {
 				return err
 			}
 
-			templateName, err := uploadFlags.templateName(inv.Args)
+			templateName, err := uploadFlags.templateName(inv)
 			if err != nil {
 				return err
 			}
@@ -95,8 +96,8 @@ func (r *RootCmd) templateCreate() *serpent.Command {
 			message := uploadFlags.templateMessage(inv)
 
 			var varsFiles []string
-			if !uploadFlags.stdin() {
-				varsFiles, err = DiscoverVarsFiles(uploadFlags.directory)
+			if !uploadFlags.stdin(inv) {
+				varsFiles, err = codersdk.DiscoverVarsFiles(uploadFlags.directory)
 				if err != nil {
 					return err
 				}
@@ -117,7 +118,7 @@ func (r *RootCmd) templateCreate() *serpent.Command {
 				return err
 			}
 
-			userVariableValues, err := ParseUserVariableValues(
+			userVariableValues, err := codersdk.ParseUserVariableValues(
 				varsFiles,
 				variablesFile,
 				commandLineVariables)
@@ -138,7 +139,7 @@ func (r *RootCmd) templateCreate() *serpent.Command {
 				return err
 			}
 
-			if !uploadFlags.stdin() {
+			if !uploadFlags.stdin(inv) {
 				_, err = cliui.Prompt(inv, cliui.PromptOptions{
 					Text:      "Confirm create?",
 					IsConfirm: true,
@@ -159,7 +160,7 @@ func (r *RootCmd) templateCreate() *serpent.Command {
 				RequireActiveVersion:           requireActiveVersion,
 			}
 
-			_, err = client.CreateTemplate(inv.Context(), organization.ID, createReq)
+			template, err := client.CreateTemplate(inv.Context(), organization.ID, createReq)
 			if err != nil {
 				return err
 			}
@@ -170,7 +171,7 @@ func (r *RootCmd) templateCreate() *serpent.Command {
 					pretty.Sprint(cliui.DefaultStyles.DateTimeStamp, time.Now().Format(time.Stamp))+"! "+
 					"Developers can provision a workspace with this template using:")+"\n")
 
-			_, _ = fmt.Fprintln(inv.Stdout, "  "+pretty.Sprint(cliui.DefaultStyles.Code, fmt.Sprintf("coder create --template=%q [workspace name]", templateName)))
+			_, _ = fmt.Fprintln(inv.Stdout, "  "+pretty.Sprint(cliui.DefaultStyles.Code, fmt.Sprintf("coder create --template=%q --org=%q [workspace name]", templateName, template.OrganizationName)))
 			_, _ = fmt.Fprintln(inv.Stdout)
 
 			return nil
@@ -236,13 +237,14 @@ func (r *RootCmd) templateCreate() *serpent.Command {
 		},
 		{
 			Flag:        "require-active-version",
-			Description: "Requires workspace builds to use the active template version. This setting does not apply to template admins. This is an enterprise-only feature.",
+			Description: "Requires workspace builds to use the active template version. This setting does not apply to template admins. This is an enterprise-only feature. See https://coder.com/docs/admin/templates/managing-templates#require-automatic-updates-enterprise for more details.",
 			Value:       serpent.BoolOf(&requireActiveVersion),
 			Default:     "false",
 		},
 
 		cliui.SkipPromptOption(),
 	}
+	orgContext.AttachOptions(cmd)
 	cmd.Options = append(cmd.Options, uploadFlags.options()...)
 	return cmd
 }

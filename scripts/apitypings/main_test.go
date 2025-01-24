@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/coder/guts"
 )
 
 // updateGoldenFiles is a flag that can be set to update golden files.
@@ -33,8 +35,24 @@ func TestGeneration(t *testing.T) {
 		t.Run(f.Name(), func(t *testing.T) {
 			t.Parallel()
 			dir := filepath.Join(".", "testdata", f.Name())
-			output, err := Generate("./" + dir)
-			require.NoErrorf(t, err, "generate %q", dir)
+
+			gen, err := guts.NewGolangParser()
+			if err != nil {
+				require.NoError(t, err)
+			}
+			err = gen.IncludeGenerate("./" + dir)
+			require.NoError(t, err)
+
+			err = TypeMappings(gen)
+			require.NoError(t, err)
+
+			ts, err := gen.ToTypescript()
+			require.NoError(t, err)
+
+			TsMutations(ts)
+
+			output, err := ts.Serialize()
+			require.NoError(t, err)
 
 			golden := filepath.Join(dir, f.Name()+".ts")
 			expected, err := os.ReadFile(golden)
@@ -43,7 +61,7 @@ func TestGeneration(t *testing.T) {
 			output = strings.TrimSpace(output)
 			if *updateGoldenFiles {
 				// nolint:gosec
-				err := os.WriteFile(golden, []byte(output), 0o644)
+				err := os.WriteFile(golden, []byte(output+"\n"), 0o644)
 				require.NoError(t, err, "write golden file")
 			} else {
 				require.Equal(t, expectedString, output, "matched output")

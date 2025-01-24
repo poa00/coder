@@ -30,7 +30,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m, testutil.GoleakOptions...)
 }
 
 func TestRun(t *testing.T) {
@@ -50,7 +50,7 @@ func TestRun(t *testing.T) {
 
 		bun, err := support.Run(ctx, &support.Deps{
 			Client:      client,
-			Log:         slogtest.Make(t, nil).Named("bundle").Leveled(slog.LevelDebug),
+			Log:         testutil.Logger(t).Named("bundle"),
 			WorkspaceID: ws.ID,
 			AgentID:     agt.ID,
 		})
@@ -66,6 +66,7 @@ func TestRun(t *testing.T) {
 		assertNotNilNotEmpty(t, bun.Network.CoordinatorDebug, "network coordinator debug should be present")
 		assertNotNilNotEmpty(t, bun.Network.Netcheck, "network netcheck should be present")
 		assertNotNilNotEmpty(t, bun.Network.TailnetDebug, "network tailnet debug should be present")
+		assertNotNilNotEmpty(t, bun.Network.Interfaces, "network interfaces health should be present")
 		assertNotNilNotEmpty(t, bun.Workspace.Workspace, "workspace should be present")
 		assertSanitizedWorkspace(t, bun.Workspace.Workspace)
 		assertNotNilNotEmpty(t, bun.Workspace.BuildLogs, "workspace build logs should be present")
@@ -114,6 +115,7 @@ func TestRun(t *testing.T) {
 		assertNotNilNotEmpty(t, bun.Network.CoordinatorDebug, "network coordinator debug should be present")
 		assertNotNilNotEmpty(t, bun.Network.Netcheck, "network netcheck should be present")
 		assertNotNilNotEmpty(t, bun.Network.TailnetDebug, "network tailnet debug should be present")
+		assertNotNilNotEmpty(t, bun.Network.Interfaces, "network interfaces health should be present")
 		assert.Empty(t, bun.Workspace.Workspace, "did not expect workspace to be present")
 		assert.Empty(t, bun.Agent, "did not expect agent to be present")
 		assertNotNilNotEmpty(t, bun.Logs, "bundle logs should be present")
@@ -147,7 +149,7 @@ func TestRun(t *testing.T) {
 		memberClient, _ := coderdtest.CreateAnotherUser(t, client, admin.OrganizationID)
 		bun, err := support.Run(ctx, &support.Deps{
 			Client: memberClient,
-			Log:    slogtest.Make(t, nil).Named("bundle").Leveled(slog.LevelDebug),
+			Log:    testutil.Logger(t).Named("bundle"),
 		})
 		require.ErrorContains(t, err, "failed authorization check")
 		require.NotEmpty(t, bun)
@@ -197,7 +199,7 @@ func setupWorkspaceAndAgent(ctx context.Context, t *testing.T, client *codersdk.
 			CreatedBy:      user.UserID,
 		}).
 		Do()
-	wbr := dbfake.WorkspaceBuild(t, db, database.Workspace{
+	wbr := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
 		OrganizationID: user.OrganizationID,
 		OwnerID:        user.UserID,
 		TemplateID:     tv.Template.ID,

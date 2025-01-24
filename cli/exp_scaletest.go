@@ -9,12 +9,12 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -118,7 +118,7 @@ func (s *scaletestTracingFlags) provider(ctx context.Context) (trace.TracerProvi
 	}
 
 	var closeTracingOnce sync.Once
-	return tracerProvider, func(ctx context.Context) error {
+	return tracerProvider, func(_ context.Context) error {
 		var err error
 		closeTracingOnce.Do(func() {
 			// Allow time to upload traces even if ctx is canceled
@@ -245,14 +245,8 @@ func (o *scaleTestOutput) write(res harness.Results, stdout io.Writer) error {
 
 	// Sync the file to disk if it's a file.
 	if s, ok := w.(interface{ Sync() error }); ok {
-		err := s.Sync()
-		// On Linux, EINVAL is returned when calling fsync on /dev/stdout. We
-		// can safely ignore this error.
-		// On macOS, ENOTTY is returned when calling sync on /dev/stdout. We
-		// can safely ignore this error.
-		if err != nil && !xerrors.Is(err, syscall.EINVAL) && !xerrors.Is(err, syscall.ENOTTY) {
-			return xerrors.Errorf("flush output file: %w", err)
-		}
+		// Best effort. If we get an error from syncing, just ignore it.
+		_ = s.Sync()
 	}
 
 	if c != nil {
@@ -437,7 +431,7 @@ func (r *RootCmd) scaletestCleanup() *serpent.Command {
 			}
 
 			cliui.Infof(inv.Stdout, "Fetching scaletest workspaces...")
-			workspaces, err := getScaletestWorkspaces(ctx, client, template)
+			workspaces, _, err := getScaletestWorkspaces(ctx, client, "", template)
 			if err != nil {
 				return err
 			}
@@ -867,12 +861,14 @@ func (r *RootCmd) scaletestCreateWorkspaces() *serpent.Command {
 
 func (r *RootCmd) scaletestWorkspaceTraffic() *serpent.Command {
 	var (
-		tickInterval     time.Duration
-		bytesPerTick     int64
-		ssh              bool
-		app              string
-		template         string
-		targetWorkspaces string
+		tickInterval      time.Duration
+		bytesPerTick      int64
+		ssh               bool
+		useHostLogin      bool
+		app               string
+		template          string
+		targetWorkspaces  string
+		workspaceProxyURL string
 
 		client          = &codersdk.Client{}
 		tracingFlags    = &scaletestTracingFlags{}
@@ -933,9 +929,17 @@ func (r *RootCmd) scaletestWorkspaceTraffic() *serpent.Command {
 				return xerrors.Errorf("get app host: %w", err)
 			}
 
-			workspaces, err := getScaletestWorkspaces(inv.Context(), client, template)
+			var owner string
+			if useHostLogin {
+				owner = codersdk.Me
+			}
+
+			workspaces, numSkipped, err := getScaletestWorkspaces(inv.Context(), client, owner, template)
 			if err != nil {
 				return err
+			}
+			if numSkipped > 0 {
+				cliui.Warnf(inv.Stdout, "CODER_DISABLE_OWNER_WORKSPACE_ACCESS is set on the deployment.\n\t%d workspace(s) were skipped due to ownership mismatch.\n\tSet --use-host-login to only target workspaces you own.", numSkipped)
 			}
 
 			if targetWorkspaceEnd == 0 {
@@ -1000,6 +1004,23 @@ func (r *RootCmd) scaletestWorkspaceTraffic() *serpent.Command {
 					return xerrors.Errorf("configure workspace app: %w", err)
 				}
 
+				var webClient *codersdk.Client
+				if workspaceProxyURL != "" {
+					u, err := url.Parse(workspaceProxyURL)
+					if err != nil {
+						return xerrors.Errorf("parse workspace proxy URL: %w", err)
+					}
+
+					webClient = codersdk.New(u)
+					webClient.HTTPClient = client.HTTPClient
+					webClient.SetSessionToken(client.SessionToken())
+
+					appConfig, err = createWorkspaceAppConfig(webClient, appHost.Host, app, ws, agent)
+					if err != nil {
+						return xerrors.Errorf("configure proxy workspace app: %w", err)
+					}
+				}
+
 				// Setup our workspace agent connection.
 				config := workspacetraffic.Config{
 					AgentID:      agent.ID,
@@ -1011,6 +1032,10 @@ func (r *RootCmd) scaletestWorkspaceTraffic() *serpent.Command {
 					SSH:          ssh,
 					Echo:         ssh,
 					App:          appConfig,
+				}
+
+				if webClient != nil {
+					config.WebClient = webClient
 				}
 
 				if err := config.Validate(); err != nil {
@@ -1098,6 +1123,20 @@ func (r *RootCmd) scaletestWorkspaceTraffic() *serpent.Command {
 			Default:     "",
 			Description: "Send WebSocket traffic to a workspace app (proxied via coderd), cannot be used with --ssh.",
 			Value:       serpent.StringOf(&app),
+		},
+		{
+			Flag:        "use-host-login",
+			Env:         "CODER_SCALETEST_USE_HOST_LOGIN",
+			Default:     "false",
+			Description: "Connect as the currently logged in user.",
+			Value:       serpent.BoolOf(&useHostLogin),
+		},
+		{
+			Flag:        "workspace-proxy-url",
+			Env:         "CODER_SCALETEST_WORKSPACE_PROXY_URL",
+			Default:     "",
+			Description: "URL for workspace proxy to send web traffic to.",
+			Value:       serpent.StringOf(&workspaceProxyURL),
 		},
 	}
 
@@ -1385,22 +1424,35 @@ func isScaleTestWorkspace(workspace codersdk.Workspace) bool {
 		strings.HasPrefix(workspace.Name, "scaletest-")
 }
 
-func getScaletestWorkspaces(ctx context.Context, client *codersdk.Client, template string) ([]codersdk.Workspace, error) {
+func getScaletestWorkspaces(ctx context.Context, client *codersdk.Client, owner, template string) ([]codersdk.Workspace, int, error) {
 	var (
 		pageNumber = 0
 		limit      = 100
 		workspaces []codersdk.Workspace
+		skipped    int
 	)
+
+	me, err := client.User(ctx, codersdk.Me)
+	if err != nil {
+		return nil, 0, xerrors.Errorf("check logged-in user")
+	}
+
+	dv, err := client.DeploymentConfig(ctx)
+	if err != nil {
+		return nil, 0, xerrors.Errorf("fetch deployment config: %w", err)
+	}
+	noOwnerAccess := dv.Values != nil && dv.Values.DisableOwnerWorkspaceExec.Value()
 
 	for {
 		page, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
 			Name:     "scaletest-",
 			Template: template,
+			Owner:    owner,
 			Offset:   pageNumber * limit,
 			Limit:    limit,
 		})
 		if err != nil {
-			return nil, xerrors.Errorf("fetch scaletest workspaces page %d: %w", pageNumber, err)
+			return nil, 0, xerrors.Errorf("fetch scaletest workspaces page %d: %w", pageNumber, err)
 		}
 
 		pageNumber++
@@ -1410,13 +1462,18 @@ func getScaletestWorkspaces(ctx context.Context, client *codersdk.Client, templa
 
 		pageWorkspaces := make([]codersdk.Workspace, 0, len(page.Workspaces))
 		for _, w := range page.Workspaces {
-			if isScaleTestWorkspace(w) {
-				pageWorkspaces = append(pageWorkspaces, w)
+			if !isScaleTestWorkspace(w) {
+				continue
 			}
+			if noOwnerAccess && w.OwnerID != me.ID {
+				skipped++
+				continue
+			}
+			pageWorkspaces = append(pageWorkspaces, w)
 		}
 		workspaces = append(workspaces, pageWorkspaces...)
 	}
-	return workspaces, nil
+	return workspaces, skipped, nil
 }
 
 func getScaletestUsers(ctx context.Context, client *codersdk.Client) ([]codersdk.User, error) {

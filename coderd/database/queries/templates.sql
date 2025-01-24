@@ -2,7 +2,7 @@
 SELECT
 	*
 FROM
-	template_with_users
+	template_with_names
 WHERE
 	id = $1
 LIMIT
@@ -12,7 +12,7 @@ LIMIT
 SELECT
 	*
 FROM
-	template_with_users AS templates
+	template_with_names AS templates
 WHERE
 	-- Optionally include deleted templates
 	templates.deleted = @deleted
@@ -26,6 +26,12 @@ WHERE
 	AND CASE
 		WHEN @exact_name :: text != '' THEN
 			LOWER("name") = LOWER(@exact_name)
+		ELSE true
+	END
+	-- Filter by name, matching on substring
+	AND CASE
+		WHEN @fuzzy_name :: text != '' THEN
+			lower(name) ILIKE '%' || lower(@fuzzy_name) || '%'
 		ELSE true
 	END
 	-- Filter by ids
@@ -54,7 +60,7 @@ ORDER BY (name, id) ASC
 SELECT
 	*
 FROM
-	template_with_users AS templates
+	template_with_names AS templates
 WHERE
 	organization_id = @organization_id
 	AND deleted = @deleted
@@ -63,7 +69,7 @@ LIMIT
 	1;
 
 -- name: GetTemplates :many
-SELECT * FROM template_with_users AS templates
+SELECT * FROM template_with_names AS templates
 ORDER BY (name, id) ASC
 ;
 

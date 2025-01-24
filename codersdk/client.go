@@ -79,6 +79,9 @@ const (
 	// ProvisionerDaemonPSK contains the authentication pre-shared key for an external provisioner daemon
 	ProvisionerDaemonPSK = "Coder-Provisioner-Daemon-PSK"
 
+	// ProvisionerDaemonKey contains the authentication key for an external provisioner daemon
+	ProvisionerDaemonKey = "Coder-Provisioner-Daemon-Key"
+
 	// BuildVersionHeader contains build information of Coder.
 	BuildVersionHeader = "X-Coder-Build-Version"
 
@@ -189,6 +192,9 @@ func prefixLines(prefix, s []byte) []byte {
 // Request performs a HTTP request with the body provided. The caller is
 // responsible for closing the response body.
 func (c *Client) Request(ctx context.Context, method, path string, body interface{}, opts ...RequestOption) (*http.Response, error) {
+	if ctx == nil {
+		return nil, xerrors.Errorf("context should not be nil")
+	}
 	ctx, span := tracing.StartSpanWithName(ctx, tracing.FuncNameSkip(1))
 	defer span.End()
 

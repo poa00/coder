@@ -3,6 +3,7 @@
 package pubsub_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -13,12 +14,15 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
+	"cdr.dev/slog/sloggers/sloghuman"
 	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/database/pubsub"
+	"github.com/coder/coder/v2/coderd/database/pubsub/psmock"
 	"github.com/coder/coder/v2/testutil"
 )
 
@@ -34,11 +38,10 @@ func TestPubsub(t *testing.T) {
 	t.Run("Postgres", func(t *testing.T) {
 		ctx, cancelFunc := context.WithCancel(context.Background())
 		defer cancelFunc()
-		logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+		logger := testutil.Logger(t)
 
-		connectionURL, closePg, err := dbtestutil.Open()
+		connectionURL, err := dbtestutil.Open(t)
 		require.NoError(t, err)
-		defer closePg()
 		db, err := sql.Open("postgres", connectionURL)
 		require.NoError(t, err)
 		defer db.Close()
@@ -64,10 +67,9 @@ func TestPubsub(t *testing.T) {
 	t.Run("PostgresCloseCancel", func(t *testing.T) {
 		ctx, cancelFunc := context.WithCancel(context.Background())
 		defer cancelFunc()
-		logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
-		connectionURL, closePg, err := dbtestutil.Open()
+		logger := testutil.Logger(t)
+		connectionURL, err := dbtestutil.Open(t)
 		require.NoError(t, err)
-		defer closePg()
 		db, err := sql.Open("postgres", connectionURL)
 		require.NoError(t, err)
 		defer db.Close()
@@ -80,10 +82,9 @@ func TestPubsub(t *testing.T) {
 	t.Run("NotClosedOnCancelContext", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
-		connectionURL, closePg, err := dbtestutil.Open()
+		logger := testutil.Logger(t)
+		connectionURL, err := dbtestutil.Open(t)
 		require.NoError(t, err)
-		defer closePg()
 		db, err := sql.Open("postgres", connectionURL)
 		require.NoError(t, err)
 		defer db.Close()
@@ -116,11 +117,10 @@ func TestPubsub_ordering(t *testing.T) {
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	defer cancelFunc()
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 
-	connectionURL, closePg, err := dbtestutil.Open()
+	connectionURL, err := dbtestutil.Open(t)
 	require.NoError(t, err)
-	defer closePg()
 	db, err := sql.Open("postgres", connectionURL)
 	require.NoError(t, err)
 	defer db.Close()
@@ -163,7 +163,7 @@ const disconnectTestPort = 26892
 func TestPubsub_Disconnect(t *testing.T) {
 	// we always use a Docker container for this test, even in CI, since we need to be able to kill
 	// postgres and bring it back on the same port.
-	connectionURL, closePg, err := dbtestutil.OpenContainerized(disconnectTestPort)
+	connectionURL, closePg, err := dbtestutil.OpenContainerized(t, dbtestutil.DBContainerOptions{Port: disconnectTestPort})
 	require.NoError(t, err)
 	defer closePg()
 	db, err := sql.Open("postgres", connectionURL)
@@ -234,7 +234,7 @@ func TestPubsub_Disconnect(t *testing.T) {
 
 	// restart postgres on the same port --- since we only use LISTEN/NOTIFY it doesn't
 	// matter that the new postgres doesn't have any persisted state from before.
-	_, closeNewPg, err := dbtestutil.OpenContainerized(disconnectTestPort)
+	_, closeNewPg, err := dbtestutil.OpenContainerized(t, dbtestutil.DBContainerOptions{Port: disconnectTestPort})
 	require.NoError(t, err)
 	defer closeNewPg()
 
@@ -293,4 +293,114 @@ func TestPubsub_Disconnect(t *testing.T) {
 		}
 	}
 	require.True(t, gotDroppedErr)
+}
+
+func TestMeasureLatency(t *testing.T) {
+	t.Parallel()
+
+	newPubsub := func() (pubsub.Pubsub, func()) {
+		ctx, cancel := context.WithCancel(context.Background())
+		logger := testutil.Logger(t)
+		connectionURL, err := dbtestutil.Open(t)
+		require.NoError(t, err)
+		db, err := sql.Open("postgres", connectionURL)
+		require.NoError(t, err)
+		ps, err := pubsub.New(ctx, logger, db, connectionURL)
+		require.NoError(t, err)
+
+		return ps, func() {
+			_ = ps.Close()
+			_ = db.Close()
+			cancel()
+		}
+	}
+
+	t.Run("MeasureLatency", func(t *testing.T) {
+		t.Parallel()
+
+		logger := testutil.Logger(t)
+		ps, done := newPubsub()
+		defer done()
+
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
+		defer cancel()
+
+		send, recv, err := pubsub.NewLatencyMeasurer(logger).Measure(ctx, ps)
+		require.NoError(t, err)
+		require.Greater(t, send.Seconds(), 0.0)
+		require.Greater(t, recv.Seconds(), 0.0)
+	})
+
+	t.Run("MeasureLatencyRecvTimeout", func(t *testing.T) {
+		t.Parallel()
+
+		logger := testutil.Logger(t)
+		ctrl := gomock.NewController(t)
+		ps := psmock.NewMockPubsub(ctrl)
+
+		ps.EXPECT().Subscribe(gomock.Any(), gomock.Any()).Return(func() {}, (error)(nil))
+		ps.EXPECT().Publish(gomock.Any(), gomock.Any()).Return((error)(nil))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		send, recv, err := pubsub.NewLatencyMeasurer(logger).Measure(ctx, ps)
+		require.ErrorContains(t, err, context.Canceled.Error())
+		require.GreaterOrEqual(t, send.Nanoseconds(), int64(0))
+		require.EqualValues(t, recv, time.Duration(-1))
+	})
+
+	t.Run("MeasureLatencyNotifyRace", func(t *testing.T) {
+		t.Parallel()
+
+		var buf bytes.Buffer
+		logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true}).Leveled(slog.LevelDebug)
+		logger = logger.AppendSinks(sloghuman.Sink(&buf))
+
+		lm := pubsub.NewLatencyMeasurer(logger)
+		ps, done := newPubsub()
+		defer done()
+
+		racy := newRacyPubsub(ps)
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
+		defer cancel()
+
+		send, recv, err := lm.Measure(ctx, racy)
+		assert.NoError(t, err)
+		assert.Greater(t, send.Seconds(), 0.0)
+		assert.Greater(t, recv.Seconds(), 0.0)
+
+		logger.Sync()
+		assert.Contains(t, buf.String(), "received unexpected message")
+	})
+}
+
+// racyPubsub simulates a race on the same channel by publishing two messages (one expected, one not).
+// This is used to verify that a subscriber will only listen for the message it explicitly expects.
+type racyPubsub struct {
+	pubsub.Pubsub
+}
+
+func newRacyPubsub(ps pubsub.Pubsub) *racyPubsub {
+	return &racyPubsub{ps}
+}
+
+func (s *racyPubsub) Subscribe(event string, listener pubsub.Listener) (cancel func(), err error) {
+	return s.Pubsub.Subscribe(event, listener)
+}
+
+func (s *racyPubsub) SubscribeWithErr(event string, listener pubsub.ListenerWithErr) (cancel func(), err error) {
+	return s.Pubsub.SubscribeWithErr(event, listener)
+}
+
+func (s *racyPubsub) Publish(event string, message []byte) error {
+	err := s.Pubsub.Publish(event, []byte("nonsense"))
+	if err != nil {
+		return xerrors.Errorf("failed to send simulated race: %w", err)
+	}
+	return s.Pubsub.Publish(event, message)
+}
+
+func (s *racyPubsub) Close() error {
+	return s.Pubsub.Close()
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"errors"
 	"expvar"
 	"flag"
 	"fmt"
@@ -37,13 +38,20 @@ import (
 	"tailscale.com/util/singleflight"
 
 	"cdr.dev/slog"
+	"github.com/coder/quartz"
+	"github.com/coder/serpent"
+
+	"github.com/coder/coder/v2/coderd/cryptokeys"
+	"github.com/coder/coder/v2/coderd/entitlements"
+	"github.com/coder/coder/v2/coderd/idpsync"
+	"github.com/coder/coder/v2/coderd/runtimeconfig"
+
 	agentproto "github.com/coder/coder/v2/agent/proto"
 	"github.com/coder/coder/v2/buildinfo"
 	_ "github.com/coder/coder/v2/coderd/apidoc" // Used for swagger docs.
 	"github.com/coder/coder/v2/coderd/appearance"
 	"github.com/coder/coder/v2/coderd/audit"
 	"github.com/coder/coder/v2/coderd/awsidentity"
-	"github.com/coder/coder/v2/coderd/batchstats"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbrollup"
@@ -56,17 +64,20 @@ import (
 	"github.com/coder/coder/v2/coderd/httpapi"
 	"github.com/coder/coder/v2/coderd/httpmw"
 	"github.com/coder/coder/v2/coderd/metricscache"
+	"github.com/coder/coder/v2/coderd/notifications"
 	"github.com/coder/coder/v2/coderd/portsharing"
 	"github.com/coder/coder/v2/coderd/prometheusmetrics"
 	"github.com/coder/coder/v2/coderd/provisionerdserver"
 	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/policy"
+	"github.com/coder/coder/v2/coderd/rbac/rolestore"
 	"github.com/coder/coder/v2/coderd/schedule"
 	"github.com/coder/coder/v2/coderd/telemetry"
 	"github.com/coder/coder/v2/coderd/tracing"
 	"github.com/coder/coder/v2/coderd/updatecheck"
 	"github.com/coder/coder/v2/coderd/util/slice"
 	"github.com/coder/coder/v2/coderd/workspaceapps"
-	"github.com/coder/coder/v2/coderd/workspaceusage"
+	"github.com/coder/coder/v2/coderd/workspacestats"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/drpc"
 	"github.com/coder/coder/v2/codersdk/healthsdk"
@@ -74,7 +85,6 @@ import (
 	"github.com/coder/coder/v2/provisionersdk"
 	"github.com/coder/coder/v2/site"
 	"github.com/coder/coder/v2/tailnet"
-	"github.com/coder/serpent"
 )
 
 // We must only ever instantiate one httpSwagger.Handler because of a data race
@@ -85,7 +95,31 @@ import (
 var globalHTTPSwaggerHandler http.HandlerFunc
 
 func init() {
-	globalHTTPSwaggerHandler = httpSwagger.Handler(httpSwagger.URL("/swagger/doc.json"))
+	globalHTTPSwaggerHandler = httpSwagger.Handler(
+		httpSwagger.URL("/swagger/doc.json"),
+		// The swagger UI has an "Authorize" button that will input the
+		// credentials into the Coder-Session-Token header. This bypasses
+		// CSRF checks **if** there is no cookie auth also present.
+		// (If the cookie matches, then it's ok too)
+		//
+		// Because swagger is hosted on the same domain, we have the cookie
+		// auth and the header auth competing. This can cause CSRF errors,
+		// and can be confusing what authentication is being used.
+		//
+		// So remove authenticating via a cookie, and rely on the authorization
+		// header passed in.
+		httpSwagger.UIConfig(map[string]string{
+			// Pulled from https://swagger.io/docs/open-source-tools/swagger-ui/usage/configuration/
+			// 'withCredentials' should disable fetch sending browser credentials, but
+			// for whatever reason it does not.
+			// So this `requestInterceptor` ensures browser credentials are
+			// omitted from all requests.
+			"requestInterceptor": `(a => {
+				a.credentials = "omit";
+				return a;
+			})`,
+			"withCredentials": "false",
+		}))
 }
 
 var expDERPOnce = sync.Once{}
@@ -105,6 +139,7 @@ type Options struct {
 	Logger           slog.Logger
 	Database         database.Store
 	Pubsub           pubsub.Pubsub
+	RuntimeConfig    *runtimeconfig.Manager
 
 	// CacheDir is used for caching files served by the API.
 	CacheDir string
@@ -129,6 +164,9 @@ type Options struct {
 	TrialGenerator                 func(ctx context.Context, body codersdk.LicensorTrialRequest) error
 	// RefreshEntitlements is used to set correct entitlements after creating first user and generating trial license.
 	RefreshEntitlements func(ctx context.Context) error
+	// Entitlements can come from the enterprise caller if enterprise code is
+	// included.
+	Entitlements *entitlements.Set
 	// PostAuthAdditionalHeadersFunc is used to add additional headers to the response
 	// after a successful authentication.
 	// This is somewhat janky, but seemingly the only reasonable way to add a header
@@ -141,17 +179,17 @@ type Options struct {
 	DERPServer         *derp.Server
 	// BaseDERPMap is used as the base DERP map for all clients and agents.
 	// Proxies are added to this list.
-	BaseDERPMap                 *tailcfg.DERPMap
-	DERPMapUpdateFrequency      time.Duration
-	SwaggerEndpoint             bool
-	SetUserGroups               func(ctx context.Context, logger slog.Logger, tx database.Store, userID uuid.UUID, orgGroupNames map[uuid.UUID][]string, createMissingGroups bool) error
-	SetUserSiteRoles            func(ctx context.Context, logger slog.Logger, tx database.Store, userID uuid.UUID, roles []string) error
-	TemplateScheduleStore       *atomic.Pointer[schedule.TemplateScheduleStore]
-	UserQuietHoursScheduleStore *atomic.Pointer[schedule.UserQuietHoursScheduleStore]
-	AccessControlStore          *atomic.Pointer[dbauthz.AccessControlStore]
-	// AppSecurityKey is the crypto key used to sign and encrypt tokens related to
-	// workspace applications. It consists of both a signing and encryption key.
-	AppSecurityKey workspaceapps.SecurityKey
+	BaseDERPMap                    *tailcfg.DERPMap
+	DERPMapUpdateFrequency         time.Duration
+	NetworkTelemetryBatchFrequency time.Duration
+	NetworkTelemetryBatchMaxSize   int
+	SwaggerEndpoint                bool
+	TemplateScheduleStore          *atomic.Pointer[schedule.TemplateScheduleStore]
+	UserQuietHoursScheduleStore    *atomic.Pointer[schedule.UserQuietHoursScheduleStore]
+	AccessControlStore             *atomic.Pointer[dbauthz.AccessControlStore]
+	// CoordinatorResumeTokenProvider is used to provide and validate resume
+	// tokens issued by and passed to the coordinator DRPC API.
+	CoordinatorResumeTokenProvider tailnet.ResumeTokenProvider
 
 	HealthcheckFunc              func(ctx context.Context, apiKey string) *healthsdk.HealthcheckReport
 	HealthcheckTimeout           time.Duration
@@ -186,7 +224,7 @@ type Options struct {
 	HTTPClient *http.Client
 
 	UpdateAgentMetrics func(ctx context.Context, labels prometheusmetrics.AgentMetricLabels, metrics []*agentproto.Stats_Metric)
-	StatsBatcher       *batchstats.Batcher
+	StatsBatcher       workspacestats.Batcher
 
 	WorkspaceAppsStatsCollectorOptions workspaceapps.StatsCollectorOptions
 
@@ -203,7 +241,21 @@ type Options struct {
 	// stats. This is used to provide insights in the WebUI.
 	DatabaseRolluper *dbrollup.Rolluper
 	// WorkspaceUsageTracker tracks workspace usage by the CLI.
-	WorkspaceUsageTracker *workspaceusage.Tracker
+	WorkspaceUsageTracker *workspacestats.UsageTracker
+	// NotificationsEnqueuer handles enqueueing notifications for delivery by SMTP, webhook, etc.
+	NotificationsEnqueuer notifications.Enqueuer
+
+	// IDPSync holds all configured values for syncing external IDP users into Coder.
+	IDPSync idpsync.IDPSync
+
+	// OneTimePasscodeValidityPeriod specifies how long a one time passcode should be valid for.
+	OneTimePasscodeValidityPeriod time.Duration
+
+	// Keycaches
+	AppSigningKeyCache    cryptokeys.SigningKeycache
+	AppEncryptionKeyCache cryptokeys.EncryptionKeycache
+	OIDCConvertKeyCache   cryptokeys.SigningKeycache
+	Clock                 quartz.Clock
 }
 
 // @title Coder API
@@ -220,6 +272,10 @@ type Options struct {
 
 // @BasePath /api/v2
 
+// @securitydefinitions.apiKey Authorization
+// @in header
+// @name Authorizaiton
+
 // @securitydefinitions.apiKey CoderSessionToken
 // @in header
 // @name Coder-Session-Token
@@ -227,6 +283,9 @@ type Options struct {
 func New(options *Options) *API {
 	if options == nil {
 		options = &Options{}
+	}
+	if options.Entitlements == nil {
+		options.Entitlements = entitlements.New()
 	}
 	if options.NewTicker == nil {
 		options.NewTicker = func(duration time.Duration) (tick <-chan time.Time, done func()) {
@@ -263,6 +322,10 @@ func New(options *Options) *API {
 		options.AccessControlStore,
 	)
 
+	if options.IDPSync == nil {
+		options.IDPSync = idpsync.NewAGPLSync(options.Logger, options.RuntimeConfig, idpsync.FromDeploymentValues(options.DeploymentValues))
+	}
+
 	experiments := ReadExperiments(
 		options.Logger, options.DeploymentValues.Experiments.Value(),
 	)
@@ -298,11 +361,20 @@ func New(options *Options) *API {
 	if options.PrometheusRegistry == nil {
 		options.PrometheusRegistry = prometheus.NewRegistry()
 	}
+	if options.Clock == nil {
+		options.Clock = quartz.NewReal()
+	}
 	if options.DERPServer == nil && options.DeploymentValues.DERP.Server.Enable {
 		options.DERPServer = derp.NewServer(key.NewNode(), tailnet.Logger(options.Logger.Named("derp")))
 	}
 	if options.DERPMapUpdateFrequency == 0 {
 		options.DERPMapUpdateFrequency = 5 * time.Second
+	}
+	if options.NetworkTelemetryBatchFrequency == 0 {
+		options.NetworkTelemetryBatchFrequency = 1 * time.Minute
+	}
+	if options.NetworkTelemetryBatchMaxSize == 0 {
+		options.NetworkTelemetryBatchMaxSize = 1_000
 	}
 	if options.TailnetCoordinator == nil {
 		options.TailnetCoordinator = tailnet.NewCoordinator(options.Logger)
@@ -315,24 +387,6 @@ func New(options *Options) *API {
 	}
 	if options.TracerProvider == nil {
 		options.TracerProvider = trace.NewNoopTracerProvider()
-	}
-	if options.SetUserGroups == nil {
-		options.SetUserGroups = func(ctx context.Context, logger slog.Logger, _ database.Store, userID uuid.UUID, orgGroupNames map[uuid.UUID][]string, createMissingGroups bool) error {
-			logger.Warn(ctx, "attempted to assign OIDC groups without enterprise license",
-				slog.F("user_id", userID),
-				slog.F("groups", orgGroupNames),
-				slog.F("create_missing_groups", createMissingGroups),
-			)
-			return nil
-		}
-	}
-	if options.SetUserSiteRoles == nil {
-		options.SetUserSiteRoles = func(ctx context.Context, logger slog.Logger, _ database.Store, userID uuid.UUID, roles []string) error {
-			logger.Warn(ctx, "attempted to assign OIDC user roles without enterprise license",
-				slog.F("user_id", userID), slog.F("roles", roles),
-			)
-			return nil
-		}
 	}
 	if options.TemplateScheduleStore == nil {
 		options.TemplateScheduleStore = &atomic.Pointer[schedule.TemplateScheduleStore]{}
@@ -347,6 +401,9 @@ func New(options *Options) *API {
 	if options.UserQuietHoursScheduleStore.Load() == nil {
 		v := schedule.NewAGPLUserQuietHoursScheduleStore()
 		options.UserQuietHoursScheduleStore.Store(&v)
+	}
+	if options.OneTimePasscodeValidityPeriod == 0 {
+		options.OneTimePasscodeValidityPeriod = 20 * time.Minute
 	}
 
 	if options.StatsBatcher == nil {
@@ -369,6 +426,7 @@ func New(options *Options) *API {
 			TemplateBuildTimes: options.MetricsCacheRefreshInterval,
 			DeploymentStats:    options.AgentStatsRefreshInterval,
 		},
+		experiments.Enabled(codersdk.ExperimentWorkspaceUsage),
 	)
 
 	oauthConfigs := &httpmw.OAuth2Configs{
@@ -381,9 +439,13 @@ func New(options *Options) *API {
 	}
 
 	if options.WorkspaceUsageTracker == nil {
-		options.WorkspaceUsageTracker = workspaceusage.New(options.Database,
-			workspaceusage.WithLogger(options.Logger.Named("workspace_usage_tracker")),
+		options.WorkspaceUsageTracker = workspacestats.NewTracker(options.Database,
+			workspacestats.TrackerWithLogger(options.Logger.Named("workspace_usage_tracker")),
 		)
+	}
+
+	if options.NotificationsEnqueuer == nil {
+		options.NotificationsEnqueuer = notifications.NewNoopEnqueuer()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -394,6 +456,71 @@ func New(options *Options) *API {
 	if err != nil {
 		panic(xerrors.Errorf("get deployment ID: %w", err))
 	}
+
+	fetcher := &cryptokeys.DBFetcher{
+		DB: options.Database,
+	}
+
+	if options.OIDCConvertKeyCache == nil {
+		options.OIDCConvertKeyCache, err = cryptokeys.NewSigningCache(ctx,
+			options.Logger.Named("oidc_convert_keycache"),
+			fetcher,
+			codersdk.CryptoKeyFeatureOIDCConvert,
+		)
+		if err != nil {
+			options.Logger.Fatal(ctx, "failed to properly instantiate oidc convert signing cache", slog.Error(err))
+		}
+	}
+
+	if options.AppSigningKeyCache == nil {
+		options.AppSigningKeyCache, err = cryptokeys.NewSigningCache(ctx,
+			options.Logger.Named("app_signing_keycache"),
+			fetcher,
+			codersdk.CryptoKeyFeatureWorkspaceAppsToken,
+		)
+		if err != nil {
+			options.Logger.Fatal(ctx, "failed to properly instantiate app signing key cache", slog.Error(err))
+		}
+	}
+
+	if options.AppEncryptionKeyCache == nil {
+		options.AppEncryptionKeyCache, err = cryptokeys.NewEncryptionCache(ctx,
+			options.Logger,
+			fetcher,
+			codersdk.CryptoKeyFeatureWorkspaceAppsAPIKey,
+		)
+		if err != nil {
+			options.Logger.Fatal(ctx, "failed to properly instantiate app encryption key cache", slog.Error(err))
+		}
+	}
+
+	if options.CoordinatorResumeTokenProvider == nil {
+		fetcher := &cryptokeys.DBFetcher{
+			DB: options.Database,
+		}
+
+		resumeKeycache, err := cryptokeys.NewSigningCache(ctx,
+			options.Logger,
+			fetcher,
+			codersdk.CryptoKeyFeatureTailnetResume,
+		)
+		if err != nil {
+			options.Logger.Fatal(ctx, "failed to properly instantiate tailnet resume signing cache", slog.Error(err))
+		}
+		options.CoordinatorResumeTokenProvider = tailnet.NewResumeTokenKeyProvider(
+			resumeKeycache,
+			options.Clock,
+			tailnet.DefaultResumeTokenExpiry,
+		)
+	}
+
+	updatesProvider := NewUpdatesProvider(options.Logger.Named("workspace_updates"), options.Pubsub, options.Database, options.Authorizer)
+
+	// Start a background process that rotates keys. We intentionally start this after the caches
+	// are created to force initial requests for a key to populate the caches. This helps catch
+	// bugs that may only occur when a key isn't precached in tests and the latency cost is minimal.
+	cryptokeys.StartRotator(ctx, options.Logger, options.Database)
+
 	api := &API{
 		ctx:          ctx,
 		cancel:       cancel,
@@ -414,11 +541,12 @@ func New(options *Options) *API {
 			options.DeploymentValues,
 			oauthConfigs,
 			options.AgentInactiveDisconnectTimeout,
-			options.AppSecurityKey,
+			options.AppSigningKeyCache,
 		),
 		metricsCache:                metricsCache,
 		Auditor:                     atomic.Pointer[audit.Auditor]{},
 		TailnetCoordinator:          atomic.Pointer[tailnet.Coordinator]{},
+		UpdatesProvider:             updatesProvider,
 		TemplateScheduleStore:       options.TemplateScheduleStore,
 		UserQuietHoursScheduleStore: options.UserQuietHoursScheduleStore,
 		AccessControlStore:          options.AccessControlStore,
@@ -430,12 +558,23 @@ func New(options *Options) *API {
 			options.Database,
 			options.Pubsub,
 		),
-		dbRolluper:            options.DatabaseRolluper,
-		workspaceUsageTracker: options.WorkspaceUsageTracker,
+		dbRolluper: options.DatabaseRolluper,
 	}
 
-	api.AppearanceFetcher.Store(&appearance.DefaultFetcher)
+	f := appearance.NewDefaultFetcher(api.DeploymentValues.DocsURL.String())
+	api.AppearanceFetcher.Store(&f)
 	api.PortSharer.Store(&portsharing.DefaultPortSharer)
+	buildInfo := codersdk.BuildInfoResponse{
+		ExternalURL:           buildinfo.ExternalURL(),
+		Version:               buildinfo.Version(),
+		AgentAPIVersion:       AgentAPIVersionREST,
+		ProvisionerAPIVersion: proto.CurrentVersion.String(),
+		DashboardURL:          api.AccessURL.String(),
+		WorkspaceProxy:        false,
+		UpgradeMessage:        api.DeploymentValues.CLIUpgradeMessage.String(),
+		DeploymentID:          api.DeploymentID,
+		Telemetry:             api.Telemetry.Enabled(),
+	}
 	api.SiteHandler = site.New(&site.Options{
 		BinFS:             binFS,
 		BinHashes:         binHashes,
@@ -444,6 +583,8 @@ func New(options *Options) *API {
 		OAuth2Configs:     oauthConfigs,
 		DocsURL:           options.DeploymentValues.DocsURL.String(),
 		AppearanceFetcher: &api.AppearanceFetcher,
+		BuildInfo:         buildInfo,
+		Entitlements:      options.Entitlements,
 	})
 	api.SiteHandler.Experiments.Store(&experiments)
 
@@ -487,7 +628,8 @@ func New(options *Options) *API {
 					CurrentVersion:         buildinfo.Version(),
 					CurrentAPIMajorVersion: proto.CurrentMajor,
 					Store:                  options.Database,
-					// TimeNow and StaleInterval set to defaults, see healthcheck/provisioner.go
+					StaleInterval:          provisionerdserver.StaleInterval,
+					// TimeNow set to default, see healthcheck/provisioner.go
 				},
 			})
 		}
@@ -507,14 +649,17 @@ func New(options *Options) *API {
 
 	api.Auditor.Store(&options.Auditor)
 	api.TailnetCoordinator.Store(&options.TailnetCoordinator)
+	dialer := &InmemTailnetDialer{
+		CoordPtr: &api.TailnetCoordinator,
+		DERPFn:   api.DERPMap,
+		Logger:   options.Logger,
+		ClientID: uuid.New(),
+	}
 	stn, err := NewServerTailnet(api.ctx,
 		options.Logger,
 		options.DERPServer,
-		api.DERPMap,
+		dialer,
 		options.DeploymentValues.DERP.Config.ForceWebSockets.Value(),
-		func(context.Context) (tailnet.MultiAgentConn, error) {
-			return (*api.TailnetCoordinator.Load()).ServeMultiAgent(uuid.New()), nil
-		},
 		options.DeploymentValues.DERP.Config.BlockDirect.Value(),
 		api.TracerProvider,
 	)
@@ -525,23 +670,45 @@ func New(options *Options) *API {
 	if options.DeploymentValues.Prometheus.Enable {
 		options.PrometheusRegistry.MustRegister(stn)
 	}
-	api.TailnetClientService, err = tailnet.NewClientService(
-		api.Logger.Named("tailnetclient"),
-		&api.TailnetCoordinator,
-		api.Options.DERPMapUpdateFrequency,
-		api.DERPMap,
+	api.NetworkTelemetryBatcher = tailnet.NewNetworkTelemetryBatcher(
+		quartz.NewReal(),
+		api.Options.NetworkTelemetryBatchFrequency,
+		api.Options.NetworkTelemetryBatchMaxSize,
+		api.handleNetworkTelemetry,
 	)
+	if options.CoordinatorResumeTokenProvider == nil {
+		panic("CoordinatorResumeTokenProvider is nil")
+	}
+	api.TailnetClientService, err = tailnet.NewClientService(tailnet.ClientServiceOptions{
+		Logger:                   api.Logger.Named("tailnetclient"),
+		CoordPtr:                 &api.TailnetCoordinator,
+		DERPMapUpdateFrequency:   api.Options.DERPMapUpdateFrequency,
+		DERPMapFn:                api.DERPMap,
+		NetworkTelemetryHandler:  api.NetworkTelemetryBatcher.Handler,
+		ResumeTokenProvider:      api.Options.CoordinatorResumeTokenProvider,
+		WorkspaceUpdatesProvider: api.UpdatesProvider,
+	})
 	if err != nil {
-		api.Logger.Fatal(api.ctx, "failed to initialize tailnet client service", slog.Error(err))
+		api.Logger.Fatal(context.Background(), "failed to initialize tailnet client service", slog.Error(err))
 	}
 
+	api.statsReporter = workspacestats.NewReporter(workspacestats.ReporterOptions{
+		Database:              options.Database,
+		Logger:                options.Logger.Named("workspacestats"),
+		Pubsub:                options.Pubsub,
+		TemplateScheduleStore: options.TemplateScheduleStore,
+		StatsBatcher:          options.StatsBatcher,
+		UsageTracker:          options.WorkspaceUsageTracker,
+		UpdateAgentMetricsFn:  options.UpdateAgentMetrics,
+		AppStatBatchSize:      workspaceapps.DefaultStatsDBReporterBatchSize,
+	})
 	workspaceAppsLogger := options.Logger.Named("workspaceapps")
 	if options.WorkspaceAppsStatsCollectorOptions.Logger == nil {
 		named := workspaceAppsLogger.Named("stats_collector")
 		options.WorkspaceAppsStatsCollectorOptions.Logger = &named
 	}
 	if options.WorkspaceAppsStatsCollectorOptions.Reporter == nil {
-		options.WorkspaceAppsStatsCollectorOptions.Reporter = workspaceapps.NewStatsDBReporter(options.Database, workspaceapps.DefaultStatsDBReporterBatchSize)
+		options.WorkspaceAppsStatsCollectorOptions.Reporter = api.statsReporter
 	}
 
 	api.workspaceAppServer = &workspaceapps.Server{
@@ -555,15 +722,16 @@ func New(options *Options) *API {
 
 		SignedTokenProvider: api.WorkspaceAppsProvider,
 		AgentProvider:       api.agentProvider,
-		AppSecurityKey:      options.AppSecurityKey,
 		StatsCollector:      workspaceapps.NewStatsCollector(options.WorkspaceAppsStatsCollectorOptions),
 
-		DisablePathApps:  options.DeploymentValues.DisablePathApps.Value(),
-		SecureAuthCookie: options.DeploymentValues.SecureAuthCookie.Value(),
+		DisablePathApps:          options.DeploymentValues.DisablePathApps.Value(),
+		SecureAuthCookie:         options.DeploymentValues.SecureAuthCookie.Value(),
+		APIKeyEncryptionKeycache: options.AppEncryptionKeyCache,
 	}
 
 	apiKeyMiddleware := httpmw.ExtractAPIKeyMW(httpmw.ExtractAPIKeyConfig{
 		DB:                            options.Database,
+		ActivateDormantUser:           ActivateDormantUser(options.Logger, &api.Auditor, options.Database),
 		OAuth2Configs:                 oauthConfigs,
 		RedirectToLogin:               false,
 		DisableSessionExpiryRefresh:   options.DeploymentValues.Sessions.DisableExpiryRefresh.Value(),
@@ -611,8 +779,6 @@ func New(options *Options) *API {
 	cors := httpmw.Cors(options.DeploymentValues.Dangerous.AllowAllCors.Value())
 	prometheusMW := httpmw.Prometheus(options.PrometheusRegistry)
 
-	api.statsBatcher = options.StatsBatcher
-
 	r.Use(
 		httpmw.Recover(api.Logger),
 		tracing.StatusWriterMiddleware,
@@ -620,6 +786,7 @@ func New(options *Options) *API {
 		httpmw.AttachRequestID,
 		httpmw.ExtractRealIP(api.RealIPConfig),
 		httpmw.Logger(api.Logger),
+		rolestore.CustomRoleMW,
 		prometheusMW,
 		// Build-Version is helpful for debugging.
 		func(next http.Handler) http.Handler {
@@ -735,7 +902,7 @@ func New(options *Options) *API {
 		// All CSP errors will be logged
 		r.Post("/csp/reports", api.logReportCSPViolations)
 
-		r.Get("/buildinfo", buildInfo(api.AccessURL, api.DeploymentValues.CLIUpgradeMessage.String()))
+		r.Get("/buildinfo", buildInfoHandler(buildInfo))
 		// /regions is overridden in the enterprise version
 		r.Group(func(r chi.Router) {
 			r.Use(apiKeyMiddleware)
@@ -793,7 +960,7 @@ func New(options *Options) *API {
 			r.Use(
 				apiKeyMiddleware,
 			)
-			r.Post("/", api.postOrganizations)
+			r.Get("/", api.organizations)
 			r.Route("/{organization}", func(r chi.Router) {
 				r.Use(
 					httpmw.ExtractOrganizationParam(options.Database),
@@ -802,8 +969,8 @@ func New(options *Options) *API {
 				r.Post("/templateversions", api.postTemplateVersionsByOrganization)
 				r.Route("/templates", func(r chi.Router) {
 					r.Post("/", api.postTemplateByOrganization)
-					r.Get("/", api.templatesByOrganization)
-					r.Get("/examples", api.templateExamples)
+					r.Get("/", api.templatesByOrganization())
+					r.Get("/examples", api.templateExamplesByOrganization)
 					r.Route("/{templatename}", func(r chi.Router) {
 						r.Get("/", api.templateByOrganizationAndName)
 						r.Route("/versions/{templateversionname}", func(r chi.Router) {
@@ -813,31 +980,61 @@ func New(options *Options) *API {
 					})
 				})
 				r.Route("/members", func(r chi.Router) {
-					r.Get("/roles", api.assignableOrgRoles)
-					r.Route("/{user}", func(r chi.Router) {
-						r.Use(
-							httpmw.ExtractOrganizationMemberParam(options.Database),
-						)
-						r.Put("/roles", api.putMemberRoles)
-						r.Post("/workspaces", api.postWorkspacesByOrganization)
+					r.Get("/", api.listMembers)
+					r.Route("/roles", func(r chi.Router) {
+						r.Get("/", api.assignableOrgRoles)
 					})
+
+					r.Route("/{user}", func(r chi.Router) {
+						r.Group(func(r chi.Router) {
+							r.Use(
+								// Adding a member requires "read" permission
+								// on the site user. So limited to owners and user-admins.
+								// TODO: Allow org-admins to add users via some new permission? Or give them
+								// 	read on site users.
+								httpmw.ExtractUserParam(options.Database),
+							)
+							r.Post("/", api.postOrganizationMember)
+						})
+
+						r.Group(func(r chi.Router) {
+							r.Use(
+								httpmw.ExtractOrganizationMemberParam(options.Database),
+							)
+							r.Delete("/", api.deleteOrganizationMember)
+							r.Put("/roles", api.putMemberRoles)
+							r.Post("/workspaces", api.postWorkspacesByOrganization)
+						})
+					})
+				})
+				r.Route("/provisionerdaemons", func(r chi.Router) {
+					r.Get("/", api.provisionerDaemons)
+				})
+				r.Route("/provisionerjobs", func(r chi.Router) {
+					r.Get("/", api.provisionerJobs)
 				})
 			})
 		})
-		r.Route("/templates/{template}", func(r chi.Router) {
+		r.Route("/templates", func(r chi.Router) {
 			r.Use(
 				apiKeyMiddleware,
-				httpmw.ExtractTemplateParam(options.Database),
 			)
-			r.Get("/daus", api.templateDAUs)
-			r.Get("/", api.template)
-			r.Delete("/", api.deleteTemplate)
-			r.Patch("/", api.patchTemplateMeta)
-			r.Route("/versions", func(r chi.Router) {
-				r.Post("/archive", api.postArchiveTemplateVersions)
-				r.Get("/", api.templateVersionsByTemplate)
-				r.Patch("/", api.patchActiveTemplateVersion)
-				r.Get("/{templateversionname}", api.templateVersionByName)
+			r.Get("/", api.fetchTemplates(nil))
+			r.Get("/examples", api.templateExamples)
+			r.Route("/{template}", func(r chi.Router) {
+				r.Use(
+					httpmw.ExtractTemplateParam(options.Database),
+				)
+				r.Get("/daus", api.templateDAUs)
+				r.Get("/", api.template)
+				r.Delete("/", api.deleteTemplate)
+				r.Patch("/", api.patchTemplateMeta)
+				r.Route("/versions", func(r chi.Router) {
+					r.Post("/archive", api.postArchiveTemplateVersions)
+					r.Get("/", api.templateVersionsByTemplate)
+					r.Patch("/", api.patchActiveTemplateVersion)
+					r.Get("/{templateversionname}", api.templateVersionByName)
+				})
 			})
 		})
 		r.Route("/templateversions/{templateversion}", func(r chi.Router) {
@@ -864,6 +1061,7 @@ func New(options *Options) *API {
 				r.Get("/{jobID}", api.templateVersionDryRun)
 				r.Get("/{jobID}/resources", api.templateVersionDryRunResources)
 				r.Get("/{jobID}/logs", api.templateVersionDryRunLogs)
+				r.Get("/{jobID}/matched-provisioners", api.templateVersionDryRunMatchedProvisioners)
 				r.Patch("/{jobID}/cancel", api.patchTemplateVersionDryRunCancel)
 			})
 		})
@@ -880,6 +1078,9 @@ func New(options *Options) *API {
 				// This value is intentionally increased during tests.
 				r.Use(httpmw.RateLimit(options.LoginRateLimit, time.Minute))
 				r.Post("/login", api.postLogin)
+				r.Post("/otp/request", api.postRequestOneTimePasscode)
+				r.Post("/validate-password", api.validateUserPassword)
+				r.Post("/otp/change-password", api.postChangePasswordWithOneTimePasscode)
 				r.Route("/oauth2", func(r chi.Router) {
 					r.Route("/github", func(r chi.Router) {
 						r.Use(
@@ -904,7 +1105,7 @@ func New(options *Options) *API {
 				r.Post("/logout", api.postLogout)
 				// These routes query information about site wide roles.
 				r.Route("/roles", func(r chi.Router) {
-					r.Get("/", api.assignableSiteRoles)
+					r.Get("/", api.AssignableSiteRoles)
 				})
 				r.Route("/{user}", func(r chi.Router) {
 					r.Use(httpmw.ExtractUserParam(options.Database))
@@ -920,6 +1121,7 @@ func New(options *Options) *API {
 					})
 					r.Put("/appearance", api.putUserAppearanceSettings)
 					r.Route("/password", func(r chi.Router) {
+						r.Use(httpmw.RateLimit(options.LoginRateLimit, time.Minute))
 						r.Put("/", api.putUserPassword)
 					})
 					// These roles apply to the site wide permissions.
@@ -946,12 +1148,19 @@ func New(options *Options) *API {
 						r.Get("/", api.organizationsByUser)
 						r.Get("/{organizationname}", api.organizationByUserAndName)
 					})
+					r.Post("/workspaces", api.postUserWorkspaces)
 					r.Route("/workspace/{workspacename}", func(r chi.Router) {
 						r.Get("/", api.workspaceByOwnerAndName)
 						r.Get("/builds/{buildnumber}", api.workspaceBuildByBuildNumber)
 					})
 					r.Get("/gitsshkey", api.gitSSHKey)
 					r.Put("/gitsshkey", api.regenerateGitSSHKey)
+					r.Route("/notifications", func(r chi.Router) {
+						r.Route("/preferences", func(r chi.Router) {
+							r.Get("/", api.userNotificationPreferences)
+							r.Put("/", api.putUserNotificationPreferences)
+						})
+					})
 				})
 			})
 		})
@@ -973,23 +1182,12 @@ func New(options *Options) *API {
 					Optional: false,
 				}))
 				r.Get("/rpc", api.workspaceAgentRPC)
-				r.Get("/manifest", api.workspaceAgentManifest)
-				// This route is deprecated and will be removed in a future release.
-				// New agents will use /me/manifest instead.
-				r.Get("/metadata", api.workspaceAgentManifest)
-				r.Post("/startup", api.postWorkspaceAgentStartup)
-				r.Patch("/startup-logs", api.patchWorkspaceAgentLogsDeprecated)
 				r.Patch("/logs", api.patchWorkspaceAgentLogs)
-				r.Post("/app-health", api.postWorkspaceAppHealth)
 				// Deprecated: Required to support legacy agents
 				r.Get("/gitauth", api.workspaceAgentsGitAuth)
 				r.Get("/external-auth", api.workspaceAgentsExternalAuth)
 				r.Get("/gitsshkey", api.agentGitSSHKey)
-				r.Get("/coordinate", api.workspaceAgentCoordinate)
-				r.Post("/report-stats", api.workspaceAgentReportStats)
-				r.Post("/report-lifecycle", api.workspaceAgentReportLifecycle)
-				r.Post("/metadata", api.workspaceAgentPostMetadata)
-				r.Post("/metadata/{key}", api.workspaceAgentPostMetadataDeprecated)
+				r.Post("/log-source", api.workspaceAgentPostLogSource)
 			})
 			r.Route("/{workspaceagent}", func(r chi.Router) {
 				r.Use(
@@ -1045,13 +1243,11 @@ func New(options *Options) *API {
 				r.Put("/autoupdates", api.putWorkspaceAutoupdates)
 				r.Get("/resolve-autostart", api.resolveAutostart)
 				r.Route("/port-share", func(r chi.Router) {
-					r.Use(
-						httpmw.RequireExperiment(api.Experiments, codersdk.ExperimentSharedPorts),
-					)
 					r.Get("/", api.workspaceAgentPortShares)
 					r.Post("/", api.postWorkspaceAgentPortShare)
 					r.Delete("/", api.deleteWorkspaceAgentPortShare)
 				})
+				r.Get("/timings", api.workspaceTimings)
 			})
 		})
 		r.Route("/workspacebuilds/{workspacebuild}", func(r chi.Router) {
@@ -1066,6 +1262,7 @@ func New(options *Options) *API {
 			r.Get("/parameters", api.workspaceBuildParameters)
 			r.Get("/resources", api.workspaceBuildResourcesDeprecated)
 			r.Get("/state", api.workspaceBuildState)
+			r.Get("/timings", api.workspaceBuildTimings)
 		})
 		r.Route("/authcheck", func(r chi.Router) {
 			r.Use(apiKeyMiddleware)
@@ -1090,6 +1287,7 @@ func New(options *Options) *API {
 			r.Use(apiKeyMiddleware)
 			r.Get("/daus", api.deploymentDAUs)
 			r.Get("/user-activity", api.insightsUserActivity)
+			r.Get("/user-status-counts", api.insightsUserStatusCounts)
 			r.Get("/user-latency", api.insightsUserLatency)
 			r.Get("/templates", api.insightsTemplates)
 		})
@@ -1099,7 +1297,7 @@ func New(options *Options) *API {
 				// Ensure only owners can access debug endpoints.
 				func(next http.Handler) http.Handler {
 					return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-						if !api.Authorize(r, rbac.ActionRead, rbac.ResourceDebugInfo) {
+						if !api.Authorize(r, policy.ActionRead, rbac.ResourceDebugInfo) {
 							httpapi.ResourceNotFound(rw)
 							return
 						}
@@ -1158,6 +1356,19 @@ func New(options *Options) *API {
 				})
 			})
 		})
+		r.Route("/notifications", func(r chi.Router) {
+			r.Use(apiKeyMiddleware)
+			r.Get("/settings", api.notificationsSettings)
+			r.Put("/settings", api.putNotificationsSettings)
+			r.Route("/templates", func(r chi.Router) {
+				r.Get("/system", api.systemNotificationTemplates)
+			})
+			r.Get("/dispatch-methods", api.notificationDispatchMethods)
+		})
+		r.Route("/tailnet", func(r chi.Router) {
+			r.Use(apiKeyMiddleware)
+			r.Get("/", api.tailnetRPCConn)
+		})
 	})
 
 	if options.SwaggerEndpoint {
@@ -1177,9 +1388,29 @@ func New(options *Options) *API {
 		r.Get("/swagger/*", swaggerDisabled)
 	}
 
+	additionalCSPHeaders := make(map[httpmw.CSPFetchDirective][]string, len(api.DeploymentValues.AdditionalCSPPolicy))
+	var cspParseErrors error
+	for _, v := range api.DeploymentValues.AdditionalCSPPolicy {
+		// Format is "<directive> <value> <value> ..."
+		v = strings.TrimSpace(v)
+		parts := strings.Split(v, " ")
+		if len(parts) < 2 {
+			cspParseErrors = errors.Join(cspParseErrors, xerrors.Errorf("invalid CSP header %q, not enough parts to be valid", v))
+			continue
+		}
+		additionalCSPHeaders[httpmw.CSPFetchDirective(strings.ToLower(parts[0]))] = parts[1:]
+	}
+
+	if cspParseErrors != nil {
+		// Do not fail Coder deployment startup because of this. Just log an error
+		// and continue
+		api.Logger.Error(context.Background(),
+			"parsing additional CSP headers", slog.Error(cspParseErrors))
+	}
+
 	// Add CSP headers to all static assets and pages. CSP headers only affect
 	// browsers, so these don't make sense on api routes.
-	cspMW := httpmw.CSPHeaders(func() []string {
+	cspMW := httpmw.CSPHeaders(options.Telemetry.Enabled(), func() []string {
 		if api.DeploymentValues.Dangerous.AllowAllCors {
 			// In this mode, allow all external requests
 			return []string{"*"}
@@ -1189,7 +1420,7 @@ func New(options *Options) *API {
 		}
 		// By default we do not add extra websocket connections to the CSP
 		return []string{}
-	})
+	}, additionalCSPHeaders)
 
 	// Static file handler must be wrapped with HSTS handler if the
 	// StrictTransportSecurityAge is set. We only need to set this header on
@@ -1219,6 +1450,7 @@ type API struct {
 	Auditor                           atomic.Pointer[audit.Auditor]
 	WorkspaceClientCoordinateOverride atomic.Pointer[func(rw http.ResponseWriter) bool]
 	TailnetCoordinator                atomic.Pointer[tailnet.Coordinator]
+	NetworkTelemetryBatcher           *tailnet.NetworkTelemetryBatcher
 	TailnetClientService              *tailnet.ClientService
 	QuotaCommitter                    atomic.Pointer[proto.QuotaCommitter]
 	AppearanceFetcher                 atomic.Pointer[appearance.Fetcher]
@@ -1237,6 +1469,8 @@ type API struct {
 	// passed to dbauthz.
 	AccessControlStore *atomic.Pointer[dbauthz.AccessControlStore]
 	PortSharer         atomic.Pointer[portsharing.PortSharer]
+
+	UpdatesProvider tailnet.WorkspaceUpdatesProvider
 
 	HTTPAuth *HTTPAuthorizer
 
@@ -1265,20 +1499,21 @@ type API struct {
 	healthCheckGroup *singleflight.Group[string, *healthsdk.HealthcheckReport]
 	healthCheckCache atomic.Pointer[healthsdk.HealthcheckReport]
 
-	statsBatcher *batchstats.Batcher
+	statsReporter *workspacestats.Reporter
 
 	Acquirer *provisionerdserver.Acquirer
 	// dbRolluper rolls up template usage stats from raw agent and app
 	// stats. This is used to provide insights in the WebUI.
-	dbRolluper            *dbrollup.Rolluper
-	workspaceUsageTracker *workspaceusage.Tracker
+	dbRolluper *dbrollup.Rolluper
 }
 
 // Close waits for all WebSocket connections to drain before returning.
 func (api *API) Close() error {
-	api.cancel()
-	if api.derpCloseFunc != nil {
-		api.derpCloseFunc()
+	select {
+	case <-api.ctx.Done():
+		return xerrors.New("API already closed")
+	default:
+		api.cancel()
 	}
 
 	wsDone := make(chan struct{})
@@ -1305,12 +1540,22 @@ func (api *API) Close() error {
 		api.updateChecker.Close()
 	}
 	_ = api.workspaceAppServer.Close()
+	_ = api.agentProvider.Close()
+	if api.derpCloseFunc != nil {
+		api.derpCloseFunc()
+	}
+	// The coordinator should be closed after the agent provider, and the DERP
+	// handler.
 	coordinator := api.TailnetCoordinator.Load()
 	if coordinator != nil {
 		_ = (*coordinator).Close()
 	}
-	_ = api.agentProvider.Close()
-	api.workspaceUsageTracker.Close()
+	_ = api.statsReporter.Close()
+	_ = api.NetworkTelemetryBatcher.Close()
+	_ = api.OIDCConvertKeyCache.Close()
+	_ = api.AppSigningKeyCache.Close()
+	_ = api.AppEncryptionKeyCache.Close()
+	_ = api.UpdatesProvider.Close()
 	return nil
 }
 
@@ -1341,7 +1586,11 @@ func compressHandler(h http.Handler) http.Handler {
 
 // CreateInMemoryProvisionerDaemon is an in-memory connection to a provisionerd.
 // Useful when starting coderd and provisionerd in the same process.
-func (api *API) CreateInMemoryProvisionerDaemon(dialCtx context.Context, name string) (client proto.DRPCProvisionerDaemonClient, err error) {
+func (api *API) CreateInMemoryProvisionerDaemon(dialCtx context.Context, name string, provisionerTypes []codersdk.ProvisionerType) (client proto.DRPCProvisionerDaemonClient, err error) {
+	return api.CreateInMemoryTaggedProvisionerDaemon(dialCtx, name, provisionerTypes, nil)
+}
+
+func (api *API) CreateInMemoryTaggedProvisionerDaemon(dialCtx context.Context, name string, provisionerTypes []codersdk.ProvisionerType, provisionerTags map[string]string) (client proto.DRPCProvisionerDaemonClient, err error) {
 	tracer := api.TracerProvider.Tracer(tracing.TracerName)
 	clientSession, serverSession := drpc.MemTransportPipe()
 	defer func() {
@@ -1358,25 +1607,34 @@ func (api *API) CreateInMemoryProvisionerDaemon(dialCtx context.Context, name st
 		return nil, xerrors.Errorf("unable to fetch default org for in memory provisioner: %w", err)
 	}
 
+	dbTypes := make([]database.ProvisionerType, 0, len(provisionerTypes))
+	for _, tp := range provisionerTypes {
+		dbTypes = append(dbTypes, database.ProvisionerType(tp))
+	}
+
+	keyID, err := uuid.Parse(string(codersdk.ProvisionerKeyIDBuiltIn))
+	if err != nil {
+		return nil, xerrors.Errorf("failed to parse built-in provisioner key ID: %w", err)
+	}
+
 	//nolint:gocritic // in-memory provisioners are owned by system
 	daemon, err := api.Database.UpsertProvisionerDaemon(dbauthz.AsSystemRestricted(dialCtx), database.UpsertProvisionerDaemonParams{
 		Name:           name,
 		OrganizationID: defaultOrg.ID,
 		CreatedAt:      dbtime.Now(),
-		Provisioners: []database.ProvisionerType{
-			database.ProvisionerTypeEcho, database.ProvisionerTypeTerraform,
-		},
-		Tags:       provisionersdk.MutateTags(uuid.Nil, nil),
-		LastSeenAt: sql.NullTime{Time: dbtime.Now(), Valid: true},
-		Version:    buildinfo.Version(),
-		APIVersion: proto.CurrentVersion.String(),
+		Provisioners:   dbTypes,
+		Tags:           provisionersdk.MutateTags(uuid.Nil, provisionerTags),
+		LastSeenAt:     sql.NullTime{Time: dbtime.Now(), Valid: true},
+		Version:        buildinfo.Version(),
+		APIVersion:     proto.CurrentVersion.String(),
+		KeyID:          keyID,
 	})
 	if err != nil {
 		return nil, xerrors.Errorf("failed to create in-memory provisioner daemon: %w", err)
 	}
 
 	mux := drpcmux.New()
-	api.Logger.Info(dialCtx, "starting in-memory provisioner daemon", slog.F("name", name))
+	api.Logger.Debug(dialCtx, "starting in-memory provisioner daemon", slog.F("name", name))
 	logger := api.Logger.Named(fmt.Sprintf("inmem-provisionerd-%s", name))
 	srv, err := provisionerdserver.NewServer(
 		api.ctx, // use the same ctx as the API
@@ -1399,7 +1657,9 @@ func (api *API) CreateInMemoryProvisionerDaemon(dialCtx context.Context, name st
 		provisionerdserver.Options{
 			OIDCConfig:          api.OIDCConfig,
 			ExternalAuthConfigs: api.ExternalAuthConfigs,
+			Clock:               api.Clock,
 		},
+		api.NotificationsEnqueuer,
 	)
 	if err != nil {
 		return nil, err

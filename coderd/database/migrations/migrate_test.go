@@ -28,7 +28,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m, testutil.GoleakOptions...)
 }
 
 func TestMigrate(t *testing.T) {
@@ -95,9 +95,8 @@ func TestMigrate(t *testing.T) {
 func testSQLDB(t testing.TB) *sql.DB {
 	t.Helper()
 
-	connection, closeFn, err := dbtestutil.Open()
+	connection, err := dbtestutil.Open(t)
 	require.NoError(t, err)
-	t.Cleanup(closeFn)
 
 	db, err := sql.Open("postgres", connection)
 	require.NoError(t, err)
@@ -267,6 +266,8 @@ func TestMigrateUpWithFixtures(t *testing.T) {
 		"workspace_build_parameters",
 		"template_version_variables",
 		"dbcrypt_keys", // having zero rows is a valid state for this table
+		"template_version_workspace_tags",
+		"notification_report_generator_logs",
 	}
 	s := &tableStats{s: make(map[string]int)}
 

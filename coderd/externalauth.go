@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/sqlc-dev/pqtype"
 	"golang.org/x/sync/errgroup"
@@ -197,7 +198,7 @@ func (api *API) postExternalAuthDeviceByID(rw http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
-	httpapi.Write(ctx, rw, http.StatusNoContent, nil)
+	rw.WriteHeader(http.StatusNoContent)
 }
 
 // @Summary Get external auth device by ID.
@@ -306,6 +307,7 @@ func (api *API) externalAuthCallback(externalAuthConfig *externalauth.Config) ht
 			// FE know not to enter the authentication loop again, and instead display an error.
 			redirect = fmt.Sprintf("/external-auth/%s?redirected=true", externalAuthConfig.ID)
 		}
+		redirect = uriFromURL(redirect)
 		http.Redirect(rw, r, redirect, http.StatusTemporaryRedirect)
 	}
 }
@@ -351,15 +353,17 @@ func (api *API) listUserExternalAuths(rw http.ResponseWriter, r *http.Request) {
 		if link.OAuthAccessToken != "" {
 			cfg, ok := configs[link.ProviderID]
 			if ok {
-				newLink, valid, err := cfg.RefreshToken(ctx, api.Database, link)
+				newLink, err := cfg.RefreshToken(ctx, api.Database, link)
 				meta := db2sdk.ExternalAuthMeta{
-					Authenticated: valid,
+					Authenticated: err == nil,
 				}
 				if err != nil {
 					meta.ValidateError = err.Error()
 				}
+				linkMeta[link.ProviderID] = meta
+
 				// Update the link if it was potentially refreshed.
-				if err == nil && valid {
+				if err == nil {
 					links[i] = newLink
 				}
 			}
@@ -398,4 +402,13 @@ func ExternalAuthConfig(cfg *externalauth.Config) codersdk.ExternalAuthLinkProvi
 		AllowRefresh:  !cfg.NoRefresh,
 		AllowValidate: cfg.ValidateURL != "",
 	}
+}
+
+func uriFromURL(u string) string {
+	uri, err := url.Parse(u)
+	if err != nil {
+		return "/"
+	}
+
+	return uri.RequestURI()
 }

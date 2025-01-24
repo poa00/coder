@@ -20,8 +20,8 @@ import (
 	"cdr.dev/slog"
 	"cdr.dev/slog/sloggers/slogtest"
 
+	agentproto "github.com/coder/coder/v2/agent/proto"
 	"github.com/coder/coder/v2/coderd/agentmetrics"
-	"github.com/coder/coder/v2/coderd/batchstats"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbgen"
@@ -29,6 +29,7 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/prometheusmetrics"
+	"github.com/coder/coder/v2/coderd/workspacestats"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/agentsdk"
 	"github.com/coder/coder/v2/cryptorand"
@@ -37,6 +38,7 @@ import (
 	"github.com/coder/coder/v2/tailnet"
 	"github.com/coder/coder/v2/tailnet/tailnettest"
 	"github.com/coder/coder/v2/testutil"
+	"github.com/coder/quartz"
 )
 
 func TestActiveUsers(t *testing.T) {
@@ -97,7 +99,7 @@ func TestActiveUsers(t *testing.T) {
 		t.Run(tc.Name, func(t *testing.T) {
 			t.Parallel()
 			registry := prometheus.NewRegistry()
-			closeFunc, err := prometheusmetrics.ActiveUsers(context.Background(), registry, tc.Database(t), time.Millisecond)
+			closeFunc, err := prometheusmetrics.ActiveUsers(context.Background(), testutil.Logger(t), registry, tc.Database(t), time.Millisecond)
 			require.NoError(t, err)
 			t.Cleanup(closeFunc)
 
@@ -107,6 +109,100 @@ func TestActiveUsers(t *testing.T) {
 				result := int(*metrics[0].Metric[0].Gauge.Value)
 				return result == tc.Count
 			}, testutil.WaitShort, testutil.IntervalFast)
+		})
+	}
+}
+
+func TestUsers(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		Name     string
+		Database func(t *testing.T) database.Store
+		Count    map[database.UserStatus]int
+	}{{
+		Name: "None",
+		Database: func(t *testing.T) database.Store {
+			return dbmem.New()
+		},
+		Count: map[database.UserStatus]int{},
+	}, {
+		Name: "One",
+		Database: func(t *testing.T) database.Store {
+			db := dbmem.New()
+			dbgen.User(t, db, database.User{Status: database.UserStatusActive})
+			return db
+		},
+		Count: map[database.UserStatus]int{database.UserStatusActive: 1},
+	}, {
+		Name: "MultipleStatuses",
+		Database: func(t *testing.T) database.Store {
+			db := dbmem.New()
+
+			dbgen.User(t, db, database.User{Status: database.UserStatusActive})
+			dbgen.User(t, db, database.User{Status: database.UserStatusDormant})
+
+			return db
+		},
+		Count: map[database.UserStatus]int{database.UserStatusActive: 1, database.UserStatusDormant: 1},
+	}, {
+		Name: "MultipleActive",
+		Database: func(t *testing.T) database.Store {
+			db := dbmem.New()
+			dbgen.User(t, db, database.User{Status: database.UserStatusActive})
+			dbgen.User(t, db, database.User{Status: database.UserStatusActive})
+			dbgen.User(t, db, database.User{Status: database.UserStatusActive})
+			return db
+		},
+		Count: map[database.UserStatus]int{database.UserStatusActive: 3},
+	}} {
+		tc := tc
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
+			defer cancel()
+
+			registry := prometheus.NewRegistry()
+			mClock := quartz.NewMock(t)
+			db := tc.Database(t)
+			closeFunc, err := prometheusmetrics.Users(context.Background(), testutil.Logger(t), mClock, registry, db, time.Millisecond)
+			require.NoError(t, err)
+			t.Cleanup(closeFunc)
+
+			_, w := mClock.AdvanceNext()
+			w.MustWait(ctx)
+
+			checkFn := func() bool {
+				metrics, err := registry.Gather()
+				if err != nil {
+					return false
+				}
+
+				// If we get no metrics and we know none should exist, bail
+				// early. If we get no metrics but we expect some, retry.
+				if len(metrics) == 0 {
+					return len(tc.Count) == 0
+				}
+
+				for _, metric := range metrics[0].Metric {
+					if tc.Count[database.UserStatus(*metric.Label[0].Value)] != int(metric.Gauge.GetValue()) {
+						return false
+					}
+				}
+
+				return true
+			}
+
+			require.Eventually(t, checkFn, testutil.WaitShort, testutil.IntervalFast)
+
+			// Add another dormant user and ensure it updates
+			dbgen.User(t, db, database.User{Status: database.UserStatusDormant})
+			tc.Count[database.UserStatusDormant]++
+
+			_, w = mClock.AdvanceNext()
+			w.MustWait(ctx)
+
+			require.Eventually(t, checkFn, testutil.WaitShort, testutil.IntervalFast)
 		})
 	}
 }
@@ -150,7 +246,7 @@ func TestWorkspaceLatestBuildTotals(t *testing.T) {
 		t.Run(tc.Name, func(t *testing.T) {
 			t.Parallel()
 			registry := prometheus.NewRegistry()
-			closeFunc, err := prometheusmetrics.Workspaces(context.Background(), slogtest.Make(t, nil).Leveled(slog.LevelWarn), registry, tc.Database(), testutil.IntervalFast)
+			closeFunc, err := prometheusmetrics.Workspaces(context.Background(), testutil.Logger(t).Leveled(slog.LevelWarn), registry, tc.Database(), testutil.IntervalFast)
 			require.NoError(t, err)
 			t.Cleanup(closeFunc)
 
@@ -159,7 +255,7 @@ func TestWorkspaceLatestBuildTotals(t *testing.T) {
 				assert.NoError(t, err)
 				sum := 0
 				for _, m := range metrics {
-					if m.GetName() != "coderd_api_workspace_latest_build_total" {
+					if m.GetName() != "coderd_api_workspace_latest_build" {
 						continue
 					}
 
@@ -224,7 +320,7 @@ func TestWorkspaceLatestBuildStatuses(t *testing.T) {
 		t.Run(tc.Name, func(t *testing.T) {
 			t.Parallel()
 			registry := prometheus.NewRegistry()
-			closeFunc, err := prometheusmetrics.Workspaces(context.Background(), slogtest.Make(t, nil), registry, tc.Database(), testutil.IntervalFast)
+			closeFunc, err := prometheusmetrics.Workspaces(context.Background(), testutil.Logger(t), registry, tc.Database(), testutil.IntervalFast)
 			require.NoError(t, err)
 			t.Cleanup(closeFunc)
 
@@ -309,7 +405,7 @@ func TestAgents(t *testing.T) {
 	})
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 	// given
@@ -317,7 +413,7 @@ func TestAgents(t *testing.T) {
 	derpMapFn := func() *tailcfg.DERPMap {
 		return derpMap
 	}
-	coordinator := tailnet.NewCoordinator(slogtest.Make(t, nil).Leveled(slog.LevelDebug))
+	coordinator := tailnet.NewCoordinator(testutil.Logger(t))
 	coordinatorPtr := atomic.Pointer[tailnet.Coordinator]{}
 	coordinatorPtr.Store(&coordinator)
 	agentInactiveDisconnectTimeout := 1 * time.Hour // don't need to focus on this value in tests
@@ -389,21 +485,21 @@ func TestAgentStats(t *testing.T) {
 	t.Cleanup(cancelFunc)
 
 	db, pubsub := dbtestutil.NewDB(t)
-	log := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	log := testutil.Logger(t)
 
-	batcher, closeBatcher, err := batchstats.New(ctx,
+	batcher, closeBatcher, err := workspacestats.NewBatcher(ctx,
 		// We had previously set the batch size to 1 here, but that caused
 		// intermittent test flakes due to a race between the batcher completing
 		// its flush and the test asserting that the metrics were collected.
 		// Instead, we close the batcher after all stats have been posted, which
 		// forces a flush.
-		batchstats.WithStore(db),
-		batchstats.WithLogger(log),
+		workspacestats.BatcherWithStore(db),
+		workspacestats.BatcherWithLogger(log),
 	)
 	require.NoError(t, err, "create stats batcher failed")
 	t.Cleanup(closeBatcher)
 
-	tLogger := slogtest.Make(t, nil)
+	tLogger := testutil.Logger(t)
 	// Build sample workspaces with test agents and fake agent client
 	client, _, _ := coderdtest.NewWithAPI(t, &coderdtest.Options{
 		Database:                 db,
@@ -415,36 +511,45 @@ func TestAgentStats(t *testing.T) {
 
 	user := coderdtest.CreateFirstUser(t, client)
 
-	agent1 := prepareWorkspaceAndAgent(t, client, user, 1)
-	agent2 := prepareWorkspaceAndAgent(t, client, user, 2)
-	agent3 := prepareWorkspaceAndAgent(t, client, user, 3)
+	agent1 := prepareWorkspaceAndAgent(ctx, t, client, user, 1)
+	agent2 := prepareWorkspaceAndAgent(ctx, t, client, user, 2)
+	agent3 := prepareWorkspaceAndAgent(ctx, t, client, user, 3)
+	defer agent1.DRPCConn().Close()
+	defer agent2.DRPCConn().Close()
+	defer agent3.DRPCConn().Close()
 
 	registry := prometheus.NewRegistry()
 
 	// given
 	var i int64
 	for i = 0; i < 3; i++ {
-		_, err = agent1.PostStats(ctx, &agentsdk.Stats{
-			TxBytes: 1 + i, RxBytes: 2 + i,
-			SessionCountVSCode: 3 + i, SessionCountJetBrains: 4 + i, SessionCountReconnectingPTY: 5 + i, SessionCountSSH: 6 + i,
-			ConnectionCount: 7 + i, ConnectionMedianLatencyMS: 8000,
-			ConnectionsByProto: map[string]int64{"TCP": 1},
+		_, err = agent1.UpdateStats(ctx, &agentproto.UpdateStatsRequest{
+			Stats: &agentproto.Stats{
+				TxBytes: 1 + i, RxBytes: 2 + i,
+				SessionCountVscode: 3 + i, SessionCountJetbrains: 4 + i, SessionCountReconnectingPty: 5 + i, SessionCountSsh: 6 + i,
+				ConnectionCount: 7 + i, ConnectionMedianLatencyMs: 8000,
+				ConnectionsByProto: map[string]int64{"TCP": 1},
+			},
 		})
 		require.NoError(t, err)
 
-		_, err = agent2.PostStats(ctx, &agentsdk.Stats{
-			TxBytes: 2 + i, RxBytes: 4 + i,
-			SessionCountVSCode: 6 + i, SessionCountJetBrains: 8 + i, SessionCountReconnectingPTY: 10 + i, SessionCountSSH: 12 + i,
-			ConnectionCount: 8 + i, ConnectionMedianLatencyMS: 10000,
-			ConnectionsByProto: map[string]int64{"TCP": 1},
+		_, err = agent2.UpdateStats(ctx, &agentproto.UpdateStatsRequest{
+			Stats: &agentproto.Stats{
+				TxBytes: 2 + i, RxBytes: 4 + i,
+				SessionCountVscode: 6 + i, SessionCountJetbrains: 8 + i, SessionCountReconnectingPty: 10 + i, SessionCountSsh: 12 + i,
+				ConnectionCount: 8 + i, ConnectionMedianLatencyMs: 10000,
+				ConnectionsByProto: map[string]int64{"TCP": 1},
+			},
 		})
 		require.NoError(t, err)
 
-		_, err = agent3.PostStats(ctx, &agentsdk.Stats{
-			TxBytes: 3 + i, RxBytes: 6 + i,
-			SessionCountVSCode: 12 + i, SessionCountJetBrains: 14 + i, SessionCountReconnectingPTY: 16 + i, SessionCountSSH: 18 + i,
-			ConnectionCount: 9 + i, ConnectionMedianLatencyMS: 12000,
-			ConnectionsByProto: map[string]int64{"TCP": 1},
+		_, err = agent3.UpdateStats(ctx, &agentproto.UpdateStatsRequest{
+			Stats: &agentproto.Stats{
+				TxBytes: 3 + i, RxBytes: 6 + i,
+				SessionCountVscode: 12 + i, SessionCountJetbrains: 14 + i, SessionCountReconnectingPty: 16 + i, SessionCountSsh: 18 + i,
+				ConnectionCount: 9 + i, ConnectionMedianLatencyMs: 12000,
+				ConnectionsByProto: map[string]int64{"TCP": 1},
+			},
 		})
 		require.NoError(t, err)
 	}
@@ -460,7 +565,7 @@ func TestAgentStats(t *testing.T) {
 	// and it doesn't depend on the real time.
 	closeFunc, err := prometheusmetrics.AgentStats(ctx, slogtest.Make(t, &slogtest.Options{
 		IgnoreErrors: true,
-	}), registry, db, time.Now().Add(-time.Minute), time.Millisecond, agentmetrics.LabelAll)
+	}), registry, db, time.Now().Add(-time.Minute), time.Millisecond, agentmetrics.LabelAll, false)
 	require.NoError(t, err)
 	t.Cleanup(closeFunc)
 
@@ -511,23 +616,29 @@ func TestAgentStats(t *testing.T) {
 func TestExperimentsMetric(t *testing.T) {
 	t.Parallel()
 
+	if len(codersdk.ExperimentsAll) == 0 {
+		t.Skip("No experiments are currently defined; skipping test.")
+	}
+
 	tests := []struct {
 		name        string
 		experiments codersdk.Experiments
 		expected    map[codersdk.Experiment]float64
 	}{
 		{
-			name:        "Enabled experiment is exported in metrics",
-			experiments: codersdk.Experiments{codersdk.ExperimentSharedPorts},
+			name: "Enabled experiment is exported in metrics",
+			experiments: codersdk.Experiments{
+				codersdk.ExperimentsAll[0],
+			},
 			expected: map[codersdk.Experiment]float64{
-				codersdk.ExperimentSharedPorts: 1,
+				codersdk.ExperimentsAll[0]: 1,
 			},
 		},
 		{
 			name:        "Disabled experiment is exported in metrics",
 			experiments: codersdk.Experiments{},
 			expected: map[codersdk.Experiment]float64{
-				codersdk.ExperimentSharedPorts: 0,
+				codersdk.ExperimentsAll[0]: 0,
 			},
 		},
 		{
@@ -590,7 +701,7 @@ func TestExperimentsMetric(t *testing.T) {
 	}
 }
 
-func prepareWorkspaceAndAgent(t *testing.T, client *codersdk.Client, user codersdk.CreateFirstUserResponse, workspaceNum int) *agentsdk.Client {
+func prepareWorkspaceAndAgent(ctx context.Context, t *testing.T, client *codersdk.Client, user codersdk.CreateFirstUserResponse, workspaceNum int) agentproto.DRPCAgentClient {
 	authToken := uuid.NewString()
 
 	version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, &echo.Responses{
@@ -600,14 +711,17 @@ func prepareWorkspaceAndAgent(t *testing.T, client *codersdk.Client, user coders
 	})
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 		cwr.Name = fmt.Sprintf("workspace-%d", workspaceNum)
 	})
 	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
-	agentClient := agentsdk.New(client.URL)
-	agentClient.SetSessionToken(authToken)
-	return agentClient
+	ac := agentsdk.New(client.URL)
+	ac.SetSessionToken(authToken)
+	conn, err := ac.ConnectRPC(ctx)
+	require.NoError(t, err)
+	agentAPI := agentproto.NewDRPCAgentClient(conn)
+	return agentAPI
 }
 
 var (

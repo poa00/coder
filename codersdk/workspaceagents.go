@@ -12,9 +12,10 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/xerrors"
-	"nhooyr.io/websocket"
 
 	"github.com/coder/coder/v2/coderd/tracing"
+	"github.com/coder/coder/v2/codersdk/wsjson"
+	"github.com/coder/websocket"
 )
 
 type WorkspaceAgentStatus string
@@ -185,6 +186,7 @@ type WorkspaceAgentLogSource struct {
 }
 
 type WorkspaceAgentScript struct {
+	ID               uuid.UUID     `json:"id" format:"uuid"`
 	LogSourceID      uuid.UUID     `json:"log_source_id" format:"uuid"`
 	LogPath          string        `json:"log_path"`
 	Script           string        `json:"script"`
@@ -193,6 +195,7 @@ type WorkspaceAgentScript struct {
 	RunOnStop        bool          `json:"run_on_stop"`
 	StartBlocksLogin bool          `json:"start_blocks_login"`
 	Timeout          time.Duration `json:"timeout"`
+	DisplayName      string        `json:"display_name"`
 }
 
 type WorkspaceAgentHealth struct {
@@ -452,30 +455,6 @@ func (c *Client) WorkspaceAgentLogsAfter(ctx context.Context, agentID uuid.UUID,
 		}
 		return nil, nil, ReadBodyAsError(res)
 	}
-	logChunks := make(chan []WorkspaceAgentLog, 1)
-	closed := make(chan struct{})
-	ctx, wsNetConn := WebsocketNetConn(ctx, conn, websocket.MessageText)
-	decoder := json.NewDecoder(wsNetConn)
-	go func() {
-		defer close(closed)
-		defer close(logChunks)
-		defer conn.Close(websocket.StatusGoingAway, "")
-		for {
-			var logs []WorkspaceAgentLog
-			err = decoder.Decode(&logs)
-			if err != nil {
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case logChunks <- logs:
-			}
-		}
-	}()
-	return logChunks, closeFunc(func() error {
-		_ = wsNetConn.Close()
-		<-closed
-		return nil
-	}), nil
+	d := wsjson.NewDecoder[[]WorkspaceAgentLog](conn, websocket.MessageText, c.logger)
+	return d.Chan(), d, nil
 }

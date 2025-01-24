@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	"golang.org/x/oauth2"
 	"golang.org/x/xerrors"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbmem"
+	"github.com/coder/coder/v2/coderd/database/dbmock"
 	"github.com/coder/coder/v2/coderd/externalauth"
 	"github.com/coder/coder/v2/coderd/promoauth"
 	"github.com/coder/coder/v2/codersdk"
@@ -59,9 +61,10 @@ func TestRefreshToken(t *testing.T) {
 		// Expire the link
 		link.OAuthExpiry = expired
 
-		_, refreshed, err := config.RefreshToken(ctx, nil, link)
-		require.NoError(t, err)
-		require.False(t, refreshed)
+		_, err := config.RefreshToken(ctx, nil, link)
+		require.Error(t, err)
+		require.True(t, externalauth.IsInvalidTokenError(err))
+		require.Contains(t, err.Error(), "refreshing is either disabled or refreshing failed")
 	})
 
 	// NoRefreshNoExpiry tests that an oauth token without an expiry is always valid.
@@ -90,9 +93,8 @@ func TestRefreshToken(t *testing.T) {
 
 		// Zero time used
 		link.OAuthExpiry = time.Time{}
-		_, refreshed, err := config.RefreshToken(ctx, nil, link)
+		_, err := config.RefreshToken(ctx, nil, link)
 		require.NoError(t, err)
-		require.True(t, refreshed, "token without expiry is always valid")
 		require.True(t, validated, "token should have been validated")
 	})
 
@@ -105,11 +107,12 @@ func TestRefreshToken(t *testing.T) {
 				},
 			},
 		}
-		_, refreshed, err := config.RefreshToken(context.Background(), nil, database.ExternalAuthLink{
+		_, err := config.RefreshToken(context.Background(), nil, database.ExternalAuthLink{
 			OAuthExpiry: expired,
 		})
-		require.NoError(t, err)
-		require.False(t, refreshed)
+		require.Error(t, err)
+		require.True(t, externalauth.IsInvalidTokenError(err))
+		require.Contains(t, err.Error(), "failure")
 	})
 
 	t.Run("ValidateServerError", func(t *testing.T) {
@@ -131,9 +134,80 @@ func TestRefreshToken(t *testing.T) {
 		ctx := oidc.ClientContext(context.Background(), fake.HTTPClient(nil))
 		link.OAuthExpiry = expired
 
-		_, _, err := config.RefreshToken(ctx, nil, link)
+		_, err := config.RefreshToken(ctx, nil, link)
 		require.ErrorContains(t, err, staticError)
+		// Unsure if this should be the correct behavior. It's an invalid token because
+		// 'ValidateToken()' failed with a runtime error. This was the previous behavior,
+		// so not going to change it.
+		require.False(t, externalauth.IsInvalidTokenError(err))
 		require.True(t, validated, "token should have been attempted to be validated")
+	})
+
+	// RefreshRetries tests that refresh token retry behavior works as expected.
+	// If a refresh token fails because the token itself is invalid, no more
+	// refresh attempts should ever happen. An invalid refresh token does
+	// not magically become valid at some point in the future.
+	t.Run("RefreshRetries", func(t *testing.T) {
+		t.Parallel()
+
+		var refreshErr *oauth2.RetrieveError
+
+		ctrl := gomock.NewController(t)
+		mDB := dbmock.NewMockStore(ctrl)
+
+		refreshCount := 0
+		fake, config, link := setupOauth2Test(t, testConfig{
+			FakeIDPOpts: []oidctest.FakeIDPOpt{
+				oidctest.WithRefresh(func(_ string) error {
+					refreshCount++
+					return refreshErr
+				}),
+				// The IDP should not be contacted since the token is expired and
+				// refresh attempts will fail.
+				oidctest.WithDynamicUserInfo(func(_ string) (jwt.MapClaims, error) {
+					t.Error("token was validated, but it was expired and this should never have happened.")
+					return nil, xerrors.New("should not be called")
+				}),
+			},
+			ExternalAuthOpt: func(cfg *externalauth.Config) {},
+		})
+
+		ctx := oidc.ClientContext(context.Background(), fake.HTTPClient(nil))
+		// Expire the link
+		link.OAuthExpiry = expired
+
+		// Make the failure a server internal error. Not related to the token
+		refreshErr = &oauth2.RetrieveError{
+			Response: &http.Response{
+				StatusCode: http.StatusInternalServerError,
+			},
+			ErrorCode: "internal_error",
+		}
+		_, err := config.RefreshToken(ctx, mDB, link)
+		require.Error(t, err)
+		require.True(t, externalauth.IsInvalidTokenError(err))
+		require.Equal(t, refreshCount, 1)
+
+		// Try again with a bad refresh token error
+		// Expect DB call to remove the refresh token
+		mDB.EXPECT().UpdateExternalAuthLinkRefreshToken(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		refreshErr = &oauth2.RetrieveError{ // github error
+			Response: &http.Response{
+				StatusCode: http.StatusOK,
+			},
+			ErrorCode: "bad_refresh_token",
+		}
+		_, err = config.RefreshToken(ctx, mDB, link)
+		require.Error(t, err)
+		require.True(t, externalauth.IsInvalidTokenError(err))
+		require.Equal(t, refreshCount, 2)
+
+		// When the refresh token is empty, no api calls should be made
+		link.OAuthRefreshToken = "" // mock'd db, so manually set the token to ''
+		_, err = config.RefreshToken(ctx, mDB, link)
+		require.Error(t, err)
+		require.True(t, externalauth.IsInvalidTokenError(err))
+		require.Equal(t, refreshCount, 2)
 	})
 
 	// ValidateFailure tests if the token is no longer valid with a 401 response.
@@ -156,9 +230,9 @@ func TestRefreshToken(t *testing.T) {
 		ctx := oidc.ClientContext(context.Background(), fake.HTTPClient(nil))
 		link.OAuthExpiry = expired
 
-		_, refreshed, err := config.RefreshToken(ctx, nil, link)
-		require.NoError(t, err, staticError)
-		require.False(t, refreshed)
+		_, err := config.RefreshToken(ctx, nil, link)
+		require.ErrorContains(t, err, "token failed to validate")
+		require.True(t, externalauth.IsInvalidTokenError(err))
 		require.True(t, validated, "token should have been attempted to be validated")
 	})
 
@@ -191,9 +265,8 @@ func TestRefreshToken(t *testing.T) {
 		// Unlimited lifetime, this is what GitHub returns tokens as
 		link.OAuthExpiry = time.Time{}
 
-		_, ok, err := config.RefreshToken(ctx, nil, link)
+		_, err := config.RefreshToken(ctx, nil, link)
 		require.NoError(t, err)
-		require.True(t, ok)
 		require.Equal(t, 2, validateCalls, "token should have been attempted to be validated more than once")
 	})
 
@@ -219,9 +292,8 @@ func TestRefreshToken(t *testing.T) {
 
 		ctx := oidc.ClientContext(context.Background(), fake.HTTPClient(nil))
 
-		_, ok, err := config.RefreshToken(ctx, nil, link)
+		_, err := config.RefreshToken(ctx, nil, link)
 		require.NoError(t, err)
-		require.True(t, ok)
 		require.Equal(t, 1, validateCalls, "token is validated")
 	})
 
@@ -253,9 +325,8 @@ func TestRefreshToken(t *testing.T) {
 		// Force a refresh
 		link.OAuthExpiry = expired
 
-		updated, ok, err := config.RefreshToken(ctx, db, link)
+		updated, err := config.RefreshToken(ctx, db, link)
 		require.NoError(t, err)
-		require.True(t, ok)
 		require.Equal(t, 1, validateCalls, "token is validated")
 		require.Equal(t, 1, refreshCalls, "token is refreshed")
 		require.NotEqualf(t, link.OAuthAccessToken, updated.OAuthAccessToken, "token is updated")
@@ -292,9 +363,9 @@ func TestRefreshToken(t *testing.T) {
 		// Force a refresh
 		link.OAuthExpiry = expired
 
-		updated, ok, err := config.RefreshToken(ctx, db, link)
+		updated, err := config.RefreshToken(ctx, db, link)
 		require.NoError(t, err)
-		require.True(t, ok)
+
 		require.True(t, updated.OAuthExtra.Valid)
 		extra := map[string]interface{}{}
 		require.NoError(t, json.Unmarshal(updated.OAuthExtra.RawMessage, &extra))

@@ -92,8 +92,19 @@ EOF
 }
 
 echo_latest_stable_version() {
+	url="https://github.com/coder/coder/releases/latest"
 	# https://gist.github.com/lukechilds/a83e1d7127b78fef38c2914c4ececc3c#gistcomment-2758860
-	version="$(curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/coder/coder/releases/latest)"
+	response=$(curl -sSLI -o /dev/null -w "\n%{http_code} %{url_effective}" ${url})
+	status_code=$(echo "$response" | tail -n1 | cut -d' ' -f1)
+	version=$(echo "$response" | tail -n1 | cut -d' ' -f2-)
+	body=$(echo "$response" | sed '$d')
+
+	if [ "$status_code" != "200" ]; then
+		echoerr "GitHub API returned status code: ${status_code}"
+		echoerr "URL: ${url}"
+		exit 1
+	fi
+
 	version="${version#https://github.com/coder/coder/releases/tag/v}"
 	echo "${version}"
 }
@@ -103,7 +114,19 @@ echo_latest_mainline_version() {
 	# and take the first result. Note that we're sorting by space-
 	# separated numbers and without utilizing the sort -V flag for the
 	# best compatibility.
-	curl -fsSL https://api.github.com/repos/coder/coder/releases |
+	url="https://api.github.com/repos/coder/coder/releases"
+	response=$(curl -sSL -w "\n%{http_code}" ${url})
+	status_code=$(echo "$response" | tail -n1)
+	body=$(echo "$response" | sed '$d')
+
+	if [ "$status_code" != "200" ]; then
+		echoerr "GitHub API returned status code: ${status_code}"
+		echoerr "URL: ${url}"
+		echoerr "Response body: ${body}"
+		exit 1
+	fi
+
+	echo "$body" |
 		awk -F'"' '/"tag_name"/ {print $4}' |
 		tr -d v |
 		tr . ' ' |
@@ -216,7 +239,7 @@ To run a Coder server:
   # Or just run the server directly
   $ coder server
 
-  Configuring Coder: https://coder.com/docs/v2/latest/admin/configure
+  Configuring Coder: https://coder.com/docs/admin/setup
 
 To connect to a Coder deployment:
 
@@ -240,9 +263,9 @@ There is another binary in your PATH that conflicts with the binary we've instal
 
   $1
 
-This is likely because of an existing installation of Coder. See our documentation for suggestions on how to resolve this.
+This is likely because of an existing installation of Coder in your \$PATH.
 
-  https://coder.com/docs/v2/latest/install/install.sh#path-conflicts
+Run \`which -a coder\` to view all installations.
 
 EOF
 }
@@ -250,7 +273,7 @@ EOF
 main() {
 	MAINLINE=1
 	STABLE=0
-	TERRAFORM_VERSION="1.6.6"
+	TERRAFORM_VERSION="1.9.8"
 
 	if [ "${TRACE-}" ]; then
 		set -x
@@ -363,7 +386,7 @@ main() {
 	if [ "${RSH_ARGS-}" ]; then
 		RSH="${RSH-ssh}"
 		echoh "Installing remotely with $RSH $RSH_ARGS"
-		curl -fsSL https://coder.dev/install.sh | prefix "$RSH_ARGS" "$RSH" "$RSH_ARGS" sh -s -- "$ALL_FLAGS"
+		curl -fsSL https://coder.com/install.sh | prefix "$RSH_ARGS" "$RSH" "$RSH_ARGS" sh -s -- "$ALL_FLAGS"
 		return
 	fi
 
@@ -372,14 +395,6 @@ main() {
 	OS=${OS:-$(os)}
 	ARCH=${ARCH:-$(arch)}
 	TERRAFORM_ARCH=${TERRAFORM_ARCH:-$(terraform_arch)}
-
-	# We can't reasonably support installing specific versions of Coder through
-	# Homebrew, so if we're on macOS and the `--version` flag was set, we should
-	# "detect" standalone to be the appropriate installation method. This check
-	# needs to occur before we set `VERSION` to a default of the latest release.
-	if [ "$OS" = "darwin" ] && [ "${VERSION-}" ]; then
-		METHOD=standalone
-	fi
 
 	# If we've been provided a flag which is specific to the standalone installation
 	# method, we should "detect" standalone to be the appropriate installation method.
@@ -395,6 +410,15 @@ main() {
 		exit 1
 	fi
 
+	# We can't reasonably support installing specific versions of Coder through
+	# Homebrew, so if we're on macOS and the `--version` flag or the `--stable`
+	# flag (our tap follows mainline) was set, we should "detect" standalone to
+	# be the appropriate installation method. This check needs to occur before we
+	# set `VERSION` to a default of the latest release.
+	if [ "$OS" = "darwin" ] && { [ "${VERSION-}" ] || [ "${STABLE}" = 1 ]; }; then
+		METHOD=standalone
+	fi
+
 	# These are used by the various install_* functions that make use of GitHub
 	# releases in order to download and unpack the right release.
 	CACHE_DIR=$(echo_cache_dir)
@@ -404,8 +428,10 @@ main() {
 	STABLE_VERSION=$(echo_latest_stable_version)
 	if [ "${MAINLINE}" = 1 ]; then
 		VERSION=$(echo_latest_mainline_version)
+		echoh "Resolved mainline version: v${VERSION}"
 	elif [ "${STABLE}" = 1 ]; then
 		VERSION=${STABLE_VERSION}
+		echoh "Resolved stable version: v${VERSION}"
 	fi
 
 	distro_name

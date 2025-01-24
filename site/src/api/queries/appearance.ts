@@ -1,24 +1,24 @@
-import type { QueryClient, UseQueryOptions } from "react-query";
-import * as API from "api/api";
+import { API } from "api/api";
 import type { AppearanceConfig } from "api/typesGenerated";
-import { getMetadataAsJSON } from "utils/metadata";
+import type { MetadataState } from "hooks/useEmbeddedMetadata";
+import type { QueryClient } from "react-query";
+import { cachedQuery } from "./util";
 
-const initialAppearanceData = getMetadataAsJSON<AppearanceConfig>("appearance");
-const appearanceConfigKey = ["appearance"] as const;
+export const appearanceConfigKey = ["appearance"] as const;
 
-export const appearance = (): UseQueryOptions<AppearanceConfig> => {
-  return {
-    queryKey: ["appearance"],
-    initialData: initialAppearanceData,
-    queryFn: () => API.getAppearance(),
-  };
+export const appearance = (metadata: MetadataState<AppearanceConfig>) => {
+	return cachedQuery({
+		metadata,
+		queryKey: appearanceConfigKey,
+		queryFn: () => API.getAppearance(),
+	});
 };
 
 export const updateAppearance = (queryClient: QueryClient) => {
-  return {
-    mutationFn: API.updateAppearance,
-    onSuccess: (newConfig: AppearanceConfig) => {
-      queryClient.setQueryData(appearanceConfigKey, newConfig);
-    },
-  };
+	return {
+		mutationFn: API.updateAppearance,
+		onSuccess: (newConfig: AppearanceConfig) => {
+			queryClient.setQueryData(appearanceConfigKey, newConfig);
+		},
+	};
 };

@@ -19,6 +19,7 @@ import (
 	"github.com/coder/coder/v2/cli/cliui"
 	"github.com/coder/coder/v2/cli/telemetry"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/testutil"
 	"github.com/coder/pretty"
 	"github.com/coder/serpent"
 )
@@ -29,15 +30,7 @@ func TestMain(m *testing.M) {
 		// See: https://github.com/coder/coder/issues/8954
 		os.Exit(m.Run())
 	}
-	goleak.VerifyTestMain(m,
-		// The lumberjack library is used by by agent and seems to leave
-		// goroutines after Close(), fails TestGitSSH tests.
-		// https://github.com/natefinch/lumberjack/pull/100
-		goleak.IgnoreTopFunction("gopkg.in/natefinch/lumberjack%2ev2.(*Logger).millRun"),
-		goleak.IgnoreTopFunction("gopkg.in/natefinch/lumberjack%2ev2.(*Logger).mill.func1"),
-		// The pq library appears to leave around a goroutine after Close().
-		goleak.IgnoreTopFunction("github.com/lib/pq.NewDialListener"),
-	)
+	goleak.VerifyTestMain(m, testutil.GoleakOptions...)
 }
 
 func Test_formatExamples(t *testing.T) {
@@ -45,7 +38,7 @@ func Test_formatExamples(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		examples    []example
+		examples    []Example
 		wantMatches []string
 	}{
 		{
@@ -55,7 +48,7 @@ func Test_formatExamples(t *testing.T) {
 		},
 		{
 			name: "Output examples",
-			examples: []example{
+			examples: []Example{
 				{
 					Description: "Hello world.",
 					Command:     "echo hello",
@@ -72,7 +65,7 @@ func Test_formatExamples(t *testing.T) {
 		},
 		{
 			name: "No description outputs commands",
-			examples: []example{
+			examples: []Example{
 				{
 					Command: "echo hello",
 				},
@@ -87,7 +80,7 @@ func Test_formatExamples(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := formatExamples(tt.examples...)
+			got := FormatExamples(tt.examples...)
 			if len(tt.wantMatches) == 0 {
 				require.Empty(t, got)
 			} else {

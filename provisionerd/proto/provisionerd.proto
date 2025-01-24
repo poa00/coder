@@ -53,6 +53,7 @@ message AcquiredJob {
 message FailedJob {
     message WorkspaceBuild {
         bytes state = 1;
+        repeated provisioner.Timing timings = 2;
     }
     message TemplateImport {}
     message TemplateDryRun {}
@@ -72,6 +73,8 @@ message CompletedJob {
     message WorkspaceBuild {
         bytes state = 1;
         repeated provisioner.Resource resources = 2;
+        repeated provisioner.Timing timings = 3;
+        repeated provisioner.Module modules = 4;
     }
     message TemplateImport {
         repeated provisioner.Resource start_resources = 1;
@@ -79,9 +82,12 @@ message CompletedJob {
         repeated provisioner.RichParameter rich_parameters = 3;
         repeated string external_auth_providers_names = 4;
         repeated provisioner.ExternalAuthProviderResource external_auth_providers = 5;
+        repeated provisioner.Module start_modules = 6;
+        repeated provisioner.Module stop_modules = 7;
     }
     message TemplateDryRun {
         repeated provisioner.Resource resources = 1;
+        repeated provisioner.Module modules = 2;
     }
 
     string job_id = 1;
@@ -116,6 +122,7 @@ message UpdateJobRequest {
     repeated provisioner.TemplateVariable template_variables = 4;
     repeated provisioner.VariableValue user_variable_values = 5;
     bytes readme = 6;
+	map<string,string> workspace_tags = 7;
 }
 
 message UpdateJobResponse {

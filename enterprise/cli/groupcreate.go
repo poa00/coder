@@ -16,6 +16,7 @@ func (r *RootCmd) groupCreate() *serpent.Command {
 	var (
 		avatarURL   string
 		displayName string
+		orgContext  = agpl.NewOrganizationContext()
 	)
 
 	client := new(codersdk.Client)
@@ -29,9 +30,14 @@ func (r *RootCmd) groupCreate() *serpent.Command {
 		Handler: func(inv *serpent.Invocation) error {
 			ctx := inv.Context()
 
-			org, err := agpl.CurrentOrganization(&r.RootCmd, inv, client)
+			org, err := orgContext.Selected(inv, client)
 			if err != nil {
 				return xerrors.Errorf("current organization: %w", err)
+			}
+
+			err = codersdk.GroupNameValid(inv.Args[0])
+			if err != nil {
+				return xerrors.Errorf("group name %q is invalid: %w", inv.Args[0], err)
 			}
 
 			group, err := client.CreateGroup(ctx, org.ID, codersdk.CreateGroupRequest{
@@ -60,9 +66,19 @@ func (r *RootCmd) groupCreate() *serpent.Command {
 			Flag:        "display-name",
 			Description: `Optional human friendly name for the group.`,
 			Env:         "CODER_DISPLAY_NAME",
-			Value:       serpent.StringOf(&displayName),
+			Value: serpent.Validate(serpent.StringOf(&displayName), func(_displayName *serpent.String) error {
+				displayName := _displayName.String()
+				if displayName != "" {
+					err := codersdk.DisplayNameValid(displayName)
+					if err != nil {
+						return xerrors.Errorf("group display name %q is invalid: %w", displayName, err)
+					}
+				}
+				return nil
+			}),
 		},
 	}
+	orgContext.AttachOptions(cmd)
 
 	return cmd
 }

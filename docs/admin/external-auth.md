@@ -1,99 +1,68 @@
 # External Authentication
 
-Coder integrates with Git and OpenID Connect to automate away the need for
-developers to authenticate with external services within their workspace.
+Coder supports external authentication via OAuth2.0. This allows enabling any OAuth provider as well as integrations with Git providers,
+such as GitHub, GitLab, and Bitbucket.
 
-## Git Providers
+External authentication can also be used to integrate with external services
+like JFrog Artifactory and others.
 
-When developers use `git` inside their workspace, they are prompted to
-authenticate. After that, Coder will store and refresh tokens for future
-operations.
+To add an external authentication provider, you'll need to create an OAuth
+application. The following providers have been tested and work with Coder:
 
-<video autoplay playsinline loop>
-  <source src="https://github.com/coder/coder/blob/main/site/static/external-auth.mp4?raw=true" type="video/mp4">
-Your browser does not support the video tag.
-</video>
+- [Azure DevOps](https://learn.microsoft.com/en-us/azure/devops/integrate/get-started/authentication/oauth?view=azure-devops)
+- [Azure DevOps (via Entra ID)](https://learn.microsoft.com/en-us/entra/architecture/auth-oauth2)
+- [BitBucket](https://support.atlassian.com/bitbucket-cloud/docs/use-oauth-on-bitbucket-cloud/)
+- [GitHub](#github)
+- [GitLab](https://docs.gitlab.com/ee/integration/oauth_provider.html)
+
+If you have experience with a provider that is not listed here, please
+[file an issue](https://github.com/coder/internal/issues/new?title=request%28docs%29%3A+external-auth+-+request+title+here%0D%0A&labels=["customer-feedback","docs"]&body=doc%3A+%5Bexternal-auth%5D%28https%3A%2F%2Fcoder.com%2Fdocs%2Fadmin%2Fexternal-auth%29%0D%0A%0D%0Aplease+enter+your+request+here%0D%0A)
 
 ## Configuration
 
-To add an external authentication provider, you'll need to create an OAuth
-application. The following providers are supported:
-
-- [GitHub](#github)
-- [GitLab](https://docs.gitlab.com/ee/integration/oauth_provider.html)
-- [BitBucket](https://support.atlassian.com/bitbucket-cloud/docs/use-oauth-on-bitbucket-cloud/)
-- [Azure DevOps](https://learn.microsoft.com/en-us/azure/devops/integrate/get-started/authentication/oauth?view=azure-devops)
-- [Azure DevOps (via Entra ID)](https://learn.microsoft.com/en-us/entra/architecture/auth-oauth2)
-
-Example callback URL:
-`https://coder.example.com/external-auth/primary-github/callback`. Use an
-arbitrary ID for your provider (e.g. `primary-github`).
-
-Set the following environment variables to
-[configure the Coder server](./configure.md):
+After you create an OAuth application, set environment variables to configure the Coder server to use it:
 
 ```env
-CODER_EXTERNAL_AUTH_0_ID="primary-github"
-CODER_EXTERNAL_AUTH_0_TYPE=github|gitlab|azure-devops|bitbucket-cloud|bitbucket-server|<name of service e.g. jfrog>
-CODER_EXTERNAL_AUTH_0_CLIENT_ID=xxxxxx
-CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=xxxxxxx
+CODER_EXTERNAL_AUTH_0_ID="<USER_DEFINED_ID>"
+CODER_EXTERNAL_AUTH_0_TYPE=<github|gitlab|azure-devops|bitbucket-cloud|bitbucket-server|etc>
+CODER_EXTERNAL_AUTH_0_CLIENT_ID=<OAuth app client ID>
+CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=<OAuth app client secret>
 
-# Optionally, configure a custom display name and icon
+# Optionally, configure a custom display name and icon:
 CODER_EXTERNAL_AUTH_0_DISPLAY_NAME="Google Calendar"
 CODER_EXTERNAL_AUTH_0_DISPLAY_ICON="https://mycustomicon.com/google.svg"
 ```
 
-### GitHub
+The `CODER_EXTERNAL_AUTH_0_ID` environment variable is used for internal
+reference. Set it with a value that helps you identify it. For example, you can use `CODER_EXTERNAL_AUTH_0_ID="primary-github"` for your
+GitHub provider.
 
-1. [Create a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)
-   to enable fine-grained access to specific repositories, or a subset of
-   permissions for security.
+Add the following code to any template to add a button to the workspace setup page which will allow you to authenticate with your provider:
 
-   ![Register GitHub App](../images/admin/github-app-register.png)
+```tf
+data "coder_external_auth" "<github|gitlab|azure-devops|bitbucket-cloud|bitbucket-server|other>" {
+    id = "<USER_DEFINED_ID>"
+}
 
-2. Adjust the GitHub App permissions. You can use more or less permissions than
-   are listed here, this is merely a suggestion that allows users to clone
-   repositories:
+# GitHub Example (CODER_EXTERNAL_AUTH_0_ID="primary-github")
+# makes a GitHub authentication token available at data.coder_external_auth.github.access_token
+data "coder_external_auth" "github" {
+   id = "primary-github"
+}
 
-   ![Adjust GitHub App Permissions](../images/admin/github-app-permissions.png)
-
-   | Name          | Permission   | Description                                            |
-   | ------------- | ------------ | ------------------------------------------------------ |
-   | Contents      | Read & Write | Grants access to code and commit statuses.             |
-   | Pull requests | Read & Write | Grants access to create and update pull requests.      |
-   | Workflows     | Read & Write | Grants access to update files in `.github/workflows/`. |
-   | Metadata      | Read-only    | Grants access to metadata written by GitHub Apps.      |
-
-3. Install the App for your organization. You may select a subset of
-   repositories to grant access to.
-
-   ![Install GitHub App](../images/admin/github-app-install.png)
-
-### GitHub Enterprise
-
-GitHub Enterprise requires the following environment variables:
-
-```env
-CODER_EXTERNAL_AUTH_0_ID="primary-github"
-CODER_EXTERNAL_AUTH_0_TYPE=github-enterprise
-CODER_EXTERNAL_AUTH_0_CLIENT_ID=xxxxxx
-CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=xxxxxxx
-CODER_EXTERNAL_AUTH_0_VALIDATE_URL="https://github.example.com/api/v3/user"
-CODER_EXTERNAL_AUTH_0_AUTH_URL="https://github.example.com/login/oauth/authorize"
-CODER_EXTERNAL_AUTH_0_TOKEN_URL="https://github.example.com/login/oauth/access_token"
 ```
 
-### Bitbucket Server
+Inside your Terraform code, you now have access to authentication variables. Reference the documentation for your chosen provider for more information on how to supply it with a token.
 
-Bitbucket Server requires the following environment variables:
+### Workspace CLI
 
-```env
-CODER_EXTERNAL_AUTH_0_TYPE="bitbucket-server"
-CODER_EXTERNAL_AUTH_0_ID=bitbucket
-CODER_EXTERNAL_AUTH_0_CLIENT_ID=xxx
-CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=xxx
-CODER_EXTERNAL_AUTH_0_AUTH_URL=https://bitbucket.domain.com/rest/oauth2/latest/authorize
+Use [`external-auth`](../reference/cli/external-auth.md) in the Coder CLI to access a token within the workspace:
+
+```shell
+coder external-auth <USER_DEFINED_ID> access-token
 ```
+
+## Git-provider specific env variables
 
 ### Azure DevOps
 
@@ -123,6 +92,61 @@ CODER_EXTERNAL_AUTH_0_AUTH_URL="https://login.microsoftonline.com/<TENANT ID>/oa
 
 > Note: Your app registration in Entra ID requires the `vso.code_write` scope
 
+### Bitbucket Server
+
+Bitbucket Server requires the following environment variables:
+
+```env
+CODER_EXTERNAL_AUTH_0_ID="primary-bitbucket-server"
+CODER_EXTERNAL_AUTH_0_TYPE=bitbucket-server
+CODER_EXTERNAL_AUTH_0_CLIENT_ID=xxx
+CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=xxx
+CODER_EXTERNAL_AUTH_0_AUTH_URL=https://bitbucket.domain.com/rest/oauth2/latest/authorize
+```
+
+### Gitea
+
+```env
+CODER_EXTERNAL_AUTH_0_ID="gitea"
+CODER_EXTERNAL_AUTH_0_TYPE=gitea
+CODER_EXTERNAL_AUTH_0_CLIENT_ID=xxxxxxx
+CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=xxxxxxx
+# If self managed, set the Auth URL to your Gitea instance
+CODER_EXTERNAL_AUTH_0_AUTH_URL="https://gitea.com/login/oauth/authorize"
+```
+
+The Redirect URI for Gitea should be
+`https://coder.company.org/external-auth/gitea/callback`.
+
+### GitHub
+
+<blockquote class="admonition tip">
+
+If you don't require fine-grained access control, it's easier to [configure a GitHub OAuth app](#configure-a-github-oauth-app).
+
+</blockquote>
+
+```env
+CODER_EXTERNAL_AUTH_0_ID="USER_DEFINED_ID"
+CODER_EXTERNAL_AUTH_0_TYPE=github
+CODER_EXTERNAL_AUTH_0_CLIENT_ID=xxxxxx
+CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=xxxxxxx
+```
+
+### GitHub Enterprise
+
+GitHub Enterprise requires the following environment variables:
+
+```env
+CODER_EXTERNAL_AUTH_0_ID="primary-github"
+CODER_EXTERNAL_AUTH_0_TYPE=github
+CODER_EXTERNAL_AUTH_0_CLIENT_ID=xxxxxx
+CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=xxxxxxx
+CODER_EXTERNAL_AUTH_0_VALIDATE_URL="https://github.example.com/api/v3/user"
+CODER_EXTERNAL_AUTH_0_AUTH_URL="https://github.example.com/login/oauth/authorize"
+CODER_EXTERNAL_AUTH_0_TOKEN_URL="https://github.example.com/login/oauth/access_token"
+```
+
 ### GitLab self-managed
 
 GitLab self-managed requires the following environment variables:
@@ -139,18 +163,11 @@ CODER_EXTERNAL_AUTH_0_TOKEN_URL="https://gitlab.company.org/oauth/token"
 CODER_EXTERNAL_AUTH_0_REGEX=gitlab\.company\.org
 ```
 
-### Gitea
+### JFrog Artifactory
 
-```env
-CODER_EXTERNAL_AUTH_0_ID="gitea"
-CODER_EXTERNAL_AUTH_0_TYPE=gitea
-CODER_EXTERNAL_AUTH_0_CLIENT_ID=xxxxxxx
-CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=xxxxxxx
-# If self managed, set the Auth URL to your Gitea instance
-CODER_EXTERNAL_AUTH_0_AUTH_URL="https://gitea.com/login/oauth/authorize"
-```
+Visit the [JFrog Artifactory](../admin/integrations/jfrog-artifactory.md) guide for instructions on how to set up for JFrog Artifactory.
 
-### Self-managed git providers
+## Self-managed Git providers
 
 Custom authentication and token URLs should be used for self-managed Git
 provider deployments.
@@ -164,7 +181,7 @@ CODER_EXTERNAL_AUTH_0_REGEX=github\.company\.org
 
 > Note: The `REGEX` variable must be set if using a custom git domain.
 
-### Custom scopes
+## Custom scopes
 
 Optionally, you can request custom scopes:
 
@@ -172,10 +189,59 @@ Optionally, you can request custom scopes:
 CODER_EXTERNAL_AUTH_0_SCOPES="repo:read repo:write write:gpg_key"
 ```
 
-### Multiple External Providers (enterprise)
+## OAuth provider
 
-Multiple providers are an Enterprise feature. [Learn more](../enterprise.md).
-Below is an example configuration with multiple providers.
+### Configure a GitHub OAuth app
+
+1. [Create a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)
+
+   - Set the callback URL to
+     `https://coder.example.com/external-auth/USER_DEFINED_ID/callback`.
+   - Deactivate Webhooks.
+   - Enable fine-grained access to specific repositories or a subset of
+     permissions for security.
+
+   ![Register GitHub App](../images/admin/github-app-register.png)
+
+1. Adjust the GitHub app permissions. You can use more or fewer permissions than
+   are listed here, this example allows users to clone
+   repositories:
+
+   ![Adjust GitHub App Permissions](../images/admin/github-app-permissions.png)
+
+   | Name          | Permission   | Description                                            |
+   |---------------|--------------|--------------------------------------------------------|
+   | Contents      | Read & Write | Grants access to code and commit statuses.             |
+   | Pull requests | Read & Write | Grants access to create and update pull requests.      |
+   | Workflows     | Read & Write | Grants access to update files in `.github/workflows/`. |
+   | Metadata      | Read-only    | Grants access to metadata written by GitHub Apps.      |
+   | Members       | Read-only    | Grants access to organization members and teams.       |
+
+1. Install the App for your organization. You may select a subset of
+   repositories to grant access to.
+
+   ![Install GitHub App](../images/admin/github-app-install.png)
+
+## Multiple External Providers
+
+<blockquote class="info">
+
+Multiple providers is an Enterprise and Premium feature.
+[Learn more](https://coder.com/pricing#compare-plans).
+
+</blockquote>
+
+Below is an example configuration with multiple providers:
+
+<blockquote class="admonition warning">
+
+**Note:** To support regex matching for paths like `github\.com/org`, add the following `git config` line to the [Coder agent startup script](https://registry.terraform.io/providers/coder/coder/latest/docs/resources/agent#startup_script):
+
+```shell
+git config --global credential.useHttpPath true
+```
+
+</blockquote>
 
 ```env
 # Provider 1) github.com
@@ -183,97 +249,15 @@ CODER_EXTERNAL_AUTH_0_ID=primary-github
 CODER_EXTERNAL_AUTH_0_TYPE=github
 CODER_EXTERNAL_AUTH_0_CLIENT_ID=xxxxxx
 CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=xxxxxxx
-CODER_EXTERNAL_AUTH_0_REGEX=github.com/orgname
+CODER_EXTERNAL_AUTH_0_REGEX=github\.com/org
 
 # Provider 2) github.example.com
 CODER_EXTERNAL_AUTH_1_ID=secondary-github
 CODER_EXTERNAL_AUTH_1_TYPE=github
 CODER_EXTERNAL_AUTH_1_CLIENT_ID=xxxxxx
 CODER_EXTERNAL_AUTH_1_CLIENT_SECRET=xxxxxxx
-CODER_EXTERNAL_AUTH_1_REGEX=github.example.com
+CODER_EXTERNAL_AUTH_1_REGEX=github\.example\.com
 CODER_EXTERNAL_AUTH_1_AUTH_URL="https://github.example.com/login/oauth/authorize"
 CODER_EXTERNAL_AUTH_1_TOKEN_URL="https://github.example.com/login/oauth/access_token"
 CODER_EXTERNAL_AUTH_1_VALIDATE_URL="https://github.example.com/api/v3/user"
 ```
-
-To support regex matching for paths (e.g. github.com/orgname), you'll need to
-add this to the
-[Coder agent startup script](https://registry.terraform.io/providers/coder/coder/latest/docs/resources/agent#startup_script):
-
-```shell
-git config --global credential.useHttpPath true
-```
-
-## Require git authentication in templates
-
-If your template requires git authentication (e.g. running `git clone` in the
-[startup_script](https://registry.terraform.io/providers/coder/coder/latest/docs/resources/agent#startup_script)),
-you can require users authenticate via git prior to creating a workspace:
-
-![Git authentication in template](../images/admin/git-auth-template.png)
-
-### Native git authentication will auto-refresh tokens
-
-<blockquote class="info">
-  <p>
-  This is the preferred authentication method.
-  </p>
-</blockquote>
-
-By default, the coder agent will configure native `git` authentication via the
-`GIT_ASKPASS` environment variable. Meaning, with no additional configuration,
-external authentication will work with native `git` commands.
-
-To check the auth token being used **from inside a running workspace**, run:
-
-```shell
-# If the exit code is non-zero, then the user is not authenticated with the
-# external provider.
-coder external-auth access-token <external-auth-id>
-```
-
-Note: Some IDE's override the `GIT_ASKPASS` environment variable and need to be
-configured.
-
-**VSCode**
-
-Use the
-[Coder](https://marketplace.visualstudio.com/items?itemName=coder.coder-remote)
-extension to automatically configure these settings for you!
-
-Otherwise, you can manually configure the following settings:
-
-- Set `git.terminalAuthentication` to `false`
-- Set `git.useIntegratedAskPass` to `false`
-
-### Hard coded tokens do not auto-refresh
-
-If the token is required to be inserted into the workspace, for example
-[GitHub cli](https://cli.github.com/), the auth token can be inserted from the
-template. This token will not auto-refresh. The following example will
-authenticate via GitHub and auto-clone a repo into the `~/coder` directory.
-
-```hcl
-data "coder_external_auth" "github" {
-  # Matches the ID of the external auth provider in Coder.
-  id = "github"
-}
-
-resource "coder_agent" "dev" {
-  os   = "linux"
-  arch = "amd64"
-  dir  = "~/coder"
-  env = {
-    GITHUB_TOKEN : data.coder_external_auth.github.access_token
-  }
-  startup_script = <<EOF
-if [ ! -d ~/coder ]; then
-    git clone https://github.com/coder/coder
-fi
-EOF
-}
-```
-
-See the
-[Terraform provider documentation](https://registry.terraform.io/providers/coder/coder/latest/docs/data-sources/git_auth)
-for all available options.

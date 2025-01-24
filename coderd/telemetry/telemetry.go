@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,8 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"cdr.dev/slog"
 	"github.com/coder/coder/v2/buildinfo"
@@ -27,6 +31,7 @@ import (
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/codersdk"
+	tailnetproto "github.com/coder/coder/v2/tailnet/proto"
 )
 
 const (
@@ -41,20 +46,13 @@ type Options struct {
 	// URL is an endpoint to direct telemetry towards!
 	URL *url.URL
 
-	BuiltinPostgres    bool
-	DeploymentID       string
-	GitHubOAuth        bool
-	OIDCAuth           bool
-	OIDCIssuerURL      string
-	Wildcard           bool
-	DERPServerRelayURL string
-	GitAuth            []GitAuth
-	Prometheus         bool
-	STUN               bool
-	SnapshotFrequency  time.Duration
-	Tunnel             bool
-	ParseLicenseJWT    func(lic *License) error
-	Experiments        []string
+	DeploymentID     string
+	DeploymentConfig *codersdk.DeploymentValues
+	BuiltinPostgres  bool
+	Tunnel           bool
+
+	SnapshotFrequency time.Duration
+	ParseLicenseJWT   func(lic *License) error
 }
 
 // New constructs a reporter for telemetry data.
@@ -100,6 +98,7 @@ type Reporter interface {
 	// database. For example, if a new user is added, a snapshot can
 	// contain just that user entry.
 	Report(snapshot *Snapshot)
+	Enabled() bool
 	Close()
 }
 
@@ -114,6 +113,10 @@ type remoteReporter struct {
 	snapshotURL *url.URL
 	startedAt  time.Time
 	shutdownAt *time.Time
+}
+
+func (*remoteReporter) Enabled() bool {
+	return true
 }
 
 func (r *remoteReporter) Report(snapshot *Snapshot) {
@@ -242,31 +245,24 @@ func (r *remoteReporter) deployment() error {
 	}
 
 	data, err := json.Marshal(&Deployment{
-		ID:                 r.options.DeploymentID,
-		Architecture:       sysInfo.Architecture,
-		BuiltinPostgres:    r.options.BuiltinPostgres,
-		Containerized:      containerized,
-		Wildcard:           r.options.Wildcard,
-		DERPServerRelayURL: r.options.DERPServerRelayURL,
-		GitAuth:            r.options.GitAuth,
-		Kubernetes:         os.Getenv("KUBERNETES_SERVICE_HOST") != "",
-		GitHubOAuth:        r.options.GitHubOAuth,
-		OIDCAuth:           r.options.OIDCAuth,
-		OIDCIssuerURL:      r.options.OIDCIssuerURL,
-		Prometheus:         r.options.Prometheus,
-		InstallSource:      installSource,
-		STUN:               r.options.STUN,
-		Tunnel:             r.options.Tunnel,
-		OSType:             sysInfo.OS.Type,
-		OSFamily:           sysInfo.OS.Family,
-		OSPlatform:         sysInfo.OS.Platform,
-		OSName:             sysInfo.OS.Name,
-		OSVersion:          sysInfo.OS.Version,
-		CPUCores:           runtime.NumCPU(),
-		MemoryTotal:        mem.Total,
-		MachineID:          sysInfo.UniqueID,
-		StartedAt:          r.startedAt,
-		ShutdownAt:         r.shutdownAt,
+		ID:              r.options.DeploymentID,
+		Architecture:    sysInfo.Architecture,
+		BuiltinPostgres: r.options.BuiltinPostgres,
+		Containerized:   containerized,
+		Config:          r.options.DeploymentConfig,
+		Kubernetes:      os.Getenv("KUBERNETES_SERVICE_HOST") != "",
+		InstallSource:   installSource,
+		Tunnel:          r.options.Tunnel,
+		OSType:          sysInfo.OS.Type,
+		OSFamily:        sysInfo.OS.Family,
+		OSPlatform:      sysInfo.OS.Platform,
+		OSName:          sysInfo.OS.Name,
+		OSVersion:       sysInfo.OS.Version,
+		CPUCores:        runtime.NumCPU(),
+		MemoryTotal:     mem.Total,
+		MachineID:       sysInfo.UniqueID,
+		StartedAt:       r.startedAt,
+		ShutdownAt:      r.shutdownAt,
 	})
 	if err != nil {
 		return xerrors.Errorf("marshal deployment: %w", err)
@@ -353,9 +349,6 @@ func (r *remoteReporter) createSnapshot() (*Snapshot, error) {
 		users := database.ConvertUserRows(userRows)
 		var firstUser database.User
 		for _, dbUser := range users {
-			if dbUser.Status != database.UserStatusActive {
-				continue
-			}
 			if firstUser.CreatedAt.IsZero() {
 				firstUser = dbUser
 			}
@@ -372,6 +365,28 @@ func (r *remoteReporter) createSnapshot() (*Snapshot, error) {
 				user.Email = &email
 			}
 			snapshot.Users = append(snapshot.Users, user)
+		}
+		return nil
+	})
+	eg.Go(func() error {
+		groups, err := r.options.Database.GetGroups(ctx, database.GetGroupsParams{})
+		if err != nil {
+			return xerrors.Errorf("get groups: %w", err)
+		}
+		snapshot.Groups = make([]Group, 0, len(groups))
+		for _, group := range groups {
+			snapshot.Groups = append(snapshot.Groups, ConvertGroup(group.Group))
+		}
+		return nil
+	})
+	eg.Go(func() error {
+		groupMembers, err := r.options.Database.GetGroupMembers(ctx)
+		if err != nil {
+			return xerrors.Errorf("get groups: %w", err)
+		}
+		snapshot.GroupMembers = make([]GroupMember, 0, len(groupMembers))
+		for _, member := range groupMembers {
+			snapshot.GroupMembers = append(snapshot.GroupMembers, ConvertGroupMember(member))
 		}
 		return nil
 	})
@@ -443,6 +458,17 @@ func (r *remoteReporter) createSnapshot() (*Snapshot, error) {
 		return nil
 	})
 	eg.Go(func() error {
+		workspaceModules, err := r.options.Database.GetWorkspaceModulesCreatedAfter(ctx, createdAfter)
+		if err != nil {
+			return xerrors.Errorf("get workspace modules: %w", err)
+		}
+		snapshot.WorkspaceModules = make([]WorkspaceModule, 0, len(workspaceModules))
+		for _, module := range workspaceModules {
+			snapshot.WorkspaceModules = append(snapshot.WorkspaceModules, ConvertWorkspaceModule(module))
+		}
+		return nil
+	})
+	eg.Go(func() error {
 		licenses, err := r.options.Database.GetUnexpiredLicenses(ctx)
 		if err != nil {
 			return xerrors.Errorf("get licenses: %w", err)
@@ -460,13 +486,24 @@ func (r *remoteReporter) createSnapshot() (*Snapshot, error) {
 		return nil
 	})
 	eg.Go(func() error {
-		stats, err := r.options.Database.GetWorkspaceAgentStats(ctx, createdAfter)
-		if err != nil {
-			return xerrors.Errorf("get workspace agent stats: %w", err)
-		}
-		snapshot.WorkspaceAgentStats = make([]WorkspaceAgentStat, 0, len(stats))
-		for _, stat := range stats {
-			snapshot.WorkspaceAgentStats = append(snapshot.WorkspaceAgentStats, ConvertWorkspaceAgentStat(stat))
+		if r.options.DeploymentConfig != nil && slices.Contains(r.options.DeploymentConfig.Experiments, string(codersdk.ExperimentWorkspaceUsage)) {
+			agentStats, err := r.options.Database.GetWorkspaceAgentUsageStats(ctx, createdAfter)
+			if err != nil {
+				return xerrors.Errorf("get workspace agent stats: %w", err)
+			}
+			snapshot.WorkspaceAgentStats = make([]WorkspaceAgentStat, 0, len(agentStats))
+			for _, stat := range agentStats {
+				snapshot.WorkspaceAgentStats = append(snapshot.WorkspaceAgentStats, ConvertWorkspaceAgentStat(database.GetWorkspaceAgentStatsRow(stat)))
+			}
+		} else {
+			agentStats, err := r.options.Database.GetWorkspaceAgentStats(ctx, createdAfter)
+			if err != nil {
+				return xerrors.Errorf("get workspace agent stats: %w", err)
+			}
+			snapshot.WorkspaceAgentStats = make([]WorkspaceAgentStat, 0, len(agentStats))
+			for _, stat := range agentStats {
+				snapshot.WorkspaceAgentStats = append(snapshot.WorkspaceAgentStats, ConvertWorkspaceAgentStat(stat))
+			}
 		}
 		return nil
 	})
@@ -479,10 +516,6 @@ func (r *remoteReporter) createSnapshot() (*Snapshot, error) {
 		for _, proxy := range proxies {
 			snapshot.WorkspaceProxies = append(snapshot.WorkspaceProxies, ConvertWorkspaceProxy(proxy))
 		}
-		return nil
-	})
-	eg.Go(func() error {
-		snapshot.Experiments = ConvertExperiments(r.options.Experiments)
 		return nil
 	})
 
@@ -621,7 +654,7 @@ func ConvertWorkspaceApp(app database.WorkspaceApp) WorkspaceApp {
 
 // ConvertWorkspaceResource anonymizes a workspace resource.
 func ConvertWorkspaceResource(resource database.WorkspaceResource) WorkspaceResource {
-	return WorkspaceResource{
+	r := WorkspaceResource{
 		ID:           resource.ID,
 		JobID:        resource.JobID,
 		CreatedAt:    resource.CreatedAt,
@@ -629,6 +662,10 @@ func ConvertWorkspaceResource(resource database.WorkspaceResource) WorkspaceReso
 		Type:         resource.Type,
 		InstanceType: resource.InstanceType.String,
 	}
+	if resource.ModulePath.Valid {
+		r.ModulePath = &resource.ModulePath.String
+	}
+	return r
 }
 
 // ConvertWorkspaceResourceMetadata anonymizes workspace metadata.
@@ -637,6 +674,116 @@ func ConvertWorkspaceResourceMetadata(metadata database.WorkspaceResourceMetadat
 		ResourceID: metadata.WorkspaceResourceID,
 		Key:        metadata.Key,
 		Sensitive:  metadata.Sensitive,
+	}
+}
+
+func shouldSendRawModuleSource(source string) bool {
+	return strings.Contains(source, "registry.coder.com")
+}
+
+// ModuleSourceType is the type of source for a module.
+// For reference, see https://developer.hashicorp.com/terraform/language/modules/sources
+type ModuleSourceType string
+
+const (
+	ModuleSourceTypeLocal           ModuleSourceType = "local"
+	ModuleSourceTypeLocalAbs        ModuleSourceType = "local_absolute"
+	ModuleSourceTypePublicRegistry  ModuleSourceType = "public_registry"
+	ModuleSourceTypePrivateRegistry ModuleSourceType = "private_registry"
+	ModuleSourceTypeCoderRegistry   ModuleSourceType = "coder_registry"
+	ModuleSourceTypeGitHub          ModuleSourceType = "github"
+	ModuleSourceTypeBitbucket       ModuleSourceType = "bitbucket"
+	ModuleSourceTypeGit             ModuleSourceType = "git"
+	ModuleSourceTypeMercurial       ModuleSourceType = "mercurial"
+	ModuleSourceTypeHTTP            ModuleSourceType = "http"
+	ModuleSourceTypeS3              ModuleSourceType = "s3"
+	ModuleSourceTypeGCS             ModuleSourceType = "gcs"
+	ModuleSourceTypeUnknown         ModuleSourceType = "unknown"
+)
+
+// Terraform supports a variety of module source types, like:
+//   - local paths (./ or ../)
+//   - absolute local paths (/)
+//   - git URLs (git:: or git@)
+//   - http URLs
+//   - s3 URLs
+//
+// and more!
+//
+// See https://developer.hashicorp.com/terraform/language/modules/sources for an overview.
+//
+// This function attempts to classify the source type of a module. It's imperfect,
+// as checks that terraform actually does are pretty complicated.
+// See e.g. https://github.com/hashicorp/go-getter/blob/842d6c379e5e70d23905b8f6b5a25a80290acb66/detect.go#L47
+// if you're interested in the complexity.
+func GetModuleSourceType(source string) ModuleSourceType {
+	source = strings.TrimSpace(source)
+	source = strings.ToLower(source)
+	if strings.HasPrefix(source, "./") || strings.HasPrefix(source, "../") {
+		return ModuleSourceTypeLocal
+	}
+	if strings.HasPrefix(source, "/") {
+		return ModuleSourceTypeLocalAbs
+	}
+	// Match public registry modules in the format <NAMESPACE>/<NAME>/<PROVIDER>
+	// Sources can have a `//...` suffix, which signifies a subdirectory.
+	// The allowed characters are based on
+	// https://developer.hashicorp.com/terraform/cloud-docs/api-docs/private-registry/modules#request-body-1
+	// because Hashicorp's documentation about module sources doesn't mention it.
+	if matched, _ := regexp.MatchString(`^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+(//.*)?$`, source); matched {
+		return ModuleSourceTypePublicRegistry
+	}
+	if strings.Contains(source, "github.com") {
+		return ModuleSourceTypeGitHub
+	}
+	if strings.Contains(source, "bitbucket.org") {
+		return ModuleSourceTypeBitbucket
+	}
+	if strings.HasPrefix(source, "git::") || strings.HasPrefix(source, "git@") {
+		return ModuleSourceTypeGit
+	}
+	if strings.HasPrefix(source, "hg::") {
+		return ModuleSourceTypeMercurial
+	}
+	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+		return ModuleSourceTypeHTTP
+	}
+	if strings.HasPrefix(source, "s3::") {
+		return ModuleSourceTypeS3
+	}
+	if strings.HasPrefix(source, "gcs::") {
+		return ModuleSourceTypeGCS
+	}
+	if strings.Contains(source, "registry.terraform.io") {
+		return ModuleSourceTypePublicRegistry
+	}
+	if strings.Contains(source, "app.terraform.io") || strings.Contains(source, "localterraform.com") {
+		return ModuleSourceTypePrivateRegistry
+	}
+	if strings.Contains(source, "registry.coder.com") {
+		return ModuleSourceTypeCoderRegistry
+	}
+	return ModuleSourceTypeUnknown
+}
+
+func ConvertWorkspaceModule(module database.WorkspaceModule) WorkspaceModule {
+	source := module.Source
+	version := module.Version
+	sourceType := GetModuleSourceType(source)
+	if !shouldSendRawModuleSource(source) {
+		source = fmt.Sprintf("%x", sha256.Sum256([]byte(source)))
+		version = fmt.Sprintf("%x", sha256.Sum256([]byte(version)))
+	}
+
+	return WorkspaceModule{
+		ID:         module.ID,
+		JobID:      module.JobID,
+		Transition: module.Transition,
+		Source:     source,
+		Version:    version,
+		SourceType: sourceType,
+		Key:        module.Key,
+		CreatedAt:  module.CreatedAt,
 	}
 }
 
@@ -651,10 +798,31 @@ func ConvertUser(dbUser database.User) User {
 		emailHashed = fmt.Sprintf("%x%s", hash[:], dbUser.Email[atSymbol:])
 	}
 	return User{
-		ID:          dbUser.ID,
-		EmailHashed: emailHashed,
-		RBACRoles:   dbUser.RBACRoles,
-		CreatedAt:   dbUser.CreatedAt,
+		ID:              dbUser.ID,
+		EmailHashed:     emailHashed,
+		RBACRoles:       dbUser.RBACRoles,
+		CreatedAt:       dbUser.CreatedAt,
+		Status:          dbUser.Status,
+		GithubComUserID: dbUser.GithubComUserID.Int64,
+	}
+}
+
+func ConvertGroup(group database.Group) Group {
+	return Group{
+		ID:             group.ID,
+		Name:           group.Name,
+		OrganizationID: group.OrganizationID,
+		AvatarURL:      group.AvatarURL,
+		QuotaAllowance: group.QuotaAllowance,
+		DisplayName:    group.DisplayName,
+		Source:         group.Source,
+	}
+}
+
+func ConvertGroupMember(member database.GroupMember) GroupMember {
+	return GroupMember{
+		GroupID: member.GroupID,
+		UserID:  member.UserID,
 	}
 }
 
@@ -699,6 +867,9 @@ func ConvertTemplateVersion(version database.TemplateVersion) TemplateVersion {
 	}
 	if version.TemplateID.Valid {
 		snapVersion.TemplateID = &version.TemplateID.UUID
+	}
+	if version.SourceExampleID.Valid {
+		snapVersion.SourceExampleID = &version.SourceExampleID.String
 	}
 	return snapVersion
 }
@@ -745,16 +916,6 @@ func ConvertExternalProvisioner(id uuid.UUID, tags map[string]string, provisione
 	}
 }
 
-func ConvertExperiments(experiments []string) []Experiment {
-	var out []Experiment
-
-	for _, exp := range experiments {
-		out = append(out, Experiment{Name: exp})
-	}
-
-	return out
-}
-
 // Snapshot represents a point-in-time anonymized database dump.
 // Data is aggregated by latest on the server-side, so partial data
 // can be sent without issue.
@@ -769,6 +930,8 @@ type Snapshot struct {
 	TemplateVersions          []TemplateVersion           `json:"template_versions"`
 	Templates                 []Template                  `json:"templates"`
 	Users                     []User                      `json:"users"`
+	Groups                    []Group                     `json:"groups"`
+	GroupMembers              []GroupMember               `json:"group_members"`
 	WorkspaceAgentStats       []WorkspaceAgentStat        `json:"workspace_agent_stats"`
 	WorkspaceAgents           []WorkspaceAgent            `json:"workspace_agents"`
 	WorkspaceApps             []WorkspaceApp              `json:"workspace_apps"`
@@ -776,41 +939,31 @@ type Snapshot struct {
 	WorkspaceProxies          []WorkspaceProxy            `json:"workspace_proxies"`
 	WorkspaceResourceMetadata []WorkspaceResourceMetadata `json:"workspace_resource_metadata"`
 	WorkspaceResources        []WorkspaceResource         `json:"workspace_resources"`
+	WorkspaceModules          []WorkspaceModule           `json:"workspace_modules"`
 	Workspaces                []Workspace                 `json:"workspaces"`
-	Experiments               []Experiment                `json:"experiments"`
+	NetworkEvents             []NetworkEvent              `json:"network_events"`
 }
 
 // Deployment contains information about the host running Coder.
 type Deployment struct {
-	ID                 string     `json:"id"`
-	Architecture       string     `json:"architecture"`
-	BuiltinPostgres    bool       `json:"builtin_postgres"`
-	Containerized      bool       `json:"containerized"`
-	Kubernetes         bool       `json:"kubernetes"`
-	Tunnel             bool       `json:"tunnel"`
-	Wildcard           bool       `json:"wildcard"`
-	DERPServerRelayURL string     `json:"derp_server_relay_url"`
-	GitAuth            []GitAuth  `json:"git_auth"`
-	GitHubOAuth        bool       `json:"github_oauth"`
-	OIDCAuth           bool       `json:"oidc_auth"`
-	OIDCIssuerURL      string     `json:"oidc_issuer_url"`
-	Prometheus         bool       `json:"prometheus"`
-	InstallSource      string     `json:"install_source"`
-	STUN               bool       `json:"stun"`
-	OSType             string     `json:"os_type"`
-	OSFamily           string     `json:"os_family"`
-	OSPlatform         string     `json:"os_platform"`
-	OSName             string     `json:"os_name"`
-	OSVersion          string     `json:"os_version"`
-	CPUCores           int        `json:"cpu_cores"`
-	MemoryTotal        uint64     `json:"memory_total"`
-	MachineID          string     `json:"machine_id"`
-	StartedAt          time.Time  `json:"started_at"`
-	ShutdownAt         *time.Time `json:"shutdown_at"`
-}
-
-type GitAuth struct {
-	Type string `json:"type"`
+	ID              string                     `json:"id"`
+	Architecture    string                     `json:"architecture"`
+	BuiltinPostgres bool                       `json:"builtin_postgres"`
+	Containerized   bool                       `json:"containerized"`
+	Kubernetes      bool                       `json:"kubernetes"`
+	Config          *codersdk.DeploymentValues `json:"config"`
+	Tunnel          bool                       `json:"tunnel"`
+	InstallSource   string                     `json:"install_source"`
+	OSType          string                     `json:"os_type"`
+	OSFamily        string                     `json:"os_family"`
+	OSPlatform      string                     `json:"os_platform"`
+	OSName          string                     `json:"os_name"`
+	OSVersion       string                     `json:"os_version"`
+	CPUCores        int                        `json:"cpu_cores"`
+	MemoryTotal     uint64                     `json:"memory_total"`
+	MachineID       string                     `json:"machine_id"`
+	StartedAt       time.Time                  `json:"started_at"`
+	ShutdownAt      *time.Time                 `json:"shutdown_at"`
 }
 
 type APIKey struct {
@@ -826,10 +979,26 @@ type User struct {
 	ID        uuid.UUID `json:"id"`
 	CreatedAt time.Time `json:"created_at"`
 	// Email is only filled in for the first/admin user!
-	Email       *string             `json:"email"`
-	EmailHashed string              `json:"email_hashed"`
-	RBACRoles   []string            `json:"rbac_roles"`
-	Status      database.UserStatus `json:"status"`
+	Email           *string             `json:"email"`
+	EmailHashed     string              `json:"email_hashed"`
+	RBACRoles       []string            `json:"rbac_roles"`
+	Status          database.UserStatus `json:"status"`
+	GithubComUserID int64               `json:"github_com_user_id"`
+}
+
+type Group struct {
+	ID             uuid.UUID            `json:"id"`
+	Name           string               `json:"name"`
+	OrganizationID uuid.UUID            `json:"organization_id"`
+	AvatarURL      string               `json:"avatar_url"`
+	QuotaAllowance int32                `json:"quota_allowance"`
+	DisplayName    string               `json:"display_name"`
+	Source         database.GroupSource `json:"source"`
+}
+
+type GroupMember struct {
+	UserID  uuid.UUID `json:"user_id"`
+	GroupID uuid.UUID `json:"group_id"`
 }
 
 type WorkspaceResource struct {
@@ -839,12 +1008,28 @@ type WorkspaceResource struct {
 	Transition   database.WorkspaceTransition `json:"transition"`
 	Type         string                       `json:"type"`
 	InstanceType string                       `json:"instance_type"`
+	// ModulePath is nullable because it was added a long time after the
+	// original workspace resource telemetry was added. All new resources
+	// will have a module path, but deployments with older resources still
+	// in the database will not.
+	ModulePath *string `json:"module_path"`
 }
 
 type WorkspaceResourceMetadata struct {
 	ResourceID uuid.UUID `json:"resource_id"`
 	Key        string    `json:"key"`
 	Sensitive  bool      `json:"sensitive"`
+}
+
+type WorkspaceModule struct {
+	ID         uuid.UUID                    `json:"id"`
+	CreatedAt  time.Time                    `json:"created_at"`
+	JobID      uuid.UUID                    `json:"job_id"`
+	Transition database.WorkspaceTransition `json:"transition"`
+	Key        string                       `json:"key"`
+	Version    string                       `json:"version"`
+	Source     string                       `json:"source"`
+	SourceType ModuleSourceType             `json:"source_type"`
 }
 
 type WorkspaceAgent struct {
@@ -934,11 +1119,12 @@ type Template struct {
 }
 
 type TemplateVersion struct {
-	ID             uuid.UUID  `json:"id"`
-	CreatedAt      time.Time  `json:"created_at"`
-	TemplateID     *uuid.UUID `json:"template_id,omitempty"`
-	OrganizationID uuid.UUID  `json:"organization_id"`
-	JobID          uuid.UUID  `json:"job_id"`
+	ID              uuid.UUID  `json:"id"`
+	CreatedAt       time.Time  `json:"created_at"`
+	TemplateID      *uuid.UUID `json:"template_id,omitempty"`
+	OrganizationID  uuid.UUID  `json:"organization_id"`
+	JobID           uuid.UUID  `json:"job_id"`
+	SourceExampleID *string    `json:"source_example_id,omitempty"`
 }
 
 type ProvisionerJob struct {
@@ -985,11 +1171,294 @@ type ExternalProvisioner struct {
 	ShutdownAt   *time.Time        `json:"shutdown_at"`
 }
 
-type Experiment struct {
-	Name string `json:"name"`
+type NetworkEventIPFields struct {
+	Version int32  `json:"version"` // 4 or 6
+	Class   string `json:"class"`   // public, private, link_local, unique_local, loopback
+}
+
+func ipFieldsFromProto(proto *tailnetproto.IPFields) NetworkEventIPFields {
+	if proto == nil {
+		return NetworkEventIPFields{}
+	}
+	return NetworkEventIPFields{
+		Version: proto.Version,
+		Class:   strings.ToLower(proto.Class.String()),
+	}
+}
+
+type NetworkEventP2PEndpoint struct {
+	Hash   string               `json:"hash"`
+	Port   int                  `json:"port"`
+	Fields NetworkEventIPFields `json:"fields"`
+}
+
+func p2pEndpointFromProto(proto *tailnetproto.TelemetryEvent_P2PEndpoint) NetworkEventP2PEndpoint {
+	if proto == nil {
+		return NetworkEventP2PEndpoint{}
+	}
+	return NetworkEventP2PEndpoint{
+		Hash:   proto.Hash,
+		Port:   int(proto.Port),
+		Fields: ipFieldsFromProto(proto.Fields),
+	}
+}
+
+type DERPMapHomeParams struct {
+	RegionScore map[int64]float64 `json:"region_score"`
+}
+
+func derpMapHomeParamsFromProto(proto *tailnetproto.DERPMap_HomeParams) DERPMapHomeParams {
+	if proto == nil {
+		return DERPMapHomeParams{}
+	}
+	out := DERPMapHomeParams{
+		RegionScore: make(map[int64]float64, len(proto.RegionScore)),
+	}
+	for k, v := range proto.RegionScore {
+		out.RegionScore[k] = v
+	}
+	return out
+}
+
+type DERPRegion struct {
+	RegionID      int64 `json:"region_id"`
+	EmbeddedRelay bool  `json:"embedded_relay"`
+	RegionCode    string
+	RegionName    string
+	Avoid         bool
+	Nodes         []DERPNode `json:"nodes"`
+}
+
+func derpRegionFromProto(proto *tailnetproto.DERPMap_Region) DERPRegion {
+	if proto == nil {
+		return DERPRegion{}
+	}
+	nodes := make([]DERPNode, 0, len(proto.Nodes))
+	for _, node := range proto.Nodes {
+		nodes = append(nodes, derpNodeFromProto(node))
+	}
+	return DERPRegion{
+		RegionID:      proto.RegionId,
+		EmbeddedRelay: proto.EmbeddedRelay,
+		RegionCode:    proto.RegionCode,
+		RegionName:    proto.RegionName,
+		Avoid:         proto.Avoid,
+		Nodes:         nodes,
+	}
+}
+
+type DERPNode struct {
+	Name             string `json:"name"`
+	RegionID         int64  `json:"region_id"`
+	HostName         string `json:"host_name"`
+	CertName         string `json:"cert_name"`
+	IPv4             string `json:"ipv4"`
+	IPv6             string `json:"ipv6"`
+	STUNPort         int32  `json:"stun_port"`
+	STUNOnly         bool   `json:"stun_only"`
+	DERPPort         int32  `json:"derp_port"`
+	InsecureForTests bool   `json:"insecure_for_tests"`
+	ForceHTTP        bool   `json:"force_http"`
+	STUNTestIP       string `json:"stun_test_ip"`
+	CanPort80        bool   `json:"can_port_80"`
+}
+
+func derpNodeFromProto(proto *tailnetproto.DERPMap_Region_Node) DERPNode {
+	if proto == nil {
+		return DERPNode{}
+	}
+	return DERPNode{
+		Name:             proto.Name,
+		RegionID:         proto.RegionId,
+		HostName:         proto.HostName,
+		CertName:         proto.CertName,
+		IPv4:             proto.Ipv4,
+		IPv6:             proto.Ipv6,
+		STUNPort:         proto.StunPort,
+		STUNOnly:         proto.StunOnly,
+		DERPPort:         proto.DerpPort,
+		InsecureForTests: proto.InsecureForTests,
+		ForceHTTP:        proto.ForceHttp,
+		STUNTestIP:       proto.StunTestIp,
+		CanPort80:        proto.CanPort_80,
+	}
+}
+
+type DERPMap struct {
+	HomeParams DERPMapHomeParams `json:"home_params"`
+	Regions    map[int64]DERPRegion
+}
+
+func derpMapFromProto(proto *tailnetproto.DERPMap) DERPMap {
+	if proto == nil {
+		return DERPMap{}
+	}
+	regionMap := make(map[int64]DERPRegion, len(proto.Regions))
+	for k, v := range proto.Regions {
+		regionMap[k] = derpRegionFromProto(v)
+	}
+	return DERPMap{
+		HomeParams: derpMapHomeParamsFromProto(proto.HomeParams),
+		Regions:    regionMap,
+	}
+}
+
+type NetcheckIP struct {
+	Hash   string               `json:"hash"`
+	Fields NetworkEventIPFields `json:"fields"`
+}
+
+func netcheckIPFromProto(proto *tailnetproto.Netcheck_NetcheckIP) NetcheckIP {
+	if proto == nil {
+		return NetcheckIP{}
+	}
+	return NetcheckIP{
+		Hash:   proto.Hash,
+		Fields: ipFieldsFromProto(proto.Fields),
+	}
+}
+
+type Netcheck struct {
+	UDP         bool `json:"udp"`
+	IPv6        bool `json:"ipv6"`
+	IPv4        bool `json:"ipv4"`
+	IPv6CanSend bool `json:"ipv6_can_send"`
+	IPv4CanSend bool `json:"ipv4_can_send"`
+	ICMPv4      bool `json:"icmpv4"`
+
+	OSHasIPv6             *bool `json:"os_has_ipv6"`
+	MappingVariesByDestIP *bool `json:"mapping_varies_by_dest_ip"`
+	HairPinning           *bool `json:"hair_pinning"`
+	UPnP                  *bool `json:"upnp"`
+	PMP                   *bool `json:"pmp"`
+	PCP                   *bool `json:"pcp"`
+
+	PreferredDERP int64 `json:"preferred_derp"`
+
+	RegionV4Latency map[int64]time.Duration `json:"region_v4_latency"`
+	RegionV6Latency map[int64]time.Duration `json:"region_v6_latency"`
+
+	GlobalV4 NetcheckIP `json:"global_v4"`
+	GlobalV6 NetcheckIP `json:"global_v6"`
+}
+
+func protoBool(b *wrapperspb.BoolValue) *bool {
+	if b == nil {
+		return nil
+	}
+	return &b.Value
+}
+
+func netcheckFromProto(proto *tailnetproto.Netcheck) Netcheck {
+	if proto == nil {
+		return Netcheck{}
+	}
+
+	durationMapFromProto := func(m map[int64]*durationpb.Duration) map[int64]time.Duration {
+		out := make(map[int64]time.Duration, len(m))
+		for k, v := range m {
+			out[k] = v.AsDuration()
+		}
+		return out
+	}
+
+	return Netcheck{
+		UDP:         proto.UDP,
+		IPv6:        proto.IPv6,
+		IPv4:        proto.IPv4,
+		IPv6CanSend: proto.IPv6CanSend,
+		IPv4CanSend: proto.IPv4CanSend,
+		ICMPv4:      proto.ICMPv4,
+
+		OSHasIPv6:             protoBool(proto.OSHasIPv6),
+		MappingVariesByDestIP: protoBool(proto.MappingVariesByDestIP),
+		HairPinning:           protoBool(proto.HairPinning),
+		UPnP:                  protoBool(proto.UPnP),
+		PMP:                   protoBool(proto.PMP),
+		PCP:                   protoBool(proto.PCP),
+
+		PreferredDERP: proto.PreferredDERP,
+
+		RegionV4Latency: durationMapFromProto(proto.RegionV4Latency),
+		RegionV6Latency: durationMapFromProto(proto.RegionV6Latency),
+
+		GlobalV4: netcheckIPFromProto(proto.GlobalV4),
+		GlobalV6: netcheckIPFromProto(proto.GlobalV6),
+	}
+}
+
+// NetworkEvent and all related structs come from tailnet.proto.
+type NetworkEvent struct {
+	ID             uuid.UUID               `json:"id"`
+	Time           time.Time               `json:"time"`
+	Application    string                  `json:"application"`
+	Status         string                  `json:"status"`      // connected, disconnected
+	ClientType     string                  `json:"client_type"` // cli, agent, coderd, wsproxy
+	ClientVersion  string                  `json:"client_version"`
+	NodeIDSelf     uint64                  `json:"node_id_self"`
+	NodeIDRemote   uint64                  `json:"node_id_remote"`
+	P2PEndpoint    NetworkEventP2PEndpoint `json:"p2p_endpoint"`
+	HomeDERP       int                     `json:"home_derp"`
+	DERPMap        DERPMap                 `json:"derp_map"`
+	LatestNetcheck Netcheck                `json:"latest_netcheck"`
+
+	ConnectionAge   *time.Duration `json:"connection_age"`
+	ConnectionSetup *time.Duration `json:"connection_setup"`
+	P2PSetup        *time.Duration `json:"p2p_setup"`
+	DERPLatency     *time.Duration `json:"derp_latency"`
+	P2PLatency      *time.Duration `json:"p2p_latency"`
+	ThroughputMbits *float32       `json:"throughput_mbits"`
+}
+
+func protoFloat(f *wrapperspb.FloatValue) *float32 {
+	if f == nil {
+		return nil
+	}
+	return &f.Value
+}
+
+func protoDurationNil(d *durationpb.Duration) *time.Duration {
+	if d == nil {
+		return nil
+	}
+	dur := d.AsDuration()
+	return &dur
+}
+
+func NetworkEventFromProto(proto *tailnetproto.TelemetryEvent) (NetworkEvent, error) {
+	if proto == nil {
+		return NetworkEvent{}, xerrors.New("nil event")
+	}
+	id, err := uuid.FromBytes(proto.Id)
+	if err != nil {
+		return NetworkEvent{}, xerrors.Errorf("parse id %q: %w", proto.Id, err)
+	}
+
+	return NetworkEvent{
+		ID:             id,
+		Time:           proto.Time.AsTime(),
+		Application:    proto.Application,
+		Status:         strings.ToLower(proto.Status.String()),
+		ClientType:     strings.ToLower(proto.ClientType.String()),
+		ClientVersion:  proto.ClientVersion,
+		NodeIDSelf:     proto.NodeIdSelf,
+		NodeIDRemote:   proto.NodeIdRemote,
+		P2PEndpoint:    p2pEndpointFromProto(proto.P2PEndpoint),
+		HomeDERP:       int(proto.HomeDerp),
+		DERPMap:        derpMapFromProto(proto.DerpMap),
+		LatestNetcheck: netcheckFromProto(proto.LatestNetcheck),
+
+		ConnectionAge:   protoDurationNil(proto.ConnectionAge),
+		ConnectionSetup: protoDurationNil(proto.ConnectionSetup),
+		P2PSetup:        protoDurationNil(proto.P2PSetup),
+		DERPLatency:     protoDurationNil(proto.DerpLatency),
+		P2PLatency:      protoDurationNil(proto.P2PLatency),
+		ThroughputMbits: protoFloat(proto.ThroughputMbits),
+	}, nil
 }
 
 type noopReporter struct{}
 
 func (*noopReporter) Report(_ *Snapshot) {}
+func (*noopReporter) Enabled() bool      { return false }
 func (*noopReporter) Close()             {}

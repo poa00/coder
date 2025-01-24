@@ -1,15 +1,19 @@
 package database
 
 import (
+	"encoding/hex"
 	"sort"
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/exp/maps"
 	"golang.org/x/oauth2"
+	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/policy"
 )
 
 type WorkspaceStatus string
@@ -59,20 +63,32 @@ func (s WorkspaceAgentStatus) Valid() bool {
 	}
 }
 
+type AuditableOrganizationMember struct {
+	OrganizationMember
+	Username string `json:"username"`
+}
+
+func (m OrganizationMember) Auditable(username string) AuditableOrganizationMember {
+	return AuditableOrganizationMember{
+		OrganizationMember: m,
+		Username:           username,
+	}
+}
+
 type AuditableGroup struct {
 	Group
-	Members []GroupMember `json:"members"`
+	Members []GroupMemberTable `json:"members"`
 }
 
 // Auditable returns an object that can be used in audit logs.
 // Covers both group and group member changes.
-func (g Group) Auditable(users []User) AuditableGroup {
-	members := make([]GroupMember, 0, len(users))
-	for _, u := range users {
-		members = append(members, GroupMember{
-			UserID:  u.ID,
-			GroupID: g.ID,
-		})
+func (g Group) Auditable(members []GroupMember) AuditableGroup {
+	membersTable := make([]GroupMemberTable, len(members))
+	for i, member := range members {
+		membersTable[i] = GroupMemberTable{
+			UserID:  member.UserID,
+			GroupID: member.GroupID,
+		}
 	}
 
 	// consistent ordering
@@ -82,11 +98,24 @@ func (g Group) Auditable(users []User) AuditableGroup {
 
 	return AuditableGroup{
 		Group:   g,
-		Members: members,
+		Members: membersTable,
 	}
 }
 
 const EveryoneGroup = "Everyone"
+
+func (w GetAuditLogsOffsetRow) RBACObject() rbac.Object {
+	return w.AuditLog.RBACObject()
+}
+
+func (w AuditLog) RBACObject() rbac.Object {
+	obj := rbac.ResourceAuditLog.WithID(w.ID)
+	if w.OrganizationID != uuid.Nil {
+		obj = obj.InOrg(w.OrganizationID)
+	}
+
+	return obj
+}
 
 func (s APIKeyScope) ToRBAC() rbac.ScopeName {
 	switch s {
@@ -100,7 +129,7 @@ func (s APIKeyScope) ToRBAC() rbac.ScopeName {
 }
 
 func (k APIKey) RBACObject() rbac.Object {
-	return rbac.ResourceAPIKey.WithIDString(k.ID).
+	return rbac.ResourceApiKey.WithIDString(k.ID).
 		WithOwner(k.UserID.String())
 }
 
@@ -146,60 +175,64 @@ func (v TemplateVersion) RBACObjectNoTemplate() rbac.Object {
 
 func (g Group) RBACObject() rbac.Object {
 	return rbac.ResourceGroup.WithID(g.ID).
-		InOrg(g.OrganizationID)
+		InOrg(g.OrganizationID).
+		// Group members can read the group.
+		WithGroupACL(map[string][]policy.Action{
+			g.ID.String(): {
+				policy.ActionRead,
+			},
+		})
 }
 
-func (w GetWorkspaceByAgentIDRow) RBACObject() rbac.Object {
-	return w.Workspace.RBACObject()
+func (g GetGroupsRow) RBACObject() rbac.Object {
+	return g.Group.RBACObject()
+}
+
+func (gm GroupMember) RBACObject() rbac.Object {
+	return rbac.ResourceGroupMember.WithID(gm.UserID).InOrg(gm.OrganizationID).WithOwner(gm.UserID.String())
+}
+
+// WorkspaceTable converts a Workspace to it's reduced version.
+// A more generalized solution is to use json marshaling to
+// consistently keep these two structs in sync.
+// That would be a lot of overhead, and a more costly unit test is
+// written to make sure these match up.
+func (w Workspace) WorkspaceTable() WorkspaceTable {
+	return WorkspaceTable{
+		ID:                w.ID,
+		CreatedAt:         w.CreatedAt,
+		UpdatedAt:         w.UpdatedAt,
+		OwnerID:           w.OwnerID,
+		OrganizationID:    w.OrganizationID,
+		TemplateID:        w.TemplateID,
+		Deleted:           w.Deleted,
+		Name:              w.Name,
+		AutostartSchedule: w.AutostartSchedule,
+		Ttl:               w.Ttl,
+		LastUsedAt:        w.LastUsedAt,
+		DormantAt:         w.DormantAt,
+		DeletingAt:        w.DeletingAt,
+		AutomaticUpdates:  w.AutomaticUpdates,
+		Favorite:          w.Favorite,
+		NextStartAt:       w.NextStartAt,
+	}
 }
 
 func (w Workspace) RBACObject() rbac.Object {
+	return w.WorkspaceTable().RBACObject()
+}
+
+func (w WorkspaceTable) RBACObject() rbac.Object {
+	if w.DormantAt.Valid {
+		return w.DormantRBAC()
+	}
+
 	return rbac.ResourceWorkspace.WithID(w.ID).
 		InOrg(w.OrganizationID).
 		WithOwner(w.OwnerID.String())
 }
 
-func (w Workspace) ExecutionRBAC() rbac.Object {
-	// If a workspace is locked it cannot be accessed.
-	if w.DormantAt.Valid {
-		return w.DormantRBAC()
-	}
-
-	return rbac.ResourceWorkspaceExecution.
-		WithID(w.ID).
-		InOrg(w.OrganizationID).
-		WithOwner(w.OwnerID.String())
-}
-
-func (w Workspace) ApplicationConnectRBAC() rbac.Object {
-	// If a workspace is locked it cannot be accessed.
-	if w.DormantAt.Valid {
-		return w.DormantRBAC()
-	}
-
-	return rbac.ResourceWorkspaceApplicationConnect.
-		WithID(w.ID).
-		InOrg(w.OrganizationID).
-		WithOwner(w.OwnerID.String())
-}
-
-func (w Workspace) WorkspaceBuildRBAC(transition WorkspaceTransition) rbac.Object {
-	// If a workspace is dormant it cannot be built.
-	// However we need to allow stopping a workspace by a caller once a workspace
-	// is locked (e.g. for autobuild). Additionally, if a user wants to delete
-	// a locked workspace, they shouldn't have to have it unlocked first.
-	if w.DormantAt.Valid && transition != WorkspaceTransitionStop &&
-		transition != WorkspaceTransitionDelete {
-		return w.DormantRBAC()
-	}
-
-	return rbac.ResourceWorkspaceBuild.
-		WithID(w.ID).
-		InOrg(w.OrganizationID).
-		WithOwner(w.OwnerID.String())
-}
-
-func (w Workspace) DormantRBAC() rbac.Object {
+func (w WorkspaceTable) DormantRBAC() rbac.Object {
 	return rbac.ResourceWorkspaceDormant.
 		WithID(w.ID).
 		InOrg(w.OrganizationID).
@@ -211,6 +244,10 @@ func (m OrganizationMember) RBACObject() rbac.Object {
 		WithID(m.UserID).
 		InOrg(m.OrganizationID).
 		WithOwner(m.UserID.String())
+}
+
+func (m OrganizationMembersRow) RBACObject() rbac.Object {
+	return m.OrganizationMember.RBACObject()
 }
 
 func (m GetOrganizationIDsByMemberIDsRow) RBACObject() rbac.Object {
@@ -227,7 +264,23 @@ func (o Organization) RBACObject() rbac.Object {
 }
 
 func (p ProvisionerDaemon) RBACObject() rbac.Object {
-	return rbac.ResourceProvisionerDaemon.WithID(p.ID)
+	return rbac.ResourceProvisionerDaemon.
+		WithID(p.ID).
+		InOrg(p.OrganizationID)
+}
+
+func (p GetProvisionerDaemonsWithStatusByOrganizationRow) RBACObject() rbac.Object {
+	return p.ProvisionerDaemon.RBACObject()
+}
+
+func (p GetEligibleProvisionerDaemonsByProvisionerJobIDsRow) RBACObject() rbac.Object {
+	return p.ProvisionerDaemon.RBACObject()
+}
+
+func (p ProvisionerKey) RBACObject() rbac.Object {
+	return rbac.ResourceProvisionerKeys.
+		WithID(p.ID).
+		InOrg(p.OrganizationID)
 }
 
 func (w WorkspaceProxy) RBACObject() rbac.Object {
@@ -246,32 +299,17 @@ func (f File) RBACObject() rbac.Object {
 }
 
 // RBACObject returns the RBAC object for the site wide user resource.
-// If you are trying to get the RBAC object for the UserData, use
-// u.UserDataRBACObject() instead.
 func (u User) RBACObject() rbac.Object {
 	return rbac.ResourceUserObject(u.ID)
-}
-
-func (u User) UserDataRBACObject() rbac.Object {
-	return rbac.ResourceUserData.WithID(u.ID).WithOwner(u.ID.String())
-}
-
-func (u User) UserWorkspaceBuildParametersObject() rbac.Object {
-	return rbac.ResourceUserWorkspaceBuildParameters.WithID(u.ID).WithOwner(u.ID.String())
 }
 
 func (u GetUsersRow) RBACObject() rbac.Object {
 	return rbac.ResourceUserObject(u.ID)
 }
 
-func (u GitSSHKey) RBACObject() rbac.Object {
-	return rbac.ResourceUserData.WithID(u.UserID).WithOwner(u.UserID.String())
-}
-
-func (u ExternalAuthLink) RBACObject() rbac.Object {
-	// I assume UserData is ok?
-	return rbac.ResourceUserData.WithID(u.UserID).WithOwner(u.UserID.String())
-}
+func (u GitSSHKey) RBACObject() rbac.Object        { return rbac.ResourceUserObject(u.UserID) }
+func (u ExternalAuthLink) RBACObject() rbac.Object { return rbac.ResourceUserObject(u.UserID) }
+func (u UserLink) RBACObject() rbac.Object         { return rbac.ResourceUserObject(u.UserID) }
 
 func (u ExternalAuthLink) OAuthToken() *oauth2.Token {
 	return &oauth2.Token{
@@ -281,25 +319,20 @@ func (u ExternalAuthLink) OAuthToken() *oauth2.Token {
 	}
 }
 
-func (u UserLink) RBACObject() rbac.Object {
-	// I assume UserData is ok?
-	return rbac.ResourceUserData.WithOwner(u.UserID.String()).WithID(u.UserID)
-}
-
 func (l License) RBACObject() rbac.Object {
 	return rbac.ResourceLicense.WithIDString(strconv.FormatInt(int64(l.ID), 10))
 }
 
 func (c OAuth2ProviderAppCode) RBACObject() rbac.Object {
-	return rbac.ResourceOAuth2ProviderAppCodeToken.WithOwner(c.UserID.String())
+	return rbac.ResourceOauth2AppCodeToken.WithOwner(c.UserID.String())
 }
 
 func (OAuth2ProviderAppSecret) RBACObject() rbac.Object {
-	return rbac.ResourceOAuth2ProviderAppSecret
+	return rbac.ResourceOauth2AppSecret
 }
 
 func (OAuth2ProviderApp) RBACObject() rbac.Object {
-	return rbac.ResourceOAuth2ProviderApp
+	return rbac.ResourceOauth2App
 }
 
 func (a GetOAuth2ProviderAppsByUserIDRow) RBACObject() rbac.Object {
@@ -368,6 +401,7 @@ func ConvertUserRows(rows []GetUsersRow) []User {
 			ID:              r.ID,
 			Email:           r.Email,
 			Username:        r.Username,
+			Name:            r.Name,
 			HashedPassword:  r.HashedPassword,
 			CreatedAt:       r.CreatedAt,
 			UpdatedAt:       r.UpdatedAt,
@@ -388,21 +422,32 @@ func ConvertWorkspaceRows(rows []GetWorkspacesRow) []Workspace {
 	workspaces := make([]Workspace, len(rows))
 	for i, r := range rows {
 		workspaces[i] = Workspace{
-			ID:                r.ID,
-			CreatedAt:         r.CreatedAt,
-			UpdatedAt:         r.UpdatedAt,
-			OwnerID:           r.OwnerID,
-			OrganizationID:    r.OrganizationID,
-			TemplateID:        r.TemplateID,
-			Deleted:           r.Deleted,
-			Name:              r.Name,
-			AutostartSchedule: r.AutostartSchedule,
-			Ttl:               r.Ttl,
-			LastUsedAt:        r.LastUsedAt,
-			DormantAt:         r.DormantAt,
-			DeletingAt:        r.DeletingAt,
-			AutomaticUpdates:  r.AutomaticUpdates,
-			Favorite:          r.Favorite,
+			ID:                      r.ID,
+			CreatedAt:               r.CreatedAt,
+			UpdatedAt:               r.UpdatedAt,
+			OwnerID:                 r.OwnerID,
+			OrganizationID:          r.OrganizationID,
+			TemplateID:              r.TemplateID,
+			Deleted:                 r.Deleted,
+			Name:                    r.Name,
+			AutostartSchedule:       r.AutostartSchedule,
+			Ttl:                     r.Ttl,
+			LastUsedAt:              r.LastUsedAt,
+			DormantAt:               r.DormantAt,
+			DeletingAt:              r.DeletingAt,
+			AutomaticUpdates:        r.AutomaticUpdates,
+			Favorite:                r.Favorite,
+			OwnerAvatarUrl:          r.OwnerAvatarUrl,
+			OwnerUsername:           r.OwnerUsername,
+			OrganizationName:        r.OrganizationName,
+			OrganizationDisplayName: r.OrganizationDisplayName,
+			OrganizationIcon:        r.OrganizationIcon,
+			OrganizationDescription: r.OrganizationDescription,
+			TemplateName:            r.TemplateName,
+			TemplateDisplayName:     r.TemplateDisplayName,
+			TemplateIcon:            r.TemplateIcon,
+			TemplateDescription:     r.TemplateDescription,
+			NextStartAt:             r.NextStartAt,
 		}
 	}
 
@@ -411,6 +456,18 @@ func ConvertWorkspaceRows(rows []GetWorkspacesRow) []Workspace {
 
 func (g Group) IsEveryone() bool {
 	return g.ID == g.OrganizationID
+}
+
+func (p ProvisionerJob) RBACObject() rbac.Object {
+	switch p.Type {
+	// Only acceptable for known job types at this time because template
+	// admins may not be allowed to view new types.
+	case ProvisionerJobTypeTemplateVersionImport, ProvisionerJobTypeTemplateVersionDryRun, ProvisionerJobTypeWorkspaceBuild:
+		return rbac.ResourceProvisionerJobs.InOrg(p.OrganizationID)
+
+	default:
+		panic("developer error: unknown provisioner job type " + string(p.Type))
+	}
 }
 
 func (p ProvisionerJob) Finished() bool {
@@ -427,4 +484,46 @@ func (p ProvisionerJob) FinishedAt() time.Time {
 	}
 
 	return time.Time{}
+}
+
+func (r CustomRole) RoleIdentifier() rbac.RoleIdentifier {
+	return rbac.RoleIdentifier{
+		Name:           r.Name,
+		OrganizationID: r.OrganizationID.UUID,
+	}
+}
+
+func (r GetAuthorizationUserRolesRow) RoleNames() ([]rbac.RoleIdentifier, error) {
+	names := make([]rbac.RoleIdentifier, 0, len(r.Roles))
+	for _, role := range r.Roles {
+		value, err := rbac.RoleNameFromString(role)
+		if err != nil {
+			return nil, xerrors.Errorf("convert role %q: %w", role, err)
+		}
+		names = append(names, value)
+	}
+	return names, nil
+}
+
+func (k CryptoKey) ExpiresAt(keyDuration time.Duration) time.Time {
+	return k.StartsAt.Add(keyDuration).UTC()
+}
+
+func (k CryptoKey) DecodeString() ([]byte, error) {
+	return hex.DecodeString(k.Secret.String)
+}
+
+func (k CryptoKey) CanSign(now time.Time) bool {
+	isAfterStart := !k.StartsAt.IsZero() && !now.Before(k.StartsAt)
+	return isAfterStart && k.CanVerify(now)
+}
+
+func (k CryptoKey) CanVerify(now time.Time) bool {
+	hasSecret := k.Secret.Valid
+	isBeforeDeletion := !k.DeletesAt.Valid || now.Before(k.DeletesAt.Time)
+	return hasSecret && isBeforeDeletion
+}
+
+func (r GetProvisionerJobsByOrganizationAndStatusWithQueuePositionAndProvisionerRow) RBACObject() rbac.Object {
+	return r.ProvisionerJob.RBACObject()
 }

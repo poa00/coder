@@ -31,7 +31,7 @@ func TestWorkspaceAgentParam(t *testing.T) {
 				UserID: user.ID,
 			})
 			tpl       = dbgen.Template(t, db, database.Template{})
-			workspace = dbgen.Workspace(t, db, database.Workspace{
+			workspace = dbgen.Workspace(t, db, database.WorkspaceTable{
 				OwnerID:    user.ID,
 				TemplateID: tpl.ID,
 			})
@@ -100,7 +100,7 @@ func TestWorkspaceAgentParam(t *testing.T) {
 	t.Run("NotAuthorized", func(t *testing.T) {
 		t.Parallel()
 		db := dbmem.New()
-		fakeAuthz := &coderdtest.FakeAuthorizer{AlwaysReturn: xerrors.Errorf("constant failure")}
+		fakeAuthz := (&coderdtest.FakeAuthorizer{}).AlwaysReturn(xerrors.Errorf("constant failure"))
 		dbFail := dbauthz.New(db, fakeAuthz, slog.Make(), coderdtest.AccessControlStorePointer())
 
 		rtr := chi.NewRouter()

@@ -15,7 +15,6 @@ import (
 	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 	"google.golang.org/protobuf/types/known/durationpb"
-	"storj.io/drpc"
 	"storj.io/drpc/drpcmux"
 	"storj.io/drpc/drpcserver"
 	"tailscale.com/tailcfg"
@@ -71,7 +70,6 @@ func NewClient(t testing.TB,
 		t:              t,
 		logger:         logger.Named("client"),
 		agentID:        agentID,
-		coordinator:    coordinator,
 		server:         server,
 		fakeAgentAPI:   fakeAAPI,
 		derpMapUpdates: derpMapUpdates,
@@ -82,7 +80,6 @@ type Client struct {
 	t                  testing.TB
 	logger             slog.Logger
 	agentID            uuid.UUID
-	coordinator        tailnet.Coordinator
 	server             *drpcserver.Server
 	fakeAgentAPI       *FakeAgentAPI
 	LastWorkspaceAgent func()
@@ -99,7 +96,9 @@ func (c *Client) Close() {
 	c.derpMapOnce.Do(func() { close(c.derpMapUpdates) })
 }
 
-func (c *Client) ConnectRPC(ctx context.Context) (drpc.Conn, error) {
+func (c *Client) ConnectRPC23(ctx context.Context) (
+	agentproto.DRPCAgentClient23, proto.DRPCTailnetClient23, error,
+) {
 	conn, lis := drpcsdk.MemTransportPipe()
 	c.LastWorkspaceAgent = func() {
 		_ = conn.Close()
@@ -117,7 +116,7 @@ func (c *Client) ConnectRPC(ctx context.Context) (drpc.Conn, error) {
 	go func() {
 		_ = c.server.Serve(serveCtx, lis)
 	}()
-	return conn, nil
+	return agentproto.NewDRPCAgentClient(conn), proto.NewDRPCTailnetClient(conn), nil
 }
 
 func (c *Client) GetLifecycleStates() []codersdk.WorkspaceAgentLifecycle {
@@ -138,8 +137,8 @@ func (c *Client) GetStartupLogs() []agentsdk.Log {
 	return c.logs
 }
 
-func (c *Client) SetServiceBannerFunc(f func() (codersdk.ServiceBannerConfig, error)) {
-	c.fakeAgentAPI.SetServiceBannerFunc(f)
+func (c *Client) SetAnnouncementBannersFunc(f func() ([]codersdk.BannerConfig, error)) {
+	c.fakeAgentAPI.SetAnnouncementBannersFunc(f)
 }
 
 func (c *Client) PushDERPMapUpdate(update *tailcfg.DERPMap) error {
@@ -170,39 +169,59 @@ type FakeAgentAPI struct {
 	logsCh          chan<- *agentproto.BatchCreateLogsRequest
 	lifecycleStates []codersdk.WorkspaceAgentLifecycle
 	metadata        map[string]agentsdk.Metadata
+	timings         []*agentproto.Timing
 
-	getServiceBannerFunc func() (codersdk.ServiceBannerConfig, error)
+	getAnnouncementBannersFunc func() ([]codersdk.BannerConfig, error)
 }
 
 func (f *FakeAgentAPI) GetManifest(context.Context, *agentproto.GetManifestRequest) (*agentproto.Manifest, error) {
 	return f.manifest, nil
 }
 
-func (f *FakeAgentAPI) SetServiceBannerFunc(fn func() (codersdk.ServiceBannerConfig, error)) {
-	f.Lock()
-	defer f.Unlock()
-	f.getServiceBannerFunc = fn
-	f.logger.Info(context.Background(), "updated ServiceBannerFunc")
+func (*FakeAgentAPI) GetServiceBanner(context.Context, *agentproto.GetServiceBannerRequest) (*agentproto.ServiceBanner, error) {
+	return &agentproto.ServiceBanner{}, nil
 }
 
-func (f *FakeAgentAPI) GetServiceBanner(context.Context, *agentproto.GetServiceBannerRequest) (*agentproto.ServiceBanner, error) {
+func (f *FakeAgentAPI) GetTimings() []*agentproto.Timing {
 	f.Lock()
 	defer f.Unlock()
-	if f.getServiceBannerFunc == nil {
-		return &agentproto.ServiceBanner{}, nil
+	return slices.Clone(f.timings)
+}
+
+func (f *FakeAgentAPI) SetAnnouncementBannersFunc(fn func() ([]codersdk.BannerConfig, error)) {
+	f.Lock()
+	defer f.Unlock()
+	f.getAnnouncementBannersFunc = fn
+	f.logger.Info(context.Background(), "updated notification banners")
+}
+
+func (f *FakeAgentAPI) GetAnnouncementBanners(context.Context, *agentproto.GetAnnouncementBannersRequest) (*agentproto.GetAnnouncementBannersResponse, error) {
+	f.Lock()
+	defer f.Unlock()
+	if f.getAnnouncementBannersFunc == nil {
+		return &agentproto.GetAnnouncementBannersResponse{AnnouncementBanners: []*agentproto.BannerConfig{}}, nil
 	}
-	sb, err := f.getServiceBannerFunc()
+	banners, err := f.getAnnouncementBannersFunc()
 	if err != nil {
 		return nil, err
 	}
-	return agentsdk.ProtoFromServiceBanner(sb), nil
+	bannersProto := make([]*agentproto.BannerConfig, 0, len(banners))
+	for _, banner := range banners {
+		bannersProto = append(bannersProto, agentsdk.ProtoFromBannerConfig(banner))
+	}
+	return &agentproto.GetAnnouncementBannersResponse{AnnouncementBanners: bannersProto}, nil
 }
 
 func (f *FakeAgentAPI) UpdateStats(ctx context.Context, req *agentproto.UpdateStatsRequest) (*agentproto.UpdateStatsResponse, error) {
 	f.logger.Debug(ctx, "update stats called", slog.F("req", req))
 	// empty request is sent to get the interval; but our tests don't want empty stats requests
 	if req.Stats != nil {
-		f.statsCh <- req.Stats
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case f.statsCh <- req.Stats:
+			// OK!
+		}
 	}
 	return &agentproto.UpdateStatsResponse{ReportInterval: durationpb.New(statsInterval)}, nil
 }
@@ -225,17 +244,25 @@ func (f *FakeAgentAPI) UpdateLifecycle(_ context.Context, req *agentproto.Update
 
 func (f *FakeAgentAPI) BatchUpdateAppHealths(ctx context.Context, req *agentproto.BatchUpdateAppHealthRequest) (*agentproto.BatchUpdateAppHealthResponse, error) {
 	f.logger.Debug(ctx, "batch update app health", slog.F("req", req))
-	f.appHealthCh <- req
-	return &agentproto.BatchUpdateAppHealthResponse{}, nil
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case f.appHealthCh <- req:
+		return &agentproto.BatchUpdateAppHealthResponse{}, nil
+	}
 }
 
 func (f *FakeAgentAPI) AppHealthCh() <-chan *agentproto.BatchUpdateAppHealthRequest {
 	return f.appHealthCh
 }
 
-func (f *FakeAgentAPI) UpdateStartup(_ context.Context, req *agentproto.UpdateStartupRequest) (*agentproto.Startup, error) {
-	f.startupCh <- req.GetStartup()
-	return req.GetStartup(), nil
+func (f *FakeAgentAPI) UpdateStartup(ctx context.Context, req *agentproto.UpdateStartupRequest) (*agentproto.Startup, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case f.startupCh <- req.GetStartup():
+		return req.GetStartup(), nil
+	}
 }
 
 func (f *FakeAgentAPI) GetMetadata() map[string]agentsdk.Metadata {
@@ -278,6 +305,14 @@ func (f *FakeAgentAPI) BatchCreateLogs(ctx context.Context, req *agentproto.Batc
 		}
 	}
 	return &agentproto.BatchCreateLogsResponse{}, nil
+}
+
+func (f *FakeAgentAPI) ScriptCompleted(_ context.Context, req *agentproto.WorkspaceAgentScriptCompletedRequest) (*agentproto.WorkspaceAgentScriptCompletedResponse, error) {
+	f.Lock()
+	f.timings = append(f.timings, req.Timing)
+	f.Unlock()
+
+	return &agentproto.WorkspaceAgentScriptCompletedResponse{}, nil
 }
 
 func NewFakeAgentAPI(t testing.TB, logger slog.Logger, manifest *agentproto.Manifest, statsCh chan *agentproto.Stats) *FakeAgentAPI {

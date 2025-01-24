@@ -46,6 +46,8 @@ type DRPCAgentClient interface {
 	UpdateStartup(ctx context.Context, in *UpdateStartupRequest) (*Startup, error)
 	BatchUpdateMetadata(ctx context.Context, in *BatchUpdateMetadataRequest) (*BatchUpdateMetadataResponse, error)
 	BatchCreateLogs(ctx context.Context, in *BatchCreateLogsRequest) (*BatchCreateLogsResponse, error)
+	GetAnnouncementBanners(ctx context.Context, in *GetAnnouncementBannersRequest) (*GetAnnouncementBannersResponse, error)
+	ScriptCompleted(ctx context.Context, in *WorkspaceAgentScriptCompletedRequest) (*WorkspaceAgentScriptCompletedResponse, error)
 }
 
 type drpcAgentClient struct {
@@ -130,6 +132,24 @@ func (c *drpcAgentClient) BatchCreateLogs(ctx context.Context, in *BatchCreateLo
 	return out, nil
 }
 
+func (c *drpcAgentClient) GetAnnouncementBanners(ctx context.Context, in *GetAnnouncementBannersRequest) (*GetAnnouncementBannersResponse, error) {
+	out := new(GetAnnouncementBannersResponse)
+	err := c.cc.Invoke(ctx, "/coder.agent.v2.Agent/GetAnnouncementBanners", drpcEncoding_File_agent_proto_agent_proto{}, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *drpcAgentClient) ScriptCompleted(ctx context.Context, in *WorkspaceAgentScriptCompletedRequest) (*WorkspaceAgentScriptCompletedResponse, error) {
+	out := new(WorkspaceAgentScriptCompletedResponse)
+	err := c.cc.Invoke(ctx, "/coder.agent.v2.Agent/ScriptCompleted", drpcEncoding_File_agent_proto_agent_proto{}, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 type DRPCAgentServer interface {
 	GetManifest(context.Context, *GetManifestRequest) (*Manifest, error)
 	GetServiceBanner(context.Context, *GetServiceBannerRequest) (*ServiceBanner, error)
@@ -139,6 +159,8 @@ type DRPCAgentServer interface {
 	UpdateStartup(context.Context, *UpdateStartupRequest) (*Startup, error)
 	BatchUpdateMetadata(context.Context, *BatchUpdateMetadataRequest) (*BatchUpdateMetadataResponse, error)
 	BatchCreateLogs(context.Context, *BatchCreateLogsRequest) (*BatchCreateLogsResponse, error)
+	GetAnnouncementBanners(context.Context, *GetAnnouncementBannersRequest) (*GetAnnouncementBannersResponse, error)
+	ScriptCompleted(context.Context, *WorkspaceAgentScriptCompletedRequest) (*WorkspaceAgentScriptCompletedResponse, error)
 }
 
 type DRPCAgentUnimplementedServer struct{}
@@ -175,9 +197,17 @@ func (s *DRPCAgentUnimplementedServer) BatchCreateLogs(context.Context, *BatchCr
 	return nil, drpcerr.WithCode(errors.New("Unimplemented"), drpcerr.Unimplemented)
 }
 
+func (s *DRPCAgentUnimplementedServer) GetAnnouncementBanners(context.Context, *GetAnnouncementBannersRequest) (*GetAnnouncementBannersResponse, error) {
+	return nil, drpcerr.WithCode(errors.New("Unimplemented"), drpcerr.Unimplemented)
+}
+
+func (s *DRPCAgentUnimplementedServer) ScriptCompleted(context.Context, *WorkspaceAgentScriptCompletedRequest) (*WorkspaceAgentScriptCompletedResponse, error) {
+	return nil, drpcerr.WithCode(errors.New("Unimplemented"), drpcerr.Unimplemented)
+}
+
 type DRPCAgentDescription struct{}
 
-func (DRPCAgentDescription) NumMethods() int { return 8 }
+func (DRPCAgentDescription) NumMethods() int { return 10 }
 
 func (DRPCAgentDescription) Method(n int) (string, drpc.Encoding, drpc.Receiver, interface{}, bool) {
 	switch n {
@@ -253,6 +283,24 @@ func (DRPCAgentDescription) Method(n int) (string, drpc.Encoding, drpc.Receiver,
 						in1.(*BatchCreateLogsRequest),
 					)
 			}, DRPCAgentServer.BatchCreateLogs, true
+	case 8:
+		return "/coder.agent.v2.Agent/GetAnnouncementBanners", drpcEncoding_File_agent_proto_agent_proto{},
+			func(srv interface{}, ctx context.Context, in1, in2 interface{}) (drpc.Message, error) {
+				return srv.(DRPCAgentServer).
+					GetAnnouncementBanners(
+						ctx,
+						in1.(*GetAnnouncementBannersRequest),
+					)
+			}, DRPCAgentServer.GetAnnouncementBanners, true
+	case 9:
+		return "/coder.agent.v2.Agent/ScriptCompleted", drpcEncoding_File_agent_proto_agent_proto{},
+			func(srv interface{}, ctx context.Context, in1, in2 interface{}) (drpc.Message, error) {
+				return srv.(DRPCAgentServer).
+					ScriptCompleted(
+						ctx,
+						in1.(*WorkspaceAgentScriptCompletedRequest),
+					)
+			}, DRPCAgentServer.ScriptCompleted, true
 	default:
 		return "", nil, nil, nil, false
 	}
@@ -384,6 +432,38 @@ type drpcAgent_BatchCreateLogsStream struct {
 }
 
 func (x *drpcAgent_BatchCreateLogsStream) SendAndClose(m *BatchCreateLogsResponse) error {
+	if err := x.MsgSend(m, drpcEncoding_File_agent_proto_agent_proto{}); err != nil {
+		return err
+	}
+	return x.CloseSend()
+}
+
+type DRPCAgent_GetAnnouncementBannersStream interface {
+	drpc.Stream
+	SendAndClose(*GetAnnouncementBannersResponse) error
+}
+
+type drpcAgent_GetAnnouncementBannersStream struct {
+	drpc.Stream
+}
+
+func (x *drpcAgent_GetAnnouncementBannersStream) SendAndClose(m *GetAnnouncementBannersResponse) error {
+	if err := x.MsgSend(m, drpcEncoding_File_agent_proto_agent_proto{}); err != nil {
+		return err
+	}
+	return x.CloseSend()
+}
+
+type DRPCAgent_ScriptCompletedStream interface {
+	drpc.Stream
+	SendAndClose(*WorkspaceAgentScriptCompletedResponse) error
+}
+
+type drpcAgent_ScriptCompletedStream struct {
+	drpc.Stream
+}
+
+func (x *drpcAgent_ScriptCompletedStream) SendAndClose(m *WorkspaceAgentScriptCompletedResponse) error {
 	if err := x.MsgSend(m, drpcEncoding_File_agent_proto_agent_proto{}); err != nil {
 		return err
 	}

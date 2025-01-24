@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
-
-	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
@@ -22,9 +20,42 @@ import (
 func TestReplicas(t *testing.T) {
 	t.Parallel()
 	if !dbtestutil.WillUsePostgres() {
-		t.Skip("only test with real postgresF")
+		t.Skip("only test with real postgres")
 	}
 	t.Run("ErrorWithoutLicense", func(t *testing.T) {
+		t.Parallel()
+		// This will error because replicas are expected to instantly report
+		// errors when the license is not present.
+		db, pubsub := dbtestutil.NewDB(t)
+		firstClient, _ := coderdenttest.New(t, &coderdenttest.Options{
+			Options: &coderdtest.Options{
+				IncludeProvisionerDaemon: true,
+				Database:                 db,
+				Pubsub:                   pubsub,
+			},
+			DontAddLicense:          true,
+			ReplicaErrorGracePeriod: time.Nanosecond,
+		})
+		secondClient, _, secondAPI, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
+			Options: &coderdtest.Options{
+				Database: db,
+				Pubsub:   pubsub,
+			},
+			DontAddFirstUser:        true,
+			DontAddLicense:          true,
+			ReplicaErrorGracePeriod: time.Nanosecond,
+		})
+		secondClient.SetSessionToken(firstClient.SessionToken())
+		ents, err := secondClient.Entitlements(context.Background())
+		require.NoError(t, err)
+		require.Len(t, ents.Errors, 1)
+		_ = secondAPI.Close()
+
+		ents, err = firstClient.Entitlements(context.Background())
+		require.NoError(t, err)
+		require.Len(t, ents.Warnings, 0)
+	})
+	t.Run("DoesNotErrorBeforeGrace", func(t *testing.T) {
 		t.Parallel()
 		db, pubsub := dbtestutil.NewDB(t)
 		firstClient, _ := coderdenttest.New(t, &coderdenttest.Options{
@@ -46,12 +77,12 @@ func TestReplicas(t *testing.T) {
 		secondClient.SetSessionToken(firstClient.SessionToken())
 		ents, err := secondClient.Entitlements(context.Background())
 		require.NoError(t, err)
-		require.Len(t, ents.Errors, 1)
+		require.Len(t, ents.Errors, 0)
 		_ = secondAPI.Close()
 
 		ents, err = firstClient.Entitlements(context.Background())
 		require.NoError(t, err)
-		require.Len(t, ents.Warnings, 0)
+		require.Len(t, ents.Errors, 0)
 	})
 	t.Run("ConnectAcrossMultiple", func(t *testing.T) {
 		t.Parallel()
@@ -86,7 +117,7 @@ func TestReplicas(t *testing.T) {
 		conn, err := workspacesdk.New(secondClient).
 			DialAgent(context.Background(), r.sdkAgent.ID, &workspacesdk.DialAgentOptions{
 				BlockEndpoints: true,
-				Logger:         slogtest.Make(t, nil).Leveled(slog.LevelDebug),
+				Logger:         testutil.Logger(t),
 			})
 		require.NoError(t, err)
 		require.Eventually(t, func() bool {
@@ -133,7 +164,7 @@ func TestReplicas(t *testing.T) {
 		conn, err := workspacesdk.New(secondClient).
 			DialAgent(context.Background(), r.sdkAgent.ID, &workspacesdk.DialAgentOptions{
 				BlockEndpoints: true,
-				Logger:         slogtest.Make(t, nil).Named("client").Leveled(slog.LevelDebug),
+				Logger:         testutil.Logger(t).Named("client"),
 			})
 		require.NoError(t, err)
 		require.Eventually(t, func() bool {

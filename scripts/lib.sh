@@ -43,6 +43,9 @@ SCRIPT="${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}"
 SCRIPT_DIR="$(realpath "$(dirname "$SCRIPT")")"
 
 function project_root {
+	# Nix sets $src in derivations!
+	[[ -n "${src:-}" ]] && echo "$src" && return
+
 	# Try to use `git rev-parse --show-toplevel` to find the project root.
 	# If this directory is not a git repository, this command will fail.
 	git rev-parse --show-toplevel 2>/dev/null && return
@@ -105,6 +108,13 @@ dependencies() {
 	for dep in "$@"; do
 		if ! dependency_check "$dep"; then
 			log "ERROR: The '$dep' dependency is required, but is not available."
+			if isdarwin; then
+				case "$dep" in
+				gsed | gawk)
+					log "- brew install $dep"
+					;;
+				esac
+			fi
 			fail=1
 		fi
 	done
@@ -127,6 +137,26 @@ requiredenvs() {
 	if [[ "$fail" == 1 ]]; then
 		log
 		error "One or more required environment variables are not set, check above log output for more details."
+	fi
+}
+
+gh_auth() {
+	if [[ -z ${GITHUB_TOKEN:-} ]]; then
+		if [[ -n ${GH_TOKEN:-} ]]; then
+			export GITHUB_TOKEN=${GH_TOKEN}
+		elif [[ ${CODER:-} == true ]]; then
+			if ! output=$(coder external-auth access-token github 2>&1); then
+				# TODO(mafredri): We could allow checking `gh auth token` here.
+				log "${output}"
+				error "Could not authenticate with GitHub using Coder external auth."
+			else
+				export GITHUB_TOKEN=${output}
+			fi
+		elif token="$(gh auth token --hostname github.com 2>/dev/null)"; then
+			export GITHUB_TOKEN=${token}
+		else
+			error "GitHub authentication is required to run this command, please set GITHUB_TOKEN or run 'gh auth login'."
+		fi
 	fi
 }
 

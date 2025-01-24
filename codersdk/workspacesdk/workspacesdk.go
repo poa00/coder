@@ -14,23 +14,16 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/xerrors"
-	"nhooyr.io/websocket"
 	"tailscale.com/tailcfg"
+	"tailscale.com/wgengine/capture"
 
 	"cdr.dev/slog"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/tailnet"
 	"github.com/coder/coder/v2/tailnet/proto"
+	"github.com/coder/quartz"
+	"github.com/coder/websocket"
 )
-
-// AgentIP is a static IPv6 address with the Tailscale prefix that is used to route
-// connections from clients to this node. A dynamic address is not required because a Tailnet
-// client only dials a single agent at a time.
-//
-// Deprecated: use tailnet.IP() instead. This is kept for backwards
-// compatibility with outdated CLI clients and Workspace Proxies that dial it.
-// See: https://github.com/coder/coder/issues/11819
-var AgentIP = netip.MustParseAddr("fd7a:115c:a1e0:49d6:b259:b7ac:b1b2:48f4")
 
 var ErrSkipClose = xerrors.New("skip tailnet close")
 
@@ -52,6 +45,12 @@ const (
 	// *that* much. The user could bypass this in the CLI by using SSH instead
 	// anyways.
 	AgentMinimumListeningPort = 9
+)
+
+const (
+	AgentAPIMismatchMessage = "Unknown or unsupported API version"
+
+	CoordinateAPIInvalidResumeToken = "Invalid resume token"
 )
 
 // AgentIgnoredListeningPorts contains a list of ports to ignore when looking for
@@ -176,6 +175,12 @@ type DialAgentOptions struct {
 	// BlockEndpoints forced a direct connection through DERP. The Client may
 	// have DisableDirect set which will override this value.
 	BlockEndpoints bool
+	// CaptureHook is a callback that captures Disco packets and packets sent
+	// into the tailnet tunnel.
+	CaptureHook capture.Callback
+	// Whether the client will send network telemetry events.
+	// Enable instead of Disable so it's initialized to false (in tests).
+	EnableTelemetry bool
 }
 
 func (c *Client) DialAgent(dialCtx context.Context, agentID uuid.UUID, options *DialAgentOptions) (agentConn *AgentConn, err error) {
@@ -190,28 +195,6 @@ func (c *Client) DialAgent(dialCtx context.Context, agentID uuid.UUID, options *
 	if connInfo.DisableDirectConnections {
 		options.BlockEndpoints = true
 	}
-
-	ip := tailnet.IP()
-	var header http.Header
-	if headerTransport, ok := c.client.HTTPClient.Transport.(*codersdk.HeaderTransport); ok {
-		header = headerTransport.Header
-	}
-	conn, err := tailnet.NewConn(&tailnet.Options{
-		Addresses:           []netip.Prefix{netip.PrefixFrom(ip, 128)},
-		DERPMap:             connInfo.DERPMap,
-		DERPHeader:          &header,
-		DERPForceWebSockets: connInfo.DERPForceWebSockets,
-		Logger:              options.Logger,
-		BlockEndpoints:      c.client.DisableDirectConnections || options.BlockEndpoints,
-	})
-	if err != nil {
-		return nil, xerrors.Errorf("create tailnet: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			_ = conn.Close()
-		}
-	}()
 
 	headers := make(http.Header)
 	tokenHeader := codersdk.SessionTokenHeader
@@ -233,26 +216,59 @@ func (c *Client) DialAgent(dialCtx context.Context, agentID uuid.UUID, options *
 	if err != nil {
 		return nil, xerrors.Errorf("parse url: %w", err)
 	}
-	q := coordinateURL.Query()
-	q.Add("version", proto.CurrentVersion.String())
-	coordinateURL.RawQuery = q.Encode()
 
-	connector := runTailnetAPIConnector(ctx, options.Logger,
-		agentID, coordinateURL.String(),
-		&websocket.DialOptions{
-			HTTPClient: c.client.HTTPClient,
-			HTTPHeader: headers,
-			// Need to disable compression to avoid a data-race.
-			CompressionMode: websocket.CompressionDisabled,
-		},
-		conn,
-	)
+	dialer := NewWebsocketDialer(options.Logger, coordinateURL, &websocket.DialOptions{
+		HTTPClient: c.client.HTTPClient,
+		HTTPHeader: headers,
+		// Need to disable compression to avoid a data-race.
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	clk := quartz.NewReal()
+	controller := tailnet.NewController(options.Logger, dialer)
+	controller.ResumeTokenCtrl = tailnet.NewBasicResumeTokenController(options.Logger, clk)
+
+	ip := tailnet.TailscaleServicePrefix.RandomAddr()
+	var header http.Header
+	if headerTransport, ok := c.client.HTTPClient.Transport.(*codersdk.HeaderTransport); ok {
+		header = headerTransport.Header
+	}
+	var telemetrySink tailnet.TelemetrySink
+	if options.EnableTelemetry {
+		basicTel := tailnet.NewBasicTelemetryController(options.Logger)
+		telemetrySink = basicTel
+		controller.TelemetryCtrl = basicTel
+	}
+	conn, err := tailnet.NewConn(&tailnet.Options{
+		Addresses:           []netip.Prefix{netip.PrefixFrom(ip, 128)},
+		DERPMap:             connInfo.DERPMap,
+		DERPHeader:          &header,
+		DERPForceWebSockets: connInfo.DERPForceWebSockets,
+		Logger:              options.Logger,
+		BlockEndpoints:      c.client.DisableDirectConnections || options.BlockEndpoints,
+		CaptureHook:         options.CaptureHook,
+		ClientType:          proto.TelemetryEvent_CLI,
+		TelemetrySink:       telemetrySink,
+	})
+	if err != nil {
+		return nil, xerrors.Errorf("create tailnet: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+	coordCtrl := tailnet.NewTunnelSrcCoordController(options.Logger, conn)
+	coordCtrl.AddDestination(agentID)
+	controller.CoordCtrl = coordCtrl
+	controller.DERPCtrl = tailnet.NewBasicDERPController(options.Logger, conn)
+	controller.Run(ctx)
+
 	options.Logger.Debug(ctx, "running tailnet API v2+ connector")
 
 	select {
 	case <-dialCtx.Done():
 		return nil, xerrors.Errorf("timed out waiting for coordinator and derp map: %w", dialCtx.Err())
-	case err = <-connector.connected:
+	case err = <-dialer.Connected():
 		if err != nil {
 			options.Logger.Error(ctx, "failed to connect to tailnet v2+ API", slog.Error(err))
 			return nil, xerrors.Errorf("start connector: %w", err)
@@ -264,7 +280,7 @@ func (c *Client) DialAgent(dialCtx context.Context, agentID uuid.UUID, options *
 		AgentID: agentID,
 		CloseFunc: func() error {
 			cancel()
-			<-connector.closed
+			<-controller.Closed()
 			return conn.Close()
 		},
 	})

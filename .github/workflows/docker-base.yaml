@@ -8,6 +8,11 @@ on:
       - scripts/Dockerfile.base
       - scripts/Dockerfile
 
+  pull_request:
+    paths:
+      - scripts/Dockerfile.base
+      - .github/workflows/docker-base.yaml
+
   schedule:
     # Run every week at 09:43 on Monday, Wednesday and Friday. We build this
     # frequently to ensure that packages are up-to-date.
@@ -17,10 +22,6 @@ on:
 
 permissions:
   contents: read
-  # Necessary to push docker images to ghcr.io.
-  packages: write
-  # Necessary for depot.dev authentication.
-  id-token: write
 
 # Avoid running multiple jobs for the same commit.
 concurrency:
@@ -28,14 +29,24 @@ concurrency:
 
 jobs:
   build:
+    permissions:
+      # Necessary for depot.dev authentication.
+      id-token: write
+      # Necessary to push docker images to ghcr.io.
+      packages: write
     runs-on: ubuntu-latest
     if: github.repository_owner == 'coder'
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@cb605e52c26070c328afc4562f0b4ada7618a84e # v2.10.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
 
       - name: Docker login
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -45,23 +56,25 @@ jobs:
         run: mkdir base-build-context
 
       - name: Install depot.dev CLI
-        uses: depot/setup-action@v1
+        uses: depot/setup-action@b0b1ea4f69e92ebf5dea3f8713a1b0c37b2126a5 # v1.6.0
 
       # This uses OIDC authentication, so no auth variables are required.
       - name: Build base Docker image via depot.dev
-        uses: depot/build-push-action@v1
+        uses: depot/build-push-action@636daae76684e38c301daa0c5eca1c095b24e780 # v1.14.0
         with:
           project: wl5hnrrkns
           context: base-build-context
           file: scripts/Dockerfile.base
           platforms: linux/amd64,linux/arm64,linux/arm/v7
+          provenance: true
           pull: true
           no-cache: true
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ghcr.io/coder/coder-base:latest
 
       - name: Verify that images are pushed properly
+        if: github.event_name != 'pull_request'
         run: |
           # retry 10 times with a 5 second delay as the images may not be
           # available immediately

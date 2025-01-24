@@ -33,6 +33,7 @@ type Workspace struct {
 	OwnerName                            string         `json:"owner_name"`
 	OwnerAvatarURL                       string         `json:"owner_avatar_url"`
 	OrganizationID                       uuid.UUID      `json:"organization_id" format:"uuid"`
+	OrganizationName                     string         `json:"organization_name"`
 	TemplateID                           uuid.UUID      `json:"template_id" format:"uuid"`
 	TemplateName                         string         `json:"template_name"`
 	TemplateDisplayName                  string         `json:"template_display_name"`
@@ -62,6 +63,7 @@ type Workspace struct {
 	AutomaticUpdates AutomaticUpdates `json:"automatic_updates" enums:"always,never"`
 	AllowRenames     bool             `json:"allow_renames"`
 	Favorite         bool             `json:"favorite"`
+	NextStartAt      *time.Time       `json:"next_start_at" format:"date-time"`
 }
 
 func (w Workspace) FullName() string {
@@ -92,7 +94,7 @@ const (
 // CreateWorkspaceBuildRequest provides options to update the latest workspace build.
 type CreateWorkspaceBuildRequest struct {
 	TemplateVersionID uuid.UUID           `json:"template_version_id,omitempty" format:"uuid"`
-	Transition        WorkspaceTransition `json:"transition" validate:"oneof=create start stop delete,required"`
+	Transition        WorkspaceTransition `json:"transition" validate:"oneof=start stop delete,required"`
 	DryRun            bool                `json:"dry_run,omitempty"`
 	ProvisionerState  []byte              `json:"state,omitempty"`
 	// Orphan may be set for the Destroy transition.
@@ -258,7 +260,7 @@ type UpdateWorkspaceAutostartRequest struct {
 	// Schedule is expected to be of the form `CRON_TZ=<IANA Timezone> <min> <hour> * * <dow>`
 	// Example: `CRON_TZ=US/Central 30 9 * * 1-5` represents 0930 in the timezone US/Central
 	// on weekdays (Mon-Fri). `CRON_TZ` defaults to UTC if not present.
-	Schedule *string `json:"schedule"`
+	Schedule *string `json:"schedule,omitempty"`
 }
 
 // UpdateWorkspaceAutostart sets the autostart schedule for workspace by id.
@@ -316,7 +318,43 @@ func (c *Client) PutExtendWorkspace(ctx context.Context, id uuid.UUID, req PutEx
 	return nil
 }
 
+type PostWorkspaceUsageRequest struct {
+	AgentID uuid.UUID    `json:"agent_id" format:"uuid"`
+	AppName UsageAppName `json:"app_name"`
+}
+
+type UsageAppName string
+
+const (
+	UsageAppNameVscode          UsageAppName = "vscode"
+	UsageAppNameJetbrains       UsageAppName = "jetbrains"
+	UsageAppNameReconnectingPty UsageAppName = "reconnecting-pty"
+	UsageAppNameSSH             UsageAppName = "ssh"
+)
+
+var AllowedAppNames = []UsageAppName{
+	UsageAppNameVscode,
+	UsageAppNameJetbrains,
+	UsageAppNameReconnectingPty,
+	UsageAppNameSSH,
+}
+
+// PostWorkspaceUsage marks the workspace as having been used recently and records an app stat.
+func (c *Client) PostWorkspaceUsageWithBody(ctx context.Context, id uuid.UUID, req PostWorkspaceUsageRequest) error {
+	path := fmt.Sprintf("/api/v2/workspaces/%s/usage", id.String())
+	res, err := c.Request(ctx, http.MethodPost, path, req)
+	if err != nil {
+		return xerrors.Errorf("post workspace usage: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		return ReadBodyAsError(res)
+	}
+	return nil
+}
+
 // PostWorkspaceUsage marks the workspace as having been used recently.
+// Deprecated: use PostWorkspaceUsageWithBody instead
 func (c *Client) PostWorkspaceUsage(ctx context.Context, id uuid.UUID) error {
 	path := fmt.Sprintf("/api/v2/workspaces/%s/usage", id.String())
 	res, err := c.Request(ctx, http.MethodPost, path, nil)
@@ -330,14 +368,15 @@ func (c *Client) PostWorkspaceUsage(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-// UpdateWorkspaceUsageContext periodically posts workspace usage for the workspace
-// with the given id in the background.
+// UpdateWorkspaceUsageWithBodyContext periodically posts workspace usage for the workspace
+// with the given id and app name in the background.
 // The caller is responsible for calling the returned function to stop the background
 // process.
-func (c *Client) UpdateWorkspaceUsageContext(ctx context.Context, id uuid.UUID) func() {
+func (c *Client) UpdateWorkspaceUsageWithBodyContext(ctx context.Context, workspaceID uuid.UUID, req PostWorkspaceUsageRequest) func() {
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	// Perform one initial update
-	if err := c.PostWorkspaceUsage(hbCtx, id); err != nil {
+	err := c.PostWorkspaceUsageWithBody(hbCtx, workspaceID, req)
+	if err != nil {
 		c.logger.Warn(ctx, "failed to post workspace usage", slog.Error(err))
 	}
 	ticker := time.NewTicker(time.Minute)
@@ -350,7 +389,45 @@ func (c *Client) UpdateWorkspaceUsageContext(ctx context.Context, id uuid.UUID) 
 		for {
 			select {
 			case <-ticker.C:
-				if err := c.PostWorkspaceUsage(hbCtx, id); err != nil {
+				err := c.PostWorkspaceUsageWithBody(hbCtx, workspaceID, req)
+				if err != nil {
+					c.logger.Warn(ctx, "failed to post workspace usage in background", slog.Error(err))
+				}
+			case <-hbCtx.Done():
+				return
+			}
+		}
+	}()
+	return func() {
+		hbCancel()
+		<-doneCh
+	}
+}
+
+// UpdateWorkspaceUsageContext periodically posts workspace usage for the workspace
+// with the given id in the background.
+// The caller is responsible for calling the returned function to stop the background
+// process.
+// Deprecated: use UpdateWorkspaceUsageContextWithBody instead
+func (c *Client) UpdateWorkspaceUsageContext(ctx context.Context, workspaceID uuid.UUID) func() {
+	hbCtx, hbCancel := context.WithCancel(ctx)
+	// Perform one initial update
+	err := c.PostWorkspaceUsage(hbCtx, workspaceID)
+	if err != nil {
+		c.logger.Warn(ctx, "failed to post workspace usage", slog.Error(err))
+	}
+	ticker := time.NewTicker(time.Minute)
+	doneCh := make(chan struct{})
+	go func() {
+		defer func() {
+			ticker.Stop()
+			close(doneCh)
+		}()
+		for {
+			select {
+			case <-ticker.C:
+				err := c.PostWorkspaceUsage(hbCtx, workspaceID)
+				if err != nil {
 					c.logger.Warn(ctx, "failed to post workspace usage in background", slog.Error(err))
 				}
 			case <-hbCtx.Done():
@@ -496,8 +573,8 @@ type WorkspaceQuota struct {
 	Budget          int `json:"budget"`
 }
 
-func (c *Client) WorkspaceQuota(ctx context.Context, userID string) (WorkspaceQuota, error) {
-	res, err := c.Request(ctx, http.MethodGet, fmt.Sprintf("/api/v2/workspace-quota/%s", userID), nil)
+func (c *Client) WorkspaceQuota(ctx context.Context, organizationID string, userID string) (WorkspaceQuota, error) {
+	res, err := c.Request(ctx, http.MethodGet, fmt.Sprintf("/api/v2/organizations/%s/members/%s/workspace-quota", organizationID, userID), nil)
 	if err != nil {
 		return WorkspaceQuota{}, err
 	}
@@ -550,9 +627,16 @@ func (c *Client) UnfavoriteWorkspace(ctx context.Context, workspaceID uuid.UUID)
 	return nil
 }
 
-// WorkspaceNotifyChannel is the PostgreSQL NOTIFY
-// channel to listen for updates on. The payload is empty,
-// because the size of a workspace payload can be very large.
-func WorkspaceNotifyChannel(id uuid.UUID) string {
-	return fmt.Sprintf("workspace:%s", id)
+func (c *Client) WorkspaceTimings(ctx context.Context, id uuid.UUID) (WorkspaceBuildTimings, error) {
+	path := fmt.Sprintf("/api/v2/workspaces/%s/timings", id.String())
+	res, err := c.Request(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return WorkspaceBuildTimings{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return WorkspaceBuildTimings{}, ReadBodyAsError(res)
+	}
+	var timings WorkspaceBuildTimings
+	return timings, json.NewDecoder(res.Body).Decode(&timings)
 }

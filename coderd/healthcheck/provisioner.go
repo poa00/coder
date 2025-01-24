@@ -2,7 +2,6 @@ package healthcheck
 
 import (
 	"context"
-	"sort"
 	"time"
 
 	"golang.org/x/mod/semver"
@@ -51,7 +50,7 @@ func (r *ProvisionerDaemonsReport) Run(ctx context.Context, opts *ProvisionerDae
 	now := opts.TimeNow()
 
 	if opts.StaleInterval == 0 {
-		opts.StaleInterval = provisionerdserver.DefaultHeartbeatInterval * 3
+		opts.StaleInterval = provisionerdserver.StaleInterval
 	}
 
 	if opts.CurrentVersion == "" {
@@ -80,23 +79,10 @@ func (r *ProvisionerDaemonsReport) Run(ctx context.Context, opts *ProvisionerDae
 		return
 	}
 
-	// Ensure stable order for display and for tests
-	sort.Slice(daemons, func(i, j int) bool {
-		return daemons[i].Name < daemons[j].Name
-	})
-
-	for _, daemon := range daemons {
-		// Daemon never connected, skip.
-		if !daemon.LastSeenAt.Valid {
-			continue
-		}
-		// Daemon has gone away, skip.
-		if now.Sub(daemon.LastSeenAt.Time) > (opts.StaleInterval) {
-			continue
-		}
-
+	recentDaemons := db2sdk.RecentProvisionerDaemons(now, opts.StaleInterval, daemons)
+	for _, daemon := range recentDaemons {
 		it := healthsdk.ProvisionerDaemonsReportItem{
-			ProvisionerDaemon: db2sdk.ProvisionerDaemon(daemon),
+			ProvisionerDaemon: daemon,
 			Warnings:          make([]health.Message, 0),
 		}
 

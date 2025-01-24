@@ -58,8 +58,11 @@ func TestBuilder_NoOptions(t *testing.T) {
 		withTemplate,
 		withInactiveVersion(nil),
 		withLastBuildFound,
+		withTemplateVersionVariables(inactiveVersionID, nil),
 		withRichParameters(nil),
 		withParameterSchemas(inactiveJobID, nil),
+		withWorkspaceTags(inactiveVersionID, nil),
+		withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
 
 		// Outputs
 		expectProvisionerJob(func(job database.InsertProvisionerJobParams) {
@@ -93,7 +96,8 @@ func TestBuilder_NoOptions(t *testing.T) {
 
 	ws := database.Workspace{ID: workspaceID, TemplateID: templateID, OwnerID: userID}
 	uut := wsbuilder.New(ws, database.WorkspaceTransitionStart)
-	_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+	// nolint: dogsled
+	_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 	req.NoError(err)
 }
 
@@ -110,8 +114,11 @@ func TestBuilder_Initiator(t *testing.T) {
 		withTemplate,
 		withInactiveVersion(nil),
 		withLastBuildFound,
+		withTemplateVersionVariables(inactiveVersionID, nil),
 		withRichParameters(nil),
 		withParameterSchemas(inactiveJobID, nil),
+		withWorkspaceTags(inactiveVersionID, nil),
+		withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
 
 		// Outputs
 		expectProvisionerJob(func(job database.InsertProvisionerJobParams) {
@@ -128,7 +135,8 @@ func TestBuilder_Initiator(t *testing.T) {
 
 	ws := database.Workspace{ID: workspaceID, TemplateID: templateID, OwnerID: userID}
 	uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).Initiator(otherUserID)
-	_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+	// nolint: dogsled
+	_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 	req.NoError(err)
 }
 
@@ -152,8 +160,11 @@ func TestBuilder_Baggage(t *testing.T) {
 		withTemplate,
 		withInactiveVersion(nil),
 		withLastBuildFound,
+		withTemplateVersionVariables(inactiveVersionID, nil),
 		withRichParameters(nil),
 		withParameterSchemas(inactiveJobID, nil),
+		withWorkspaceTags(inactiveVersionID, nil),
+		withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
 
 		// Outputs
 		expectProvisionerJob(func(job database.InsertProvisionerJobParams) {
@@ -169,7 +180,8 @@ func TestBuilder_Baggage(t *testing.T) {
 
 	ws := database.Workspace{ID: workspaceID, TemplateID: templateID, OwnerID: userID}
 	uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).Initiator(otherUserID)
-	_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{IP: "127.0.0.1"})
+	// nolint: dogsled
+	_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{IP: "127.0.0.1"})
 	req.NoError(err)
 }
 
@@ -186,11 +198,14 @@ func TestBuilder_Reason(t *testing.T) {
 		withTemplate,
 		withInactiveVersion(nil),
 		withLastBuildFound,
+		withTemplateVersionVariables(inactiveVersionID, nil),
 		withRichParameters(nil),
 		withParameterSchemas(inactiveJobID, nil),
+		withWorkspaceTags(inactiveVersionID, nil),
+		withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
 
 		// Outputs
-		expectProvisionerJob(func(job database.InsertProvisionerJobParams) {
+		expectProvisionerJob(func(_ database.InsertProvisionerJobParams) {
 		}),
 		withInTx,
 		expectBuild(func(bld database.InsertWorkspaceBuildParams) {
@@ -203,7 +218,8 @@ func TestBuilder_Reason(t *testing.T) {
 
 	ws := database.Workspace{ID: workspaceID, TemplateID: templateID, OwnerID: userID}
 	uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).Reason(database.BuildReasonAutostart)
-	_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+	// nolint: dogsled
+	_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 	req.NoError(err)
 }
 
@@ -220,7 +236,10 @@ func TestBuilder_ActiveVersion(t *testing.T) {
 		withTemplate,
 		withActiveVersion(nil),
 		withLastBuildNotFound,
+		withTemplateVersionVariables(activeVersionID, nil),
 		withParameterSchemas(activeJobID, nil),
+		withWorkspaceTags(activeVersionID, nil),
+		withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
 		// previous rich parameters are not queried because there is no previous build.
 
 		// Outputs
@@ -242,7 +261,122 @@ func TestBuilder_ActiveVersion(t *testing.T) {
 
 	ws := database.Workspace{ID: workspaceID, TemplateID: templateID, OwnerID: userID}
 	uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).ActiveVersion()
-	_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+	// nolint: dogsled
+	_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+	req.NoError(err)
+}
+
+func TestWorkspaceBuildWithTags(t *testing.T) {
+	t.Parallel()
+
+	asrt := assert.New(t)
+	req := require.New(t)
+
+	workspaceTags := []database.TemplateVersionWorkspaceTag{
+		{
+			Key:   "fruits_tag",
+			Value: "data.coder_parameter.number_of_apples.value + data.coder_parameter.number_of_oranges.value",
+		},
+		{
+			Key:   "cluster_tag",
+			Value: `"best_developers"`,
+		},
+		{
+			Key:   "project_tag",
+			Value: `"${data.coder_parameter.project.value}+12345"`,
+		},
+		{
+			Key:   "team_tag",
+			Value: `data.coder_parameter.team.value`,
+		},
+		{
+			Key:   "yes_or_no",
+			Value: `data.coder_parameter.is_debug_build.value`,
+		},
+		{
+			Key:   "actually_no",
+			Value: `!data.coder_parameter.is_debug_build.value`,
+		},
+		{
+			Key:   "is_debug_build",
+			Value: `data.coder_parameter.is_debug_build.value == "true" ? "in-debug-mode" : "no-debug"`,
+		},
+		{
+			Key:   "variable_tag",
+			Value: `var.tag`,
+		},
+		{
+			Key:   "another_variable_tag",
+			Value: `var.tag2`,
+		},
+	}
+
+	richParameters := []database.TemplateVersionParameter{
+		// Parameters can be mutable although it is discouraged as the workspace can be moved between provisioner nodes.
+		{Name: "project", Description: "This is first parameter", Mutable: true, Options: json.RawMessage("[]")},
+		{Name: "team", Description: "This is second parameter", Mutable: true, DefaultValue: "godzilla", Options: json.RawMessage("[]")},
+		{Name: "is_debug_build", Type: "bool", Description: "This is third parameter", Mutable: false, DefaultValue: "false", Options: json.RawMessage("[]")},
+		{Name: "number_of_apples", Type: "number", Description: "This is fourth parameter", Mutable: false, DefaultValue: "4", Options: json.RawMessage("[]")},
+		{Name: "number_of_oranges", Type: "number", Description: "This is fifth parameter", Mutable: false, DefaultValue: "6", Options: json.RawMessage("[]")},
+	}
+
+	templateVersionVariables := []database.TemplateVersionVariable{
+		{Name: "tag", Description: "This is a variable tag", TemplateVersionID: inactiveVersionID, Type: "string", DefaultValue: "default-value", Value: "my-value"},
+		{Name: "tag2", Description: "This is another variable tag", TemplateVersionID: inactiveVersionID, Type: "string", DefaultValue: "default-value-2", Value: ""},
+	}
+
+	buildParameters := []codersdk.WorkspaceBuildParameter{
+		{Name: "project", Value: "foobar-foobaz"},
+		{Name: "is_debug_build", Value: "true"},
+		// Parameters "team", "number_of_apples", "number_of_oranges" are skipped, so default value is selected
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mDB := expectDB(t,
+		// Inputs
+		withTemplate,
+		withInactiveVersion(richParameters),
+		withLastBuildFound,
+		withTemplateVersionVariables(inactiveVersionID, templateVersionVariables),
+		withRichParameters(nil),
+		withParameterSchemas(inactiveJobID, nil),
+		withWorkspaceTags(inactiveVersionID, workspaceTags),
+		withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
+
+		// Outputs
+		expectProvisionerJob(func(job database.InsertProvisionerJobParams) {
+			asrt.Len(job.Tags, 12)
+
+			expected := database.StringMap{
+				"actually_no":          "false",
+				"cluster_tag":          "best_developers",
+				"fruits_tag":           "10",
+				"is_debug_build":       "in-debug-mode",
+				"project_tag":          "foobar-foobaz+12345",
+				"team_tag":             "godzilla",
+				"yes_or_no":            "true",
+				"variable_tag":         "my-value",
+				"another_variable_tag": "default-value-2",
+
+				"scope":   "user",
+				"version": "inactive",
+				"owner":   userID.String(),
+			}
+			asrt.Equal(job.Tags, expected)
+		}),
+		withInTx,
+		expectBuild(func(_ database.InsertWorkspaceBuildParams) {}),
+		expectBuildParameters(func(_ database.InsertWorkspaceBuildParametersParams) {
+		}),
+		withBuild,
+	)
+
+	ws := database.Workspace{ID: workspaceID, TemplateID: templateID, OwnerID: userID}
+	uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).RichParameterValues(buildParameters)
+	// nolint: dogsled
+	_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 	req.NoError(err)
 }
 
@@ -300,8 +434,11 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 			withTemplate,
 			withInactiveVersion(richParameters),
 			withLastBuildFound,
+			withTemplateVersionVariables(inactiveVersionID, nil),
 			withRichParameters(initialBuildParameters),
 			withParameterSchemas(inactiveJobID, nil),
+			withWorkspaceTags(inactiveVersionID, nil),
+			withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
 
 			// Outputs
 			expectProvisionerJob(func(job database.InsertProvisionerJobParams) {}),
@@ -320,7 +457,8 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 
 		ws := database.Workspace{ID: workspaceID, TemplateID: templateID, OwnerID: userID}
 		uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).RichParameterValues(nextBuildParameters)
-		_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+		// nolint: dogsled
+		_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 		req.NoError(err)
 	})
 	t.Run("UsePreviousParameterValues", func(t *testing.T) {
@@ -343,8 +481,11 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 			withTemplate,
 			withInactiveVersion(richParameters),
 			withLastBuildFound,
+			withTemplateVersionVariables(inactiveVersionID, nil),
 			withRichParameters(initialBuildParameters),
 			withParameterSchemas(inactiveJobID, nil),
+			withWorkspaceTags(inactiveVersionID, nil),
+			withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
 
 			// Outputs
 			expectProvisionerJob(func(job database.InsertProvisionerJobParams) {}),
@@ -363,7 +504,8 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 
 		ws := database.Workspace{ID: workspaceID, TemplateID: templateID, OwnerID: userID}
 		uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).RichParameterValues(nextBuildParameters)
-		_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+		// nolint: dogsled
+		_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 		req.NoError(err)
 	})
 
@@ -392,18 +534,15 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 			withTemplate,
 			withInactiveVersion(richParameters),
 			withLastBuildFound,
+			withTemplateVersionVariables(inactiveVersionID, nil),
 			withRichParameters(nil),
 			withParameterSchemas(inactiveJobID, schemas),
-
-			// Outputs
-			expectProvisionerJob(func(job database.InsertProvisionerJobParams) {}),
-			withInTx,
-			expectBuild(func(bld database.InsertWorkspaceBuildParams) {}),
+			withWorkspaceTags(inactiveVersionID, nil),
 		)
 
 		ws := database.Workspace{ID: workspaceID, TemplateID: templateID, OwnerID: userID}
 		uut := wsbuilder.New(ws, database.WorkspaceTransitionStart)
-		_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+		_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 		bldErr := wsbuilder.BuildError{}
 		req.ErrorAs(err, &bldErr)
 		asrt.Equal(http.StatusBadRequest, bldErr.Status)
@@ -427,20 +566,19 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 			withTemplate,
 			withInactiveVersion(richParameters),
 			withLastBuildFound,
+			withTemplateVersionVariables(inactiveVersionID, nil),
 			withRichParameters(initialBuildParameters),
 			withParameterSchemas(inactiveJobID, nil),
+			withWorkspaceTags(inactiveVersionID, nil),
 
 			// Outputs
-			expectProvisionerJob(func(job database.InsertProvisionerJobParams) {}),
-			withInTx,
-			expectBuild(func(bld database.InsertWorkspaceBuildParams) {}),
-			// no build parameters, since we hit an error validating.
-			// expectBuildParameters(func(params database.InsertWorkspaceBuildParametersParams) {}),
+			// no transaction, since we failed fast while validation build parameters
 		)
 
 		ws := database.Workspace{ID: workspaceID, TemplateID: templateID, OwnerID: userID}
 		uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).RichParameterValues(nextBuildParameters)
-		_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+		// nolint: dogsled
+		_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 		bldErr := wsbuilder.BuildError{}
 		req.ErrorAs(err, &bldErr)
 		asrt.Equal(http.StatusBadRequest, bldErr.Status)
@@ -480,8 +618,11 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 			withTemplate,
 			withActiveVersion(version2params),
 			withLastBuildFound,
+			withTemplateVersionVariables(activeVersionID, nil),
 			withRichParameters(initialBuildParameters),
 			withParameterSchemas(activeJobID, nil),
+			withWorkspaceTags(activeVersionID, nil),
+			withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
 
 			// Outputs
 			expectProvisionerJob(func(job database.InsertProvisionerJobParams) {}),
@@ -502,7 +643,7 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 		uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).
 			RichParameterValues(nextBuildParameters).
 			VersionID(activeVersionID)
-		_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+		_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 		req.NoError(err)
 	})
 
@@ -540,8 +681,11 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 			withTemplate,
 			withActiveVersion(version2params),
 			withLastBuildFound,
+			withTemplateVersionVariables(activeVersionID, nil),
 			withRichParameters(initialBuildParameters),
 			withParameterSchemas(activeJobID, nil),
+			withWorkspaceTags(activeVersionID, nil),
+			withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
 
 			// Outputs
 			expectProvisionerJob(func(job database.InsertProvisionerJobParams) {}),
@@ -562,7 +706,7 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 		uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).
 			RichParameterValues(nextBuildParameters).
 			VersionID(activeVersionID)
-		_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+		_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 		req.NoError(err)
 	})
 
@@ -598,8 +742,11 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 			withTemplate,
 			withActiveVersion(version2params),
 			withLastBuildFound,
+			withTemplateVersionVariables(activeVersionID, nil),
 			withRichParameters(initialBuildParameters),
 			withParameterSchemas(activeJobID, nil),
+			withWorkspaceTags(activeVersionID, nil),
+			withProvisionerDaemons([]database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow{}),
 
 			// Outputs
 			expectProvisionerJob(func(job database.InsertProvisionerJobParams) {}),
@@ -620,7 +767,8 @@ func TestWorkspaceBuildWithRichParameters(t *testing.T) {
 		uut := wsbuilder.New(ws, database.WorkspaceTransitionStart).
 			RichParameterValues(nextBuildParameters).
 			VersionID(activeVersionID)
-		_, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
+		// nolint: dogsled
+		_, _, _, err := uut.Build(ctx, mDB, nil, audit.WorkspaceBuildBaggage{})
 		req.NoError(err)
 	})
 }
@@ -636,9 +784,9 @@ func expectDB(t *testing.T, opts ...txExpect) *dbmock.MockStore {
 	// we expect to be run in a transaction; we use mTx to record the
 	// "in transaction" calls.
 	mDB.EXPECT().InTx(
-		gomock.Any(), gomock.Eq(&sql.TxOptions{Isolation: sql.LevelRepeatableRead}),
+		gomock.Any(), gomock.Eq(&database.TxOptions{Isolation: sql.LevelRepeatableRead}),
 	).
-		DoAndReturn(func(f func(database.Store) error, _ *sql.TxOptions) error {
+		DoAndReturn(func(f func(database.Store) error, _ *database.TxOptions) error {
 			err := f(mTx)
 			return err
 		})
@@ -664,7 +812,7 @@ func withTemplate(mTx *dbmock.MockStore) {
 // withInTx runs the given functions on the same db mock.
 func withInTx(mTx *dbmock.MockStore) {
 	mTx.EXPECT().InTx(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-		func(f func(store database.Store) error, _ *sql.TxOptions) error {
+		func(f func(store database.Store) error, _ *database.TxOptions) error {
 			return f(mTx)
 		},
 	)
@@ -801,12 +949,36 @@ func withParameterSchemas(jobID uuid.UUID, schemas []database.ParameterSchema) f
 	}
 }
 
+func withTemplateVersionVariables(versionID uuid.UUID, params []database.TemplateVersionVariable) func(mTx *dbmock.MockStore) {
+	return func(mTx *dbmock.MockStore) {
+		c := mTx.EXPECT().GetTemplateVersionVariables(gomock.Any(), versionID).
+			Times(1)
+		if len(params) > 0 {
+			c.Return(params, nil)
+		} else {
+			c.Return(nil, sql.ErrNoRows)
+		}
+	}
+}
+
 func withRichParameters(params []database.WorkspaceBuildParameter) func(mTx *dbmock.MockStore) {
 	return func(mTx *dbmock.MockStore) {
 		c := mTx.EXPECT().GetWorkspaceBuildParameters(gomock.Any(), lastBuildID).
 			Times(1)
 		if len(params) > 0 {
 			c.Return(params, nil)
+		} else {
+			c.Return(nil, sql.ErrNoRows)
+		}
+	}
+}
+
+func withWorkspaceTags(versionID uuid.UUID, tags []database.TemplateVersionWorkspaceTag) func(mTx *dbmock.MockStore) {
+	return func(mTx *dbmock.MockStore) {
+		c := mTx.EXPECT().GetTemplateVersionWorkspaceTags(gomock.Any(), versionID).
+			Times(1)
+		if len(tags) > 0 {
+			c.Return(tags, nil)
 		} else {
 			c.Return(nil, sql.ErrNoRows)
 		}
@@ -874,5 +1046,11 @@ func expectBuildParameters(
 					return nil
 				},
 			)
+	}
+}
+
+func withProvisionerDaemons(provisionerDaemons []database.GetEligibleProvisionerDaemonsByProvisionerJobIDsRow) func(mTx *dbmock.MockStore) {
+	return func(mTx *dbmock.MockStore) {
+		mTx.EXPECT().GetEligibleProvisionerDaemonsByProvisionerJobIDs(gomock.Any(), gomock.Any()).Return(provisionerDaemons, nil)
 	}
 }

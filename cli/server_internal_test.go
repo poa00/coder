@@ -13,12 +13,32 @@ import (
 
 	"cdr.dev/slog"
 	"cdr.dev/slog/sloggers/sloghuman"
-	"cdr.dev/slog/sloggers/slogtest"
-
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/testutil"
 	"github.com/coder/serpent"
 )
+
+func Test_configureServerTLS(t *testing.T) {
+	t.Parallel()
+	t.Run("DefaultNoInsecureCiphers", func(t *testing.T) {
+		t.Parallel()
+		logger := testutil.Logger(t)
+		cfg, err := configureServerTLS(context.Background(), logger, "tls12", "none", nil, nil, "", nil, false)
+		require.NoError(t, err)
+
+		require.NotEmpty(t, cfg)
+
+		insecureCiphers := tls.InsecureCipherSuites()
+		for _, cipher := range cfg.CipherSuites {
+			for _, insecure := range insecureCiphers {
+				if cipher == insecure.ID {
+					t.Logf("Insecure cipher found by default: %s", insecure.Name)
+					t.Fail()
+				}
+			}
+		}
+	})
+}
 
 func Test_configureCipherSuites(t *testing.T) {
 	t.Parallel()
@@ -141,8 +161,8 @@ func Test_configureCipherSuites(t *testing.T) {
 			name:   "TLSUnsupported",
 			minTLS: tls.VersionTLS10,
 			maxTLS: tls.VersionTLS13,
-			// TLS_RSA_WITH_AES_128_GCM_SHA256 only supports tls 1.2
-			inputCiphers: []string{"TLS_RSA_WITH_AES_128_GCM_SHA256"},
+			// TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 only supports tls 1.2
+			inputCiphers: []string{"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"},
 			wantErr:      "no tls ciphers supported for tls versions",
 		},
 		{
@@ -229,7 +249,7 @@ func TestRedirectHTTPToHTTPSDeprecation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ctx := testutil.Context(t, testutil.WaitShort)
-			logger := slogtest.Make(t, nil)
+			logger := testutil.Logger(t)
 			flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
 			_ = flags.Bool("tls-redirect-http-to-https", true, "")
 			err := flags.Parse(tc.flags)

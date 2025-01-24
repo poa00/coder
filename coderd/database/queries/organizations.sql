@@ -12,7 +12,21 @@ LIMIT
 SELECT
 	*
 FROM
-	organizations;
+	organizations
+WHERE
+	true
+	  -- Filter by ids
+	AND CASE
+		WHEN array_length(@ids :: uuid[], 1) > 0 THEN
+			id = ANY(@ids)
+		ELSE true
+	END
+  	AND CASE
+		  WHEN @name::text != '' THEN
+			  LOWER("name") = LOWER(@name)
+		  ELSE true
+	END
+;
 
 -- name: GetOrganizationByID :one
 SELECT
@@ -49,7 +63,27 @@ WHERE
 
 -- name: InsertOrganization :one
 INSERT INTO
-	organizations (id, "name", description, created_at, updated_at, is_default)
+	organizations (id, "name", display_name, description, icon, created_at, updated_at, is_default)
 VALUES
 	-- If no organizations exist, and this is the first, make it the default.
-	($1, $2, $3, $4, $5, (SELECT TRUE FROM organizations LIMIT 1) IS NULL) RETURNING *;
+	(@id, @name, @display_name, @description, @icon, @created_at, @updated_at, (SELECT TRUE FROM organizations LIMIT 1) IS NULL) RETURNING *;
+
+-- name: UpdateOrganization :one
+UPDATE
+	organizations
+SET
+	updated_at = @updated_at,
+	name = @name,
+	display_name = @display_name,
+	description = @description,
+	icon = @icon
+WHERE
+	id = @id
+RETURNING *;
+
+-- name: DeleteOrganization :exec
+DELETE FROM
+	organizations
+WHERE
+	id = $1 AND
+	is_default = false;

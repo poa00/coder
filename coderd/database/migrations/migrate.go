@@ -2,11 +2,16 @@ package migrations
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
+	"sort"
+	"strings"
+	"sync"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source"
@@ -17,9 +22,62 @@ import (
 //go:embed *.sql
 var migrations embed.FS
 
-func setup(db *sql.DB) (source.Driver, *migrate.Migrate, error) {
+var (
+	migrationsHash     string
+	migrationsHashOnce sync.Once
+)
+
+// A migrations hash is a sha256 hash of the contents and names
+// of the migrations sorted by filename.
+func calculateMigrationsHash(migrationsFs embed.FS) (string, error) {
+	files, err := migrationsFs.ReadDir(".")
+	if err != nil {
+		return "", xerrors.Errorf("read migrations directory: %w", err)
+	}
+	sortedFiles := make([]fs.DirEntry, len(files))
+	copy(sortedFiles, files)
+	sort.Slice(sortedFiles, func(i, j int) bool {
+		return sortedFiles[i].Name() < sortedFiles[j].Name()
+	})
+
+	var builder strings.Builder
+	for _, file := range sortedFiles {
+		if _, err := builder.WriteString(file.Name()); err != nil {
+			return "", xerrors.Errorf("write migration file name %q: %w", file.Name(), err)
+		}
+		content, err := migrationsFs.ReadFile(file.Name())
+		if err != nil {
+			return "", xerrors.Errorf("read migration file %q: %w", file.Name(), err)
+		}
+		if _, err := builder.Write(content); err != nil {
+			return "", xerrors.Errorf("write migration file content %q: %w", file.Name(), err)
+		}
+	}
+
+	hash := sha256.New()
+	if _, err := hash.Write([]byte(builder.String())); err != nil {
+		return "", xerrors.Errorf("write to hash: %w", err)
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func GetMigrationsHash() string {
+	migrationsHashOnce.Do(func() {
+		hash, err := calculateMigrationsHash(migrations)
+		if err != nil {
+			panic(err)
+		}
+		migrationsHash = hash
+	})
+	return migrationsHash
+}
+
+func setup(db *sql.DB, migs fs.FS) (source.Driver, *migrate.Migrate, error) {
+	if migs == nil {
+		migs = migrations
+	}
 	ctx := context.Background()
-	sourceDriver, err := iofs.New(migrations, ".")
+	sourceDriver, err := iofs.New(migs, ".")
 	if err != nil {
 		return nil, nil, xerrors.Errorf("create iofs: %w", err)
 	}
@@ -47,8 +105,13 @@ func setup(db *sql.DB) (source.Driver, *migrate.Migrate, error) {
 }
 
 // Up runs SQL migrations to ensure the database schema is up-to-date.
-func Up(db *sql.DB) (retErr error) {
-	_, m, err := setup(db)
+func Up(db *sql.DB) error {
+	return UpWithFS(db, migrations)
+}
+
+// UpWithFS runs SQL migrations in the given fs.
+func UpWithFS(db *sql.DB, migs fs.FS) (retErr error) {
+	_, m, err := setup(db, migs)
 	if err != nil {
 		return xerrors.Errorf("migrate setup: %w", err)
 	}
@@ -79,7 +142,7 @@ func Up(db *sql.DB) (retErr error) {
 
 // Down runs all down SQL migrations.
 func Down(db *sql.DB) error {
-	_, m, err := setup(db)
+	_, m, err := setup(db, migrations)
 	if err != nil {
 		return xerrors.Errorf("migrate setup: %w", err)
 	}
@@ -101,7 +164,7 @@ func Down(db *sql.DB) error {
 // applied, without making any changes to the database. If not, returns a
 // non-nil error.
 func EnsureClean(db *sql.DB) error {
-	sourceDriver, m, err := setup(db)
+	sourceDriver, m, err := setup(db, migrations)
 	if err != nil {
 		return xerrors.Errorf("migrate setup: %w", err)
 	}
@@ -167,7 +230,7 @@ func CheckLatestVersion(sourceDriver source.Driver, currentVersion uint) error {
 // Stepper cannot be closed pre-emptively, it must be run to completion
 // (or until an error is encountered).
 func Stepper(db *sql.DB) (next func() (version uint, more bool, err error), err error) {
-	_, m, err := setup(db)
+	_, m, err := setup(db, migrations)
 	if err != nil {
 		return nil, xerrors.Errorf("migrate setup: %w", err)
 	}

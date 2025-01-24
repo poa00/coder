@@ -34,11 +34,11 @@ import (
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/xerrors"
 
-	"github.com/coder/coder/v2/buildinfo"
 	"github.com/coder/coder/v2/coderd/appearance"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
+	"github.com/coder/coder/v2/coderd/entitlements"
 	"github.com/coder/coder/v2/coderd/httpapi"
 	"github.com/coder/coder/v2/coderd/httpmw"
 	"github.com/coder/coder/v2/codersdk"
@@ -78,18 +78,22 @@ type Options struct {
 	SiteFS            fs.FS
 	OAuth2Configs     *httpmw.OAuth2Configs
 	DocsURL           string
+	BuildInfo         codersdk.BuildInfoResponse
 	AppearanceFetcher *atomic.Pointer[appearance.Fetcher]
+	Entitlements      *entitlements.Set
 }
 
 func New(opts *Options) *Handler {
 	if opts.AppearanceFetcher == nil {
 		daf := atomic.Pointer[appearance.Fetcher]{}
-		daf.Store(&appearance.DefaultFetcher)
+		f := appearance.NewDefaultFetcher(opts.DocsURL)
+		daf.Store(&f)
 		opts.AppearanceFetcher = &daf
 	}
 	handler := &Handler{
 		opts:          opts,
 		secureHeaders: secureHeaders(),
+		Entitlements:  opts.Entitlements,
 	}
 
 	// html files are handled by a text/template. Non-html files
@@ -149,17 +153,17 @@ func New(opts *Options) *Handler {
 			// static files.
 			OnlyFiles(opts.SiteFS))),
 	)
-
-	buildInfo := codersdk.BuildInfoResponse{
-		ExternalURL: buildinfo.ExternalURL(),
-		Version:     buildinfo.Version(),
-	}
-	buildInfoResponse, err := json.Marshal(buildInfo)
+	buildInfoResponse, err := json.Marshal(opts.BuildInfo)
 	if err != nil {
 		panic("failed to marshal build info: " + err.Error())
 	}
 	handler.buildInfoJSON = html.EscapeString(string(buildInfoResponse))
 	handler.handler = mux.ServeHTTP
+
+	handler.installScript, err = parseInstallScript(opts.SiteFS, opts.BuildInfo)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "install.sh will be unavailable: %v", err.Error())
+	}
 
 	return handler
 }
@@ -170,14 +174,14 @@ type Handler struct {
 	secureHeaders *secure.Secure
 	handler       http.HandlerFunc
 	htmlTemplates *template.Template
-
 	buildInfoJSON string
+	installScript []byte
 
 	// RegionsFetcher will attempt to fetch the more detailed WorkspaceProxy data, but will fall back to the
 	// regions if the user does not have the correct permissions.
 	RegionsFetcher func(ctx context.Context) (any, error)
 
-	Entitlements atomic.Pointer[codersdk.Entitlements]
+	Entitlements *entitlements.Set
 	Experiments  atomic.Pointer[codersdk.Experiments]
 }
 
@@ -205,6 +209,28 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	// If requesting binaries, serve straight up.
 	case reqFile == "bin" || strings.HasPrefix(reqFile, "bin/"):
 		h.handler.ServeHTTP(rw, r)
+		return
+	// If requesting assets, serve straight up with caching.
+	case reqFile == "assets" || strings.HasPrefix(reqFile, "assets/"):
+		// It could make sense to cache 404s, but the problem is that during an
+		// upgrade a load balancer may route partially to the old server, and that
+		// would make new asset paths get cached as 404s and not load even once the
+		// new server was in place.  To combat that, only cache if we have the file.
+		if h.exists(reqFile) && ShouldCacheFile(reqFile) {
+			rw.Header().Add("Cache-Control", "public, max-age=31536000, immutable")
+		}
+		// If the asset does not exist, this will return a 404.
+		h.handler.ServeHTTP(rw, r)
+		return
+	// If requesting the install.sh script, respond with the preprocessed version
+	// which contains the correct hostname and version information.
+	case reqFile == "install.sh":
+		if h.installScript == nil {
+			http.NotFound(rw, r)
+			return
+		}
+		rw.Header().Add("Content-Type", "text/plain; charset=utf-8")
+		http.ServeContent(rw, r, reqFile, time.Time{}, bytes.NewReader(h.installScript))
 		return
 	// If the original file path exists we serve it.
 	case h.exists(reqFile):
@@ -383,15 +409,12 @@ func (h *Handler) renderHTMLWithState(r *http.Request, filePath string, state ht
 				state.User = html.EscapeString(string(user))
 			}
 		}()
-		entitlements := h.Entitlements.Load()
-		if entitlements != nil {
+
+		if h.Entitlements != nil {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				entitlements, err := json.Marshal(entitlements)
-				if err == nil {
-					state.Entitlements = html.EscapeString(string(entitlements))
-				}
+				state.Entitlements = html.EscapeString(string(h.Entitlements.AsJSON()))
 			}()
 		}
 
@@ -523,6 +546,32 @@ func findAndParseHTMLFiles(files fs.FS) (*template.Template, error) {
 		return nil, err
 	}
 	return root, nil
+}
+
+type installScriptState struct {
+	Origin  string
+	Version string
+}
+
+func parseInstallScript(files fs.FS, buildInfo codersdk.BuildInfoResponse) ([]byte, error) {
+	scriptFile, err := fs.ReadFile(files, "install.sh")
+	if err != nil {
+		return nil, err
+	}
+
+	script, err := template.New("install.sh").Parse(string(scriptFile))
+	if err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	state := installScriptState{Origin: buildInfo.DashboardURL, Version: buildInfo.Version}
+	err = script.Execute(&buf, state)
+	if err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
 }
 
 // ExtractOrReadBinFS checks the provided fs for compressed coder binaries and
@@ -786,12 +835,15 @@ func extractBin(dest string, r io.Reader) (numExtracted int, err error) {
 type ErrorPageData struct {
 	Status int
 	// HideStatus will remove the status code from the page.
-	HideStatus   bool
-	Title        string
-	Description  string
-	RetryEnabled bool
-	DashboardURL string
-	Warnings     []string
+	HideStatus           bool
+	Title                string
+	Description          string
+	RetryEnabled         bool
+	DashboardURL         string
+	Warnings             []string
+	AdditionalInfo       string
+	AdditionalButtonLink string
+	AdditionalButtonText string
 
 	RenderDescriptionMarkdown bool
 }

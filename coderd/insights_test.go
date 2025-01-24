@@ -21,15 +21,16 @@ import (
 	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent/agenttest"
 	agentproto "github.com/coder/coder/v2/agent/proto"
-	"github.com/coder/coder/v2/coderd/batchstats"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbgen"
 	"github.com/coder/coder/v2/coderd/database/dbrollup"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/workspaceapps"
+	"github.com/coder/coder/v2/coderd/workspacestats"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/agentsdk"
 	"github.com/coder/coder/v2/codersdk/workspacesdk"
@@ -45,18 +46,29 @@ func TestDeploymentInsights(t *testing.T) {
 	require.NoError(t, err)
 
 	db, ps := dbtestutil.NewDB(t, dbtestutil.WithDumpOnFailure())
-	logger := slogtest.Make(t, nil)
+	logger := testutil.Logger(t)
 	rollupEvents := make(chan dbrollup.Event)
+	statsInterval := 500 * time.Millisecond
+	// Speed up the test by controlling batch size and interval.
+	batcher, closeBatcher, err := workspacestats.NewBatcher(context.Background(),
+		workspacestats.BatcherWithLogger(logger.Named("batcher").Leveled(slog.LevelDebug)),
+		workspacestats.BatcherWithStore(db),
+		workspacestats.BatcherWithBatchSize(1),
+		workspacestats.BatcherWithInterval(statsInterval),
+	)
+	require.NoError(t, err)
+	defer closeBatcher()
 	client := coderdtest.New(t, &coderdtest.Options{
 		Database:                  db,
 		Pubsub:                    ps,
 		Logger:                    &logger,
 		IncludeProvisionerDaemon:  true,
-		AgentStatsRefreshInterval: time.Millisecond * 100,
+		AgentStatsRefreshInterval: statsInterval,
+		StatsBatcher:              batcher,
 		DatabaseRolluper: dbrollup.New(
 			logger.Named("dbrollup").Leveled(slog.LevelDebug),
 			db,
-			dbrollup.WithInterval(time.Millisecond*100),
+			dbrollup.WithInterval(statsInterval/2),
 			dbrollup.WithEventChannel(rollupEvents),
 		),
 	})
@@ -72,10 +84,10 @@ func TestDeploymentInsights(t *testing.T) {
 	require.Empty(t, template.BuildTimeStats[codersdk.WorkspaceTransitionStart])
 
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
-	ctx := testutil.Context(t, testutil.WaitLong)
+	ctx := testutil.Context(t, testutil.WaitSuperLong)
 
 	// Pre-check, no  permission issues.
 	daus, err := client.DeploymentDAUs(ctx, codersdk.TimezoneOffsetHour(clientTz))
@@ -86,7 +98,7 @@ func TestDeploymentInsights(t *testing.T) {
 
 	conn, err := workspacesdk.New(client).
 		DialAgent(ctx, resources[0].Agents[0].ID, &workspacesdk.DialAgentOptions{
-			Logger: slogtest.Make(t, nil).Named("dialagent"),
+			Logger: testutil.Logger(t).Named("dialagent"),
 		})
 	require.NoError(t, err)
 	defer conn.Close()
@@ -107,6 +119,13 @@ func TestDeploymentInsights(t *testing.T) {
 	err = sess.Start("cat")
 	require.NoError(t, err)
 
+	select {
+	case <-ctx.Done():
+		require.Fail(t, "timed out waiting for initial rollup event", ctx.Err())
+	case ev := <-rollupEvents:
+		require.True(t, ev.Init, "want init event")
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -119,6 +138,7 @@ func TestDeploymentInsights(t *testing.T) {
 		if len(daus.Entries) > 0 && daus.Entries[len(daus.Entries)-1].Amount > 0 {
 			break
 		}
+		t.Logf("waiting for deployment daus to update: %+v", daus)
 	}
 }
 
@@ -126,7 +146,7 @@ func TestUserActivityInsights_SanityCheck(t *testing.T) {
 	t.Parallel()
 
 	db, ps := dbtestutil.NewDB(t)
-	logger := slogtest.Make(t, nil)
+	logger := testutil.Logger(t)
 	client := coderdtest.New(t, &coderdtest.Options{
 		Database:                  db,
 		Pubsub:                    ps,
@@ -154,7 +174,7 @@ func TestUserActivityInsights_SanityCheck(t *testing.T) {
 	require.Empty(t, template.BuildTimeStats[codersdk.WorkspaceTransitionStart])
 
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 	// Start an agent so that we can generate stats.
@@ -224,7 +244,7 @@ func TestUserLatencyInsights(t *testing.T) {
 	t.Parallel()
 
 	db, ps := dbtestutil.NewDB(t)
-	logger := slogtest.Make(t, nil)
+	logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true}).Leveled(slog.LevelDebug)
 	client := coderdtest.New(t, &coderdtest.Options{
 		Database:                  db,
 		Pubsub:                    ps,
@@ -252,7 +272,7 @@ func TestUserLatencyInsights(t *testing.T) {
 	require.Empty(t, template.BuildTimeStats[codersdk.WorkspaceTransitionStart])
 
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 	// Start an agent so that we can generate stats.
@@ -501,7 +521,7 @@ func TestTemplateInsights_Golden(t *testing.T) {
 	}
 
 	prepare := func(t *testing.T, templates []*testTemplate, users []*testUser, testData map[*testWorkspace]testDataGen) (*codersdk.Client, chan dbrollup.Event) {
-		logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: false}).Leveled(slog.LevelDebug)
+		logger := testutil.Logger(t)
 		db, ps := dbtestutil.NewDB(t)
 		events := make(chan dbrollup.Event)
 		client := coderdtest.New(t, &coderdtest.Options{
@@ -522,7 +542,7 @@ func TestTemplateInsights_Golden(t *testing.T) {
 
 		// Prepare all test users.
 		for _, user := range users {
-			user.client, user.sdk = coderdtest.CreateAnotherUserMutators(t, client, firstUser.OrganizationID, nil, func(r *codersdk.CreateUserRequest) {
+			user.client, user.sdk = coderdtest.CreateAnotherUserMutators(t, client, firstUser.OrganizationID, nil, func(r *codersdk.CreateUserRequestWithOrgs) {
 				r.Username = user.name
 			})
 			user.client.SetLogger(logger.Named("user").With(slog.Field{Name: "name", Value: user.name}))
@@ -608,7 +628,7 @@ func TestTemplateInsights_Golden(t *testing.T) {
 
 					createWorkspaces = append(createWorkspaces, func(templateID uuid.UUID) {
 						// Create workspace using the users client.
-						createdWorkspace := coderdtest.CreateWorkspace(t, user.client, firstUser.OrganizationID, templateID, func(cwr *codersdk.CreateWorkspaceRequest) {
+						createdWorkspace := coderdtest.CreateWorkspace(t, user.client, templateID, func(cwr *codersdk.CreateWorkspaceRequest) {
 							cwr.RichParameterValues = buildParameters
 						})
 						workspace.id = createdWorkspace.ID
@@ -655,7 +675,7 @@ func TestTemplateInsights_Golden(t *testing.T) {
 				OrganizationID:  firstUser.OrganizationID,
 				CreatedBy:       firstUser.UserID,
 				GroupACL: database.TemplateACL{
-					firstUser.OrganizationID.String(): []rbac.Action{rbac.ActionRead},
+					firstUser.OrganizationID.String(): db2sdk.TemplateRoleActions(codersdk.TemplateRoleUse),
 				},
 			})
 			err := db.UpdateTemplateVersionByID(context.Background(), database.UpdateTemplateVersionByIDParams{
@@ -682,11 +702,11 @@ func TestTemplateInsights_Golden(t *testing.T) {
 		// NOTE(mafredri): Ideally we would pass batcher as a coderd option and
 		// insert using the agentClient, but we have a circular dependency on
 		// the database.
-		batcher, batcherCloser, err := batchstats.New(
+		batcher, batcherCloser, err := workspacestats.NewBatcher(
 			ctx,
-			batchstats.WithStore(db),
-			batchstats.WithLogger(logger.Named("batchstats")),
-			batchstats.WithInterval(time.Hour),
+			workspacestats.BatcherWithStore(db),
+			workspacestats.BatcherWithLogger(logger.Named("batchstats")),
+			workspacestats.BatcherWithInterval(time.Hour),
 		)
 		require.NoError(t, err)
 		defer batcherCloser() // Flushes the stats, this is to ensure they're written.
@@ -699,14 +719,13 @@ func TestTemplateInsights_Golden(t *testing.T) {
 					connectionCount = 0
 				}
 				for createdAt.Before(stat.endedAt) {
-					err = batcher.Add(createdAt, workspace.agentID, workspace.template.id, workspace.user.(*testUser).sdk.ID, workspace.id, &agentproto.Stats{
+					batcher.Add(createdAt, workspace.agentID, workspace.template.id, workspace.user.(*testUser).sdk.ID, workspace.id, &agentproto.Stats{
 						ConnectionCount:             connectionCount,
 						SessionCountVscode:          stat.sessionCountVSCode,
 						SessionCountJetbrains:       stat.sessionCountJetBrains,
 						SessionCountReconnectingPty: stat.sessionCountReconnectingPTY,
 						SessionCountSsh:             stat.sessionCountSSH,
-					})
-					require.NoError(t, err, "want no error inserting agent stats")
+					}, false)
 					createdAt = createdAt.Add(30 * time.Second)
 				}
 			}
@@ -735,9 +754,12 @@ func TestTemplateInsights_Golden(t *testing.T) {
 				})
 			}
 		}
-		reporter := workspaceapps.NewStatsDBReporter(db, workspaceapps.DefaultStatsDBReporterBatchSize)
+		reporter := workspacestats.NewReporter(workspacestats.ReporterOptions{
+			Database:         db,
+			AppStatBatchSize: workspaceapps.DefaultStatsDBReporterBatchSize,
+		})
 		//nolint:gocritic // This is a test.
-		err = reporter.Report(dbauthz.AsSystemRestricted(ctx), stats)
+		err = reporter.ReportAppStats(dbauthz.AsSystemRestricted(ctx), stats)
 		require.NoError(t, err, "want no error inserting app stats")
 
 		return client, events
@@ -1418,7 +1440,7 @@ func TestUserActivityInsights_Golden(t *testing.T) {
 	}
 
 	prepare := func(t *testing.T, templates []*testTemplate, users []*testUser, testData map[*testWorkspace]testDataGen) (*codersdk.Client, chan dbrollup.Event) {
-		logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: false}).Leveled(slog.LevelDebug)
+		logger := testutil.Logger(t)
 		db, ps := dbtestutil.NewDB(t)
 		events := make(chan dbrollup.Event)
 		client := coderdtest.New(t, &coderdtest.Options{
@@ -1514,7 +1536,7 @@ func TestUserActivityInsights_Golden(t *testing.T) {
 
 					createWorkspaces = append(createWorkspaces, func(templateID uuid.UUID) {
 						// Create workspace using the users client.
-						createdWorkspace := coderdtest.CreateWorkspace(t, user.client, firstUser.OrganizationID, templateID)
+						createdWorkspace := coderdtest.CreateWorkspace(t, user.client, templateID)
 						workspace.id = createdWorkspace.ID
 						waitWorkspaces = append(waitWorkspaces, func() {
 							coderdtest.AwaitWorkspaceBuildJobCompleted(t, user.client, createdWorkspace.LatestBuild.ID)
@@ -1551,7 +1573,7 @@ func TestUserActivityInsights_Golden(t *testing.T) {
 				OrganizationID:  firstUser.OrganizationID,
 				CreatedBy:       firstUser.UserID,
 				GroupACL: database.TemplateACL{
-					firstUser.OrganizationID.String(): []rbac.Action{rbac.ActionRead},
+					firstUser.OrganizationID.String(): db2sdk.TemplateRoleActions(codersdk.TemplateRoleUse),
 				},
 			})
 			err := db.UpdateTemplateVersionByID(context.Background(), database.UpdateTemplateVersionByIDParams{
@@ -1578,11 +1600,11 @@ func TestUserActivityInsights_Golden(t *testing.T) {
 		// NOTE(mafredri): Ideally we would pass batcher as a coderd option and
 		// insert using the agentClient, but we have a circular dependency on
 		// the database.
-		batcher, batcherCloser, err := batchstats.New(
+		batcher, batcherCloser, err := workspacestats.NewBatcher(
 			ctx,
-			batchstats.WithStore(db),
-			batchstats.WithLogger(logger.Named("batchstats")),
-			batchstats.WithInterval(time.Hour),
+			workspacestats.BatcherWithStore(db),
+			workspacestats.BatcherWithLogger(logger.Named("batchstats")),
+			workspacestats.BatcherWithInterval(time.Hour),
 		)
 		require.NoError(t, err)
 		defer batcherCloser() // Flushes the stats, this is to ensure they're written.
@@ -1595,14 +1617,13 @@ func TestUserActivityInsights_Golden(t *testing.T) {
 					connectionCount = 0
 				}
 				for createdAt.Before(stat.endedAt) {
-					err = batcher.Add(createdAt, workspace.agentID, workspace.template.id, workspace.user.(*testUser).sdk.ID, workspace.id, &agentproto.Stats{
+					batcher.Add(createdAt, workspace.agentID, workspace.template.id, workspace.user.(*testUser).sdk.ID, workspace.id, &agentproto.Stats{
 						ConnectionCount:             connectionCount,
 						SessionCountVscode:          stat.sessionCountVSCode,
 						SessionCountJetbrains:       stat.sessionCountJetBrains,
 						SessionCountReconnectingPty: stat.sessionCountReconnectingPTY,
 						SessionCountSsh:             stat.sessionCountSSH,
-					})
-					require.NoError(t, err, "want no error inserting agent stats")
+					}, false)
 					createdAt = createdAt.Add(30 * time.Second)
 				}
 			}
@@ -1631,9 +1652,12 @@ func TestUserActivityInsights_Golden(t *testing.T) {
 				})
 			}
 		}
-		reporter := workspaceapps.NewStatsDBReporter(db, workspaceapps.DefaultStatsDBReporterBatchSize)
+		reporter := workspacestats.NewReporter(workspacestats.ReporterOptions{
+			Database:         db,
+			AppStatBatchSize: workspaceapps.DefaultStatsDBReporterBatchSize,
+		})
 		//nolint:gocritic // This is a test.
-		err = reporter.Report(dbauthz.AsSystemRestricted(ctx), stats)
+		err = reporter.ReportAppStats(dbauthz.AsSystemRestricted(ctx), stats)
 		require.NoError(t, err, "want no error inserting app stats")
 
 		return client, events
