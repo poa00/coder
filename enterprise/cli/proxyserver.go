@@ -14,6 +14,7 @@ import (
 	rpprof "runtime/pprof"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/coreos/go-systemd/daemon"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -29,18 +30,19 @@ import (
 	"github.com/coder/coder/v2/coderd/workspaceapps/appurl"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/enterprise/wsproxy"
+	"github.com/coder/pretty"
 	"github.com/coder/serpent"
 )
 
-type closers []func()
+type closerFuncs []func()
 
-func (c closers) Close() {
+func (c closerFuncs) Close() {
 	for _, closeF := range c {
 		closeF()
 	}
 }
 
-func (c *closers) Add(f func()) {
+func (c *closerFuncs) Add(f func()) {
 	*c = append(*c, f)
 }
 
@@ -108,11 +110,11 @@ func (r *RootCmd) proxyServer() *serpent.Command {
 		Options: opts,
 		Middleware: serpent.Chain(
 			cli.WriteConfigMW(cfg),
-			cli.PrintDeprecatedOptions(),
 			serpent.RequireNArgs(0),
 		),
 		Handler: func(inv *serpent.Invocation) error {
-			var closers closers
+			var closers closerFuncs
+			defer closers.Close()
 			// Main command context for managing cancellation of running
 			// services.
 			ctx, topCancel := context.WithCancel(inv.Context())
@@ -202,8 +204,14 @@ func (r *RootCmd) proxyServer() *serpent.Command {
 			headerTransport.Transport = httpClient.Transport
 			httpClient.Transport = headerTransport
 
-			// A newline is added before for visibility in terminal output.
-			cliui.Infof(inv.Stdout, "\nView the Web UI: %s", cfg.AccessURL.String())
+			accessURL := cfg.AccessURL.String()
+			cliui.Infof(inv.Stdout, lipgloss.NewStyle().
+				Border(lipgloss.DoubleBorder()).
+				Align(lipgloss.Center).
+				Padding(0, 3).
+				BorderForeground(lipgloss.Color("12")).
+				Render(fmt.Sprintf("View the Web UI:\n%s",
+					pretty.Sprint(cliui.DefaultStyles.Hyperlink, accessURL))))
 
 			var appHostnameRegex *regexp.Regexp
 			appHostname := cfg.WildcardAccessURL.String()

@@ -3,19 +3,15 @@ package agent
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"os/user"
 	"path/filepath"
-	"runtime"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,16 +27,13 @@ import (
 	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
-	"storj.io/drpc"
 	"tailscale.com/net/speedtest"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netlogtype"
 	"tailscale.com/util/clientmetric"
 
 	"cdr.dev/slog"
-	"github.com/coder/retry"
-
-	"github.com/coder/coder/v2/agent/agentproc"
+	"github.com/coder/coder/v2/agent/agentexec"
 	"github.com/coder/coder/v2/agent/agentscripts"
 	"github.com/coder/coder/v2/agent/agentssh"
 	"github.com/coder/coder/v2/agent/proto"
@@ -50,8 +43,10 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/agentsdk"
+	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/coder/v2/tailnet"
 	tailnetproto "github.com/coder/coder/v2/tailnet/proto"
+	"github.com/coder/retry"
 )
 
 const (
@@ -62,7 +57,10 @@ const (
 
 // EnvProcPrioMgmt determines whether we attempt to manage
 // process CPU and OOM Killer priority.
-const EnvProcPrioMgmt = "CODER_PROC_PRIO_MGMT"
+const (
+	EnvProcPrioMgmt = "CODER_PROC_PRIO_MGMT"
+	EnvProcOOMScore = "CODER_PROC_OOM_SCORE"
+)
 
 type Options struct {
 	Filesystem                   afero.Fs
@@ -79,19 +77,17 @@ type Options struct {
 	SSHMaxTimeout                time.Duration
 	TailnetListenPort            uint16
 	Subsystems                   []codersdk.AgentSubsystem
-	Addresses                    []netip.Prefix
 	PrometheusRegistry           *prometheus.Registry
 	ReportMetadataInterval       time.Duration
 	ServiceBannerRefreshInterval time.Duration
-	Syscaller                    agentproc.Syscaller
-	// ModifiedProcesses is used for testing process priority management.
-	ModifiedProcesses chan []*agentproc.Process
-	// ProcessManagementTick is used for testing process priority management.
-	ProcessManagementTick <-chan time.Time
+	BlockFileTransfer            bool
+	Execer                       agentexec.Execer
 }
 
 type Client interface {
-	ConnectRPC(ctx context.Context) (drpc.Conn, error)
+	ConnectRPC23(ctx context.Context) (
+		proto.DRPCAgentClient23, tailnetproto.DRPCTailnetClient23, error,
+	)
 	RewriteDERPMap(derpMap *tailcfg.DERPMap)
 }
 
@@ -145,52 +141,50 @@ func New(options Options) Agent {
 		prometheusRegistry = prometheus.NewRegistry()
 	}
 
-	if options.Syscaller == nil {
-		options.Syscaller = agentproc.NewSyscaller()
+	if options.Execer == nil {
+		options.Execer = agentexec.DefaultExecer
 	}
 
 	hardCtx, hardCancel := context.WithCancel(context.Background())
 	gracefulCtx, gracefulCancel := context.WithCancel(hardCtx)
 	a := &agent{
-		tailnetListenPort:            options.TailnetListenPort,
-		reconnectingPTYTimeout:       options.ReconnectingPTYTimeout,
-		logger:                       options.Logger,
-		gracefulCtx:                  gracefulCtx,
-		gracefulCancel:               gracefulCancel,
-		hardCtx:                      hardCtx,
-		hardCancel:                   hardCancel,
-		coordDisconnected:            make(chan struct{}),
-		environmentVariables:         options.EnvironmentVariables,
-		client:                       options.Client,
-		exchangeToken:                options.ExchangeToken,
-		filesystem:                   options.Filesystem,
-		logDir:                       options.LogDir,
-		tempDir:                      options.TempDir,
-		scriptDataDir:                options.ScriptDataDir,
-		lifecycleUpdate:              make(chan struct{}, 1),
-		lifecycleReported:            make(chan codersdk.WorkspaceAgentLifecycle, 1),
-		lifecycleStates:              []agentsdk.PostLifecycleRequest{{State: codersdk.WorkspaceAgentLifecycleCreated}},
-		ignorePorts:                  options.IgnorePorts,
-		portCacheDuration:            options.PortCacheDuration,
-		reportMetadataInterval:       options.ReportMetadataInterval,
-		serviceBannerRefreshInterval: options.ServiceBannerRefreshInterval,
-		sshMaxTimeout:                options.SSHMaxTimeout,
-		subsystems:                   options.Subsystems,
-		addresses:                    options.Addresses,
-		syscaller:                    options.Syscaller,
-		modifiedProcs:                options.ModifiedProcesses,
-		processManagementTick:        options.ProcessManagementTick,
-		logSender:                    agentsdk.NewLogSender(options.Logger),
+		tailnetListenPort:                  options.TailnetListenPort,
+		reconnectingPTYTimeout:             options.ReconnectingPTYTimeout,
+		logger:                             options.Logger,
+		gracefulCtx:                        gracefulCtx,
+		gracefulCancel:                     gracefulCancel,
+		hardCtx:                            hardCtx,
+		hardCancel:                         hardCancel,
+		coordDisconnected:                  make(chan struct{}),
+		environmentVariables:               options.EnvironmentVariables,
+		client:                             options.Client,
+		exchangeToken:                      options.ExchangeToken,
+		filesystem:                         options.Filesystem,
+		logDir:                             options.LogDir,
+		tempDir:                            options.TempDir,
+		scriptDataDir:                      options.ScriptDataDir,
+		lifecycleUpdate:                    make(chan struct{}, 1),
+		lifecycleReported:                  make(chan codersdk.WorkspaceAgentLifecycle, 1),
+		lifecycleStates:                    []agentsdk.PostLifecycleRequest{{State: codersdk.WorkspaceAgentLifecycleCreated}},
+		ignorePorts:                        options.IgnorePorts,
+		portCacheDuration:                  options.PortCacheDuration,
+		reportMetadataInterval:             options.ReportMetadataInterval,
+		announcementBannersRefreshInterval: options.ServiceBannerRefreshInterval,
+		sshMaxTimeout:                      options.SSHMaxTimeout,
+		subsystems:                         options.Subsystems,
+		logSender:                          agentsdk.NewLogSender(options.Logger),
+		blockFileTransfer:                  options.BlockFileTransfer,
 
 		prometheusRegistry: prometheusRegistry,
 		metrics:            newAgentMetrics(prometheusRegistry),
+		execer:             options.Execer,
 	}
 	// Initially, we have a closed channel, reflecting the fact that we are not initially connected.
 	// Each time we connect we replace the channel (while holding the closeMutex) with a new one
 	// that gets closed on disconnection.  This is used to wait for graceful disconnection from the
 	// coordinator during shut down.
 	close(a.coordDisconnected)
-	a.serviceBanner.Store(new(codersdk.ServiceBannerConfig))
+	a.announcementBanners.Store(new([]codersdk.BannerConfig))
 	a.sessionToken.Store(new(string))
 	a.init()
 	return a
@@ -212,8 +206,8 @@ type agent struct {
 	portCacheDuration time.Duration
 	subsystems        []codersdk.AgentSubsystem
 
-	reconnectingPTYs       sync.Map
 	reconnectingPTYTimeout time.Duration
+	reconnectingPTYServer  *reconnectingpty.Server
 
 	// we track 2 contexts and associated cancel functions: "graceful" which is Done when it is time
 	// to start gracefully shutting down and "hard" which is Done when it is time to close
@@ -228,37 +222,31 @@ type agent struct {
 
 	environmentVariables map[string]string
 
-	manifest                     atomic.Pointer[agentsdk.Manifest] // manifest is atomic because values can change after reconnection.
-	reportMetadataInterval       time.Duration
-	scriptRunner                 *agentscripts.Runner
-	serviceBanner                atomic.Pointer[codersdk.ServiceBannerConfig] // serviceBanner is atomic because it is periodically updated.
-	serviceBannerRefreshInterval time.Duration
-	sessionToken                 atomic.Pointer[string]
-	sshServer                    *agentssh.Server
-	sshMaxTimeout                time.Duration
+	manifest                           atomic.Pointer[agentsdk.Manifest] // manifest is atomic because values can change after reconnection.
+	reportMetadataInterval             time.Duration
+	scriptRunner                       *agentscripts.Runner
+	announcementBanners                atomic.Pointer[[]codersdk.BannerConfig] // announcementBanners is atomic because it is periodically updated.
+	announcementBannersRefreshInterval time.Duration
+	sessionToken                       atomic.Pointer[string]
+	sshServer                          *agentssh.Server
+	sshMaxTimeout                      time.Duration
+	blockFileTransfer                  bool
 
-	lifecycleUpdate   chan struct{}
-	lifecycleReported chan codersdk.WorkspaceAgentLifecycle
-	lifecycleMu       sync.RWMutex // Protects following.
-	lifecycleStates   []agentsdk.PostLifecycleRequest
+	lifecycleUpdate            chan struct{}
+	lifecycleReported          chan codersdk.WorkspaceAgentLifecycle
+	lifecycleMu                sync.RWMutex // Protects following.
+	lifecycleStates            []agentsdk.PostLifecycleRequest
+	lifecycleLastReportedIndex int // Keeps track of the last lifecycle state we successfully reported.
 
 	network       *tailnet.Conn
-	addresses     []netip.Prefix
 	statsReporter *statsReporter
 	logSender     *agentsdk.LogSender
-
-	connCountReconnectingPTY atomic.Int64
 
 	prometheusRegistry *prometheus.Registry
 	// metrics are prometheus registered metrics that will be collected and
 	// labeled in Coder with the agent + workspace.
-	metrics   *agentMetrics
-	syscaller agentproc.Syscaller
-
-	// modifiedProcs is used for testing process priority management.
-	modifiedProcs chan []*agentproc.Process
-	// processManagementTick is used for testing process priority management.
-	processManagementTick <-chan time.Time
+	metrics *agentMetrics
+	execer  agentexec.Execer
 }
 
 func (a *agent) TailnetConn() *tailnet.Conn {
@@ -267,12 +255,13 @@ func (a *agent) TailnetConn() *tailnet.Conn {
 
 func (a *agent) init() {
 	// pass the "hard" context because we explicitly close the SSH server as part of graceful shutdown.
-	sshSrv, err := agentssh.NewServer(a.hardCtx, a.logger.Named("ssh-server"), a.prometheusRegistry, a.filesystem, &agentssh.Config{
-		MaxTimeout:       a.sshMaxTimeout,
-		MOTDFile:         func() string { return a.manifest.Load().MOTDFile },
-		ServiceBanner:    func() *codersdk.ServiceBannerConfig { return a.serviceBanner.Load() },
-		UpdateEnv:        a.updateCommandEnv,
-		WorkingDirectory: func() string { return a.manifest.Load().Directory },
+	sshSrv, err := agentssh.NewServer(a.hardCtx, a.logger.Named("ssh-server"), a.prometheusRegistry, a.filesystem, a.execer, &agentssh.Config{
+		MaxTimeout:          a.sshMaxTimeout,
+		MOTDFile:            func() string { return a.manifest.Load().MOTDFile },
+		AnnouncementBanners: func() *[]codersdk.BannerConfig { return a.announcementBanners.Load() },
+		UpdateEnv:           a.updateCommandEnv,
+		WorkingDirectory:    func() string { return a.manifest.Load().Directory },
+		BlockFileTransfer:   a.blockFileTransfer,
 	})
 	if err != nil {
 		panic(err)
@@ -291,6 +280,13 @@ func (a *agent) init() {
 	// Register runner metrics. If the prom registry is nil, the metrics
 	// will not report anywhere.
 	a.scriptRunner.RegisterMetrics(a.prometheusRegistry)
+
+	a.reconnectingPTYServer = reconnectingpty.NewServer(
+		a.logger.Named("reconnecting-pty"),
+		a.sshServer,
+		a.metrics.connectionsTotal, a.metrics.reconnectingPTYErrors,
+		a.reconnectingPTYTimeout,
+	)
 	go a.runLoop()
 }
 
@@ -299,8 +295,6 @@ func (a *agent) init() {
 // may be happening, but regardless after the intermittent
 // failure, you'll want the agent to reconnect.
 func (a *agent) runLoop() {
-	go a.manageProcessPriorityUntilGracefulShutdown()
-
 	// need to keep retrying up to the hardCtx so that we can send graceful shutdown-related
 	// messages.
 	ctx := a.hardCtx
@@ -405,7 +399,7 @@ func (t *trySingleflight) Do(key string, fn func()) {
 	fn()
 }
 
-func (a *agent) reportMetadata(ctx context.Context, conn drpc.Conn) error {
+func (a *agent) reportMetadata(ctx context.Context, aAPI proto.DRPCAgentClient23) error {
 	tickerDone := make(chan struct{})
 	collectDone := make(chan struct{})
 	ctx, cancel := context.WithCancel(ctx)
@@ -567,7 +561,6 @@ func (a *agent) reportMetadata(ctx context.Context, conn drpc.Conn) error {
 		reportTimeout   = 30 * time.Second
 		reportError     = make(chan error, 1)
 		reportInFlight  = false
-		aAPI            = proto.NewDRPCAgentClient(conn)
 	)
 
 	for {
@@ -580,10 +573,12 @@ func (a *agent) reportMetadata(ctx context.Context, conn drpc.Conn) error {
 			updatedMetadata[mr.key] = mr.result
 			continue
 		case err := <-reportError:
-			a.logger.Debug(ctx, "batch update metadata complete", slog.Error(err))
+			logMsg := "batch update metadata complete"
 			if err != nil {
+				a.logger.Debug(ctx, logMsg, slog.Error(err))
 				return xerrors.Errorf("failed to report metadata: %w", err)
 			}
+			a.logger.Debug(ctx, logMsg)
 			reportInFlight = false
 		case <-report:
 			if len(updatedMetadata) == 0 {
@@ -620,9 +615,7 @@ func (a *agent) reportMetadata(ctx context.Context, conn drpc.Conn) error {
 
 // reportLifecycle reports the current lifecycle state once. All state
 // changes are reported in order.
-func (a *agent) reportLifecycle(ctx context.Context, conn drpc.Conn) error {
-	aAPI := proto.NewDRPCAgentClient(conn)
-	lastReportedIndex := 0 // Start off with the created state without reporting it.
+func (a *agent) reportLifecycle(ctx context.Context, aAPI proto.DRPCAgentClient23) error {
 	for {
 		select {
 		case <-a.lifecycleUpdate:
@@ -633,20 +626,20 @@ func (a *agent) reportLifecycle(ctx context.Context, conn drpc.Conn) error {
 		for {
 			a.lifecycleMu.RLock()
 			lastIndex := len(a.lifecycleStates) - 1
-			report := a.lifecycleStates[lastReportedIndex]
-			if len(a.lifecycleStates) > lastReportedIndex+1 {
-				report = a.lifecycleStates[lastReportedIndex+1]
+			report := a.lifecycleStates[a.lifecycleLastReportedIndex]
+			if len(a.lifecycleStates) > a.lifecycleLastReportedIndex+1 {
+				report = a.lifecycleStates[a.lifecycleLastReportedIndex+1]
 			}
 			a.lifecycleMu.RUnlock()
 
-			if lastIndex == lastReportedIndex {
+			if lastIndex == a.lifecycleLastReportedIndex {
 				break
 			}
 			l, err := agentsdk.ProtoFromLifecycle(report)
 			if err != nil {
 				a.logger.Critical(ctx, "failed to convert lifecycle state", slog.F("report", report))
 				// Skip this report; there is no point retrying.  Maybe we can successfully convert the next one?
-				lastReportedIndex++
+				a.lifecycleLastReportedIndex++
 				continue
 			}
 			payload := &proto.UpdateLifecycleRequest{Lifecycle: l}
@@ -659,13 +652,13 @@ func (a *agent) reportLifecycle(ctx context.Context, conn drpc.Conn) error {
 			}
 
 			logger.Debug(ctx, "successfully reported lifecycle state")
-			lastReportedIndex++
+			a.lifecycleLastReportedIndex++
 			select {
 			case a.lifecycleReported <- report.State:
 			case <-a.lifecycleReported:
 				a.lifecycleReported <- report.State
 			}
-			if lastReportedIndex < lastIndex {
+			if a.lifecycleLastReportedIndex < lastIndex {
 				// Keep reporting until we've sent all messages, we can't
 				// rely on the channel triggering us before the backlog is
 				// consumed.
@@ -704,31 +697,33 @@ func (a *agent) setLifecycle(state codersdk.WorkspaceAgentLifecycle) {
 // fetchServiceBannerLoop fetches the service banner on an interval.  It will
 // not be fetched immediately; the expectation is that it is primed elsewhere
 // (and must be done before the session actually starts).
-func (a *agent) fetchServiceBannerLoop(ctx context.Context, conn drpc.Conn) error {
-	aAPI := proto.NewDRPCAgentClient(conn)
-	ticker := time.NewTicker(a.serviceBannerRefreshInterval)
+func (a *agent) fetchServiceBannerLoop(ctx context.Context, aAPI proto.DRPCAgentClient23) error {
+	ticker := time.NewTicker(a.announcementBannersRefreshInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			sbp, err := aAPI.GetServiceBanner(ctx, &proto.GetServiceBannerRequest{})
+			bannersProto, err := aAPI.GetAnnouncementBanners(ctx, &proto.GetAnnouncementBannersRequest{})
 			if err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				a.logger.Error(ctx, "failed to update service banner", slog.Error(err))
+				a.logger.Error(ctx, "failed to update notification banners", slog.Error(err))
 				return err
 			}
-			serviceBanner := agentsdk.ServiceBannerFromProto(sbp)
-			a.serviceBanner.Store(&serviceBanner)
+			banners := make([]codersdk.BannerConfig, 0, len(bannersProto.AnnouncementBanners))
+			for _, bannerProto := range bannersProto.AnnouncementBanners {
+				banners = append(banners, agentsdk.BannerConfigFromProto(bannerProto))
+			}
+			a.announcementBanners.Store(&banners)
 		}
 	}
 }
 
 func (a *agent) run() (retErr error) {
-	// This allows the agent to refresh it's token if necessary.
+	// This allows the agent to refresh its token if necessary.
 	// For instance identity this is required, since the instance
 	// may not have re-provisioned, but a new agent ID was created.
 	sessionToken, err := a.exchangeToken(a.hardCtx)
@@ -738,12 +733,12 @@ func (a *agent) run() (retErr error) {
 	a.sessionToken.Store(&sessionToken)
 
 	// ConnectRPC returns the dRPC connection we use for the Agent and Tailnet v2+ APIs
-	conn, err := a.client.ConnectRPC(a.hardCtx)
+	aAPI, tAPI, err := a.client.ConnectRPC23(a.hardCtx)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		cErr := conn.Close()
+		cErr := aAPI.DRPCConn().Close()
 		if cErr != nil {
 			a.logger.Debug(a.hardCtx, "error closing drpc connection", slog.Error(err))
 		}
@@ -752,26 +747,28 @@ func (a *agent) run() (retErr error) {
 	// A lot of routines need the agent API / tailnet API connection.  We run them in their own
 	// goroutines in parallel, but errors in any routine will cause them all to exit so we can
 	// redial the coder server and retry.
-	connMan := newAPIConnRoutineManager(a.gracefulCtx, a.hardCtx, a.logger, conn)
+	connMan := newAPIConnRoutineManager(a.gracefulCtx, a.hardCtx, a.logger, aAPI, tAPI)
 
-	connMan.start("init service banner", gracefulShutdownBehaviorStop,
-		func(ctx context.Context, conn drpc.Conn) error {
-			aAPI := proto.NewDRPCAgentClient(conn)
-			sbp, err := aAPI.GetServiceBanner(ctx, &proto.GetServiceBannerRequest{})
+	connMan.startAgentAPI("init notification banners", gracefulShutdownBehaviorStop,
+		func(ctx context.Context, aAPI proto.DRPCAgentClient23) error {
+			bannersProto, err := aAPI.GetAnnouncementBanners(ctx, &proto.GetAnnouncementBannersRequest{})
 			if err != nil {
 				return xerrors.Errorf("fetch service banner: %w", err)
 			}
-			serviceBanner := agentsdk.ServiceBannerFromProto(sbp)
-			a.serviceBanner.Store(&serviceBanner)
+			banners := make([]codersdk.BannerConfig, 0, len(bannersProto.AnnouncementBanners))
+			for _, bannerProto := range bannersProto.AnnouncementBanners {
+				banners = append(banners, agentsdk.BannerConfigFromProto(bannerProto))
+			}
+			a.announcementBanners.Store(&banners)
 			return nil
 		},
 	)
 
 	// sending logs gets gracefulShutdownBehaviorRemain because we want to send logs generated by
 	// shutdown scripts.
-	connMan.start("send logs", gracefulShutdownBehaviorRemain,
-		func(ctx context.Context, conn drpc.Conn) error {
-			err := a.logSender.SendLoop(ctx, proto.NewDRPCAgentClient(conn))
+	connMan.startAgentAPI("send logs", gracefulShutdownBehaviorRemain,
+		func(ctx context.Context, aAPI proto.DRPCAgentClient23) error {
+			err := a.logSender.SendLoop(ctx, aAPI)
 			if xerrors.Is(err, agentsdk.LogLimitExceededError) {
 				// we don't want this error to tear down the API connection and propagate to the
 				// other routines that use the API.  The LogSender has already dropped a warning
@@ -783,10 +780,10 @@ func (a *agent) run() (retErr error) {
 
 	// part of graceful shut down is reporting the final lifecycle states, e.g "ShuttingDown" so the
 	// lifecycle reporting has to be via gracefulShutdownBehaviorRemain
-	connMan.start("report lifecycle", gracefulShutdownBehaviorRemain, a.reportLifecycle)
+	connMan.startAgentAPI("report lifecycle", gracefulShutdownBehaviorRemain, a.reportLifecycle)
 
 	// metadata reporting can cease as soon as we start gracefully shutting down
-	connMan.start("report metadata", gracefulShutdownBehaviorStop, a.reportMetadata)
+	connMan.startAgentAPI("report metadata", gracefulShutdownBehaviorStop, a.reportMetadata)
 
 	// channels to sync goroutines below
 	//  handle manifest
@@ -804,67 +801,67 @@ func (a *agent) run() (retErr error) {
 	//     coordination <--------------------------+
 	//        derp map subscriber <----------------+
 	//           stats report loop <---------------+
-	networkOK := make(chan struct{})
-	manifestOK := make(chan struct{})
+	networkOK := newCheckpoint(a.logger)
+	manifestOK := newCheckpoint(a.logger)
 
-	connMan.start("handle manifest", gracefulShutdownBehaviorStop, a.handleManifest(manifestOK))
+	connMan.startAgentAPI("handle manifest", gracefulShutdownBehaviorStop, a.handleManifest(manifestOK))
 
-	connMan.start("app health reporter", gracefulShutdownBehaviorStop,
-		func(ctx context.Context, conn drpc.Conn) error {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-manifestOK:
-				manifest := a.manifest.Load()
-				NewWorkspaceAppHealthReporter(
-					a.logger, manifest.Apps, agentsdk.AppHealthPoster(proto.NewDRPCAgentClient(conn)),
-				)(ctx)
-				return nil
+	connMan.startAgentAPI("app health reporter", gracefulShutdownBehaviorStop,
+		func(ctx context.Context, aAPI proto.DRPCAgentClient23) error {
+			if err := manifestOK.wait(ctx); err != nil {
+				return xerrors.Errorf("no manifest: %w", err)
 			}
+			manifest := a.manifest.Load()
+			NewWorkspaceAppHealthReporter(
+				a.logger, manifest.Apps, agentsdk.AppHealthPoster(aAPI),
+			)(ctx)
+			return nil
 		})
 
-	connMan.start("create or update network", gracefulShutdownBehaviorStop,
+	connMan.startAgentAPI("create or update network", gracefulShutdownBehaviorStop,
 		a.createOrUpdateNetwork(manifestOK, networkOK))
 
-	connMan.start("coordination", gracefulShutdownBehaviorStop,
-		func(ctx context.Context, conn drpc.Conn) error {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-networkOK:
+	connMan.startTailnetAPI("coordination", gracefulShutdownBehaviorStop,
+		func(ctx context.Context, tAPI tailnetproto.DRPCTailnetClient23) error {
+			if err := networkOK.wait(ctx); err != nil {
+				return xerrors.Errorf("no network: %w", err)
 			}
-			return a.runCoordinator(ctx, conn, a.network)
+			return a.runCoordinator(ctx, tAPI, a.network)
 		},
 	)
 
-	connMan.start("derp map subscriber", gracefulShutdownBehaviorStop,
-		func(ctx context.Context, conn drpc.Conn) error {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-networkOK:
+	connMan.startTailnetAPI("derp map subscriber", gracefulShutdownBehaviorStop,
+		func(ctx context.Context, tAPI tailnetproto.DRPCTailnetClient23) error {
+			if err := networkOK.wait(ctx); err != nil {
+				return xerrors.Errorf("no network: %w", err)
 			}
-			return a.runDERPMapSubscriber(ctx, conn, a.network)
+			return a.runDERPMapSubscriber(ctx, tAPI, a.network)
 		})
 
-	connMan.start("fetch service banner loop", gracefulShutdownBehaviorStop, a.fetchServiceBannerLoop)
+	connMan.startAgentAPI("fetch service banner loop", gracefulShutdownBehaviorStop, a.fetchServiceBannerLoop)
 
-	connMan.start("stats report loop", gracefulShutdownBehaviorStop, func(ctx context.Context, conn drpc.Conn) error {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-networkOK:
+	connMan.startAgentAPI("stats report loop", gracefulShutdownBehaviorStop, func(ctx context.Context, aAPI proto.DRPCAgentClient23) error {
+		if err := networkOK.wait(ctx); err != nil {
+			return xerrors.Errorf("no network: %w", err)
 		}
-		return a.statsReporter.reportLoop(ctx, proto.NewDRPCAgentClient(conn))
+		return a.statsReporter.reportLoop(ctx, aAPI)
 	})
 
 	return connMan.wait()
 }
 
 // handleManifest returns a function that fetches and processes the manifest
-func (a *agent) handleManifest(manifestOK chan<- struct{}) func(ctx context.Context, conn drpc.Conn) error {
-	return func(ctx context.Context, conn drpc.Conn) error {
-		aAPI := proto.NewDRPCAgentClient(conn)
+func (a *agent) handleManifest(manifestOK *checkpoint) func(ctx context.Context, aAPI proto.DRPCAgentClient23) error {
+	return func(ctx context.Context, aAPI proto.DRPCAgentClient23) error {
+		var (
+			sentResult = false
+			err        error
+		)
+		defer func() {
+			if !sentResult {
+				manifestOK.complete(err)
+			}
+		}()
 		mp, err := aAPI.GetManifest(ctx, &proto.GetManifestRequest{})
 		if err != nil {
 			return xerrors.Errorf("fetch metadata: %w", err)
@@ -900,14 +897,12 @@ func (a *agent) handleManifest(manifestOK chan<- struct{}) func(ctx context.Cont
 			Subsystems:        subsys,
 		}})
 		if err != nil {
-			if xerrors.Is(err, context.Canceled) {
-				return nil
-			}
 			return xerrors.Errorf("update workspace agent startup: %w", err)
 		}
 
 		oldManifest := a.manifest.Swap(&manifest)
-		close(manifestOK)
+		manifestOK.complete(nil)
+		sentResult = true
 
 		// The startup script should only execute on the first run!
 		if oldManifest == nil {
@@ -927,7 +922,7 @@ func (a *agent) handleManifest(manifestOK chan<- struct{}) func(ctx context.Cont
 				}
 			}
 
-			err = a.scriptRunner.Init(manifest.Scripts)
+			err = a.scriptRunner.Init(manifest.Scripts, aAPI.ScriptCompleted)
 			if err != nil {
 				return xerrors.Errorf("init script runner: %w", err)
 			}
@@ -935,9 +930,7 @@ func (a *agent) handleManifest(manifestOK chan<- struct{}) func(ctx context.Cont
 				start := time.Now()
 				// here we use the graceful context because the script runner is not directly tied
 				// to the agent API.
-				err := a.scriptRunner.Execute(a.gracefulCtx, func(script codersdk.WorkspaceAgentScript) bool {
-					return script.RunOnStart
-				})
+				err := a.scriptRunner.Execute(a.gracefulCtx, agentscripts.ExecuteStartScripts)
 				// Measure the time immediately after the script has finished
 				dur := time.Since(start).Seconds()
 				if err != nil {
@@ -968,14 +961,15 @@ func (a *agent) handleManifest(manifestOK chan<- struct{}) func(ctx context.Cont
 
 // createOrUpdateNetwork waits for the manifest to be set using manifestOK, then creates or updates
 // the tailnet using the information in the manifest
-func (a *agent) createOrUpdateNetwork(manifestOK <-chan struct{}, networkOK chan<- struct{}) func(context.Context, drpc.Conn) error {
-	return func(ctx context.Context, _ drpc.Conn) error {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-manifestOK:
+func (a *agent) createOrUpdateNetwork(manifestOK, networkOK *checkpoint) func(context.Context, proto.DRPCAgentClient23) error {
+	return func(ctx context.Context, _ proto.DRPCAgentClient23) (retErr error) {
+		if err := manifestOK.wait(ctx); err != nil {
+			return xerrors.Errorf("no manifest: %w", err)
 		}
 		var err error
+		defer func() {
+			networkOK.complete(retErr)
+		}()
 		manifest := a.manifest.Load()
 		a.closeMutex.Lock()
 		network := a.network
@@ -1011,7 +1005,6 @@ func (a *agent) createOrUpdateNetwork(manifestOK <-chan struct{}, networkOK chan
 			network.SetDERPForceWebSockets(manifest.DERPForceWebSockets)
 			network.SetBlockEndpoints(manifest.DisableDirectConnections)
 		}
-		close(networkOK)
 		return nil
 	}
 }
@@ -1100,18 +1093,14 @@ func (a *agent) updateCommandEnv(current []string) (updated []string, err error)
 	return updated, nil
 }
 
-func (a *agent) wireguardAddresses(agentID uuid.UUID) []netip.Prefix {
-	if len(a.addresses) == 0 {
-		return []netip.Prefix{
-			// This is the IP that should be used primarily.
-			netip.PrefixFrom(tailnet.IPFromUUID(agentID), 128),
-			// We also listen on the legacy codersdk.WorkspaceAgentIP. This
-			// allows for a transition away from wsconncache.
-			netip.PrefixFrom(codersdk.WorkspaceAgentIP, 128),
-		}
+func (*agent) wireguardAddresses(agentID uuid.UUID) []netip.Prefix {
+	return []netip.Prefix{
+		// This is the IP that should be used primarily.
+		tailnet.TailscaleServicePrefix.PrefixFromUUID(agentID),
+		// We'll need this address for CoderVPN, but aren't using it from clients until that feature
+		// is ready
+		tailnet.CoderServicePrefix.PrefixFromUUID(agentID),
 	}
-
-	return a.addresses
 }
 
 func (a *agent) trackGoroutine(fn func()) error {
@@ -1129,11 +1118,19 @@ func (a *agent) trackGoroutine(fn func()) error {
 }
 
 func (a *agent) createTailnet(ctx context.Context, agentID uuid.UUID, derpMap *tailcfg.DERPMap, derpForceWebSockets, disableDirectConnections bool) (_ *tailnet.Conn, err error) {
+	// Inject `CODER_AGENT_HEADER` into the DERP header.
+	var header http.Header
+	if client, ok := a.client.(*agentsdk.Client); ok {
+		if headerTransport, ok := client.SDK.HTTPClient.Transport.(*codersdk.HeaderTransport); ok {
+			header = headerTransport.Header
+		}
+	}
 	network, err := tailnet.NewConn(&tailnet.Options{
 		ID:                  agentID,
 		Addresses:           a.wireguardAddresses(agentID),
 		DERPMap:             derpMap,
 		DERPForceWebSockets: derpForceWebSockets,
+		DERPHeader:          &header,
 		Logger:              a.logger.Named("net.tailnet"),
 		ListenPort:          a.tailnetListenPort,
 		BlockEndpoints:      disableDirectConnections,
@@ -1147,7 +1144,7 @@ func (a *agent) createTailnet(ctx context.Context, agentID uuid.UUID, derpMap *t
 		}
 	}()
 
-	sshListener, err := network.Listen("tcp", ":"+strconv.Itoa(codersdk.WorkspaceAgentSSHPort))
+	sshListener, err := network.Listen("tcp", ":"+strconv.Itoa(workspacesdk.AgentSSHPort))
 	if err != nil {
 		return nil, xerrors.Errorf("listen on the ssh port: %w", err)
 	}
@@ -1162,7 +1159,7 @@ func (a *agent) createTailnet(ctx context.Context, agentID uuid.UUID, derpMap *t
 		return nil, err
 	}
 
-	reconnectingPTYListener, err := network.Listen("tcp", ":"+strconv.Itoa(codersdk.WorkspaceAgentReconnectingPTYPort))
+	reconnectingPTYListener, err := network.Listen("tcp", ":"+strconv.Itoa(workspacesdk.AgentReconnectingPTYPort))
 	if err != nil {
 		return nil, xerrors.Errorf("listen for reconnecting pty: %w", err)
 	}
@@ -1172,60 +1169,17 @@ func (a *agent) createTailnet(ctx context.Context, agentID uuid.UUID, derpMap *t
 		}
 	}()
 	if err = a.trackGoroutine(func() {
-		logger := a.logger.Named("reconnecting-pty")
-		var wg sync.WaitGroup
-		for {
-			conn, err := reconnectingPTYListener.Accept()
-			if err != nil {
-				if !a.isClosed() {
-					logger.Debug(ctx, "accept pty failed", slog.Error(err))
-				}
-				break
-			}
-			clog := logger.With(
-				slog.F("remote", conn.RemoteAddr().String()),
-				slog.F("local", conn.LocalAddr().String()))
-			clog.Info(ctx, "accepted conn")
-			wg.Add(1)
-			closed := make(chan struct{})
-			go func() {
-				select {
-				case <-closed:
-				case <-a.hardCtx.Done():
-					_ = conn.Close()
-				}
-				wg.Done()
-			}()
-			go func() {
-				defer close(closed)
-				// This cannot use a JSON decoder, since that can
-				// buffer additional data that is required for the PTY.
-				rawLen := make([]byte, 2)
-				_, err = conn.Read(rawLen)
-				if err != nil {
-					return
-				}
-				length := binary.LittleEndian.Uint16(rawLen)
-				data := make([]byte, length)
-				_, err = conn.Read(data)
-				if err != nil {
-					return
-				}
-				var msg codersdk.WorkspaceAgentReconnectingPTYInit
-				err = json.Unmarshal(data, &msg)
-				if err != nil {
-					logger.Warn(ctx, "failed to unmarshal init", slog.F("raw", data))
-					return
-				}
-				_ = a.handleReconnectingPTY(ctx, clog, msg, conn)
-			}()
+		rPTYServeErr := a.reconnectingPTYServer.Serve(a.gracefulCtx, a.hardCtx, reconnectingPTYListener)
+		if rPTYServeErr != nil &&
+			a.gracefulCtx.Err() == nil &&
+			!strings.Contains(rPTYServeErr.Error(), "use of closed network connection") {
+			a.logger.Error(ctx, "error serving reconnecting PTY", slog.Error(err))
 		}
-		wg.Wait()
 	}); err != nil {
 		return nil, err
 	}
 
-	speedtestListener, err := network.Listen("tcp", ":"+strconv.Itoa(codersdk.WorkspaceAgentSpeedtestPort))
+	speedtestListener, err := network.Listen("tcp", ":"+strconv.Itoa(workspacesdk.AgentSpeedtestPort))
 	if err != nil {
 		return nil, xerrors.Errorf("listen for speedtest: %w", err)
 	}
@@ -1273,7 +1227,7 @@ func (a *agent) createTailnet(ctx context.Context, agentID uuid.UUID, derpMap *t
 		return nil, err
 	}
 
-	apiListener, err := network.Listen("tcp", ":"+strconv.Itoa(codersdk.WorkspaceAgentHTTPAPIServerPort))
+	apiListener, err := network.Listen("tcp", ":"+strconv.Itoa(workspacesdk.AgentHTTPAPIServerPort))
 	if err != nil {
 		return nil, xerrors.Errorf("api listener: %w", err)
 	}
@@ -1299,9 +1253,9 @@ func (a *agent) createTailnet(ctx context.Context, agentID uuid.UUID, derpMap *t
 			_ = server.Close()
 		}()
 
-		err := server.Serve(apiListener)
-		if err != nil && !xerrors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
-			a.logger.Critical(ctx, "serve HTTP API server", slog.Error(err))
+		apiServErr := server.Serve(apiListener)
+		if apiServErr != nil && !xerrors.Is(apiServErr, http.ErrServerClosed) && !strings.Contains(apiServErr.Error(), "use of closed network connection") {
+			a.logger.Critical(ctx, "serve HTTP API server", slog.Error(apiServErr))
 		}
 	}); err != nil {
 		return nil, err
@@ -1312,9 +1266,8 @@ func (a *agent) createTailnet(ctx context.Context, agentID uuid.UUID, derpMap *t
 
 // runCoordinator runs a coordinator and returns whether a reconnect
 // should occur.
-func (a *agent) runCoordinator(ctx context.Context, conn drpc.Conn, network *tailnet.Conn) error {
+func (a *agent) runCoordinator(ctx context.Context, tClient tailnetproto.DRPCTailnetClient23, network *tailnet.Conn) error {
 	defer a.logger.Debug(ctx, "disconnected from coordination RPC")
-	tClient := tailnetproto.NewDRPCTailnetClient(conn)
 	// we run the RPC on the hardCtx so that we have a chance to send the disconnect message if we
 	// gracefully shut down.
 	coordinate, err := tClient.Coordinate(a.hardCtx)
@@ -1339,19 +1292,20 @@ func (a *agent) runCoordinator(ctx context.Context, conn drpc.Conn, network *tai
 	defer close(disconnected)
 	a.closeMutex.Unlock()
 
-	coordination := tailnet.NewRemoteCoordination(a.logger, coordinate, network, uuid.Nil)
+	ctrl := tailnet.NewAgentCoordinationController(a.logger, network)
+	coordination := ctrl.New(coordinate)
 
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(errCh)
 		select {
 		case <-ctx.Done():
-			err := coordination.Close()
+			err := coordination.Close(a.hardCtx)
 			if err != nil {
 				a.logger.Warn(ctx, "failed to close remote coordination", slog.Error(err))
 			}
 			return
-		case err := <-coordination.Error():
+		case err := <-coordination.Wait():
 			errCh <- err
 		}
 	}()
@@ -1359,11 +1313,10 @@ func (a *agent) runCoordinator(ctx context.Context, conn drpc.Conn, network *tai
 }
 
 // runDERPMapSubscriber runs a coordinator and returns if a reconnect should occur.
-func (a *agent) runDERPMapSubscriber(ctx context.Context, conn drpc.Conn, network *tailnet.Conn) error {
+func (a *agent) runDERPMapSubscriber(ctx context.Context, tClient tailnetproto.DRPCTailnetClient23, network *tailnet.Conn) error {
 	defer a.logger.Debug(ctx, "disconnected from derp map RPC")
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	tClient := tailnetproto.NewDRPCTailnetClient(conn)
 	stream, err := tClient.StreamDERPMaps(ctx, &tailnetproto.StreamDERPMapsRequest{})
 	if err != nil {
 		return xerrors.Errorf("stream DERP Maps: %w", err)
@@ -1384,87 +1337,6 @@ func (a *agent) runDERPMapSubscriber(ctx context.Context, conn drpc.Conn, networ
 		a.client.RewriteDERPMap(dm)
 		network.SetDERPMap(dm)
 	}
-}
-
-func (a *agent) handleReconnectingPTY(ctx context.Context, logger slog.Logger, msg codersdk.WorkspaceAgentReconnectingPTYInit, conn net.Conn) (retErr error) {
-	defer conn.Close()
-	a.metrics.connectionsTotal.Add(1)
-
-	a.connCountReconnectingPTY.Add(1)
-	defer a.connCountReconnectingPTY.Add(-1)
-
-	connectionID := uuid.NewString()
-	connLogger := logger.With(slog.F("message_id", msg.ID), slog.F("connection_id", connectionID))
-	connLogger.Debug(ctx, "starting handler")
-
-	defer func() {
-		if err := retErr; err != nil {
-			a.closeMutex.Lock()
-			closed := a.isClosed()
-			a.closeMutex.Unlock()
-
-			// If the agent is closed, we don't want to
-			// log this as an error since it's expected.
-			if closed {
-				connLogger.Info(ctx, "reconnecting pty failed with attach error (agent closed)", slog.Error(err))
-			} else {
-				connLogger.Error(ctx, "reconnecting pty failed with attach error", slog.Error(err))
-			}
-		}
-		connLogger.Info(ctx, "reconnecting pty connection closed")
-	}()
-
-	var rpty reconnectingpty.ReconnectingPTY
-	sendConnected := make(chan reconnectingpty.ReconnectingPTY, 1)
-	// On store, reserve this ID to prevent multiple concurrent new connections.
-	waitReady, ok := a.reconnectingPTYs.LoadOrStore(msg.ID, sendConnected)
-	if ok {
-		close(sendConnected) // Unused.
-		connLogger.Debug(ctx, "connecting to existing reconnecting pty")
-		c, ok := waitReady.(chan reconnectingpty.ReconnectingPTY)
-		if !ok {
-			return xerrors.Errorf("found invalid type in reconnecting pty map: %T", waitReady)
-		}
-		rpty, ok = <-c
-		if !ok || rpty == nil {
-			return xerrors.Errorf("reconnecting pty closed before connection")
-		}
-		c <- rpty // Put it back for the next reconnect.
-	} else {
-		connLogger.Debug(ctx, "creating new reconnecting pty")
-
-		connected := false
-		defer func() {
-			if !connected && retErr != nil {
-				a.reconnectingPTYs.Delete(msg.ID)
-				close(sendConnected)
-			}
-		}()
-
-		// Empty command will default to the users shell!
-		cmd, err := a.sshServer.CreateCommand(ctx, msg.Command, nil)
-		if err != nil {
-			a.metrics.reconnectingPTYErrors.WithLabelValues("create_command").Add(1)
-			return xerrors.Errorf("create command: %w", err)
-		}
-
-		rpty = reconnectingpty.New(ctx, cmd, &reconnectingpty.Options{
-			Timeout: a.reconnectingPTYTimeout,
-			Metrics: a.metrics.reconnectingPTYErrors,
-		}, logger.With(slog.F("message_id", msg.ID)))
-
-		if err = a.trackGoroutine(func() {
-			rpty.Wait()
-			a.reconnectingPTYs.Delete(msg.ID)
-		}); err != nil {
-			rpty.Close(err)
-			return xerrors.Errorf("start routine: %w", err)
-		}
-
-		connected = true
-		sendConnected <- rpty
-	}
-	return rpty.Attach(ctx, connectionID, conn, msg.Height, msg.Width, connLogger)
 }
 
 // Collect collects additional stats from the agent
@@ -1488,7 +1360,7 @@ func (a *agent) Collect(ctx context.Context, networkStats map[netlogtype.Connect
 	stats.SessionCountVscode = sshStats.VSCode
 	stats.SessionCountJetbrains = sshStats.JetBrains
 
-	stats.SessionCountReconnectingPty = a.connCountReconnectingPTY.Load()
+	stats.SessionCountReconnectingPty = a.reconnectingPTYServer.ConnCount()
 
 	// Compute the median connection latency!
 	a.logger.Debug(ctx, "starting peer latency measurement for stats")
@@ -1496,6 +1368,8 @@ func (a *agent) Collect(ctx context.Context, networkStats map[netlogtype.Connect
 	var mu sync.Mutex
 	status := a.network.Status()
 	durations := []float64{}
+	p2pConns := 0
+	derpConns := 0
 	pingCtx, cancelFunc := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelFunc()
 	for nodeID, peer := range status.Peer {
@@ -1512,13 +1386,18 @@ func (a *agent) Collect(ctx context.Context, networkStats map[netlogtype.Connect
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			duration, _, _, err := a.network.Ping(pingCtx, addresses[0].Addr())
+			duration, p2p, _, err := a.network.Ping(pingCtx, addresses[0].Addr())
 			if err != nil {
 				return
 			}
 			mu.Lock()
 			defer mu.Unlock()
 			durations = append(durations, float64(duration.Microseconds()))
+			if p2p {
+				p2pConns++
+			} else {
+				derpConns++
+			}
 		}()
 	}
 	wg.Wait()
@@ -1538,123 +1417,15 @@ func (a *agent) Collect(ctx context.Context, networkStats map[netlogtype.Connect
 	// Agent metrics are changing all the time, so there is no need to perform
 	// reflect.DeepEqual to see if stats should be transferred.
 
+	// currentConnections behaves like a hypothetical `GaugeFuncVec` and is only set at collection time.
+	a.metrics.currentConnections.WithLabelValues("p2p").Set(float64(p2pConns))
+	a.metrics.currentConnections.WithLabelValues("derp").Set(float64(derpConns))
 	metricsCtx, cancelFunc := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelFunc()
 	a.logger.Debug(ctx, "collecting agent metrics for stats")
 	stats.Metrics = a.collectMetrics(metricsCtx)
 
 	return stats
-}
-
-var prioritizedProcs = []string{"coder agent"}
-
-func (a *agent) manageProcessPriorityUntilGracefulShutdown() {
-	// process priority can stop as soon as we are gracefully shutting down
-	ctx := a.gracefulCtx
-	defer func() {
-		if r := recover(); r != nil {
-			a.logger.Critical(ctx, "recovered from panic",
-				slog.F("panic", r),
-				slog.F("stack", string(debug.Stack())),
-			)
-		}
-	}()
-
-	if val := a.environmentVariables[EnvProcPrioMgmt]; val == "" || runtime.GOOS != "linux" {
-		a.logger.Debug(ctx, "process priority not enabled, agent will not manage process niceness/oom_score_adj ",
-			slog.F("env_var", EnvProcPrioMgmt),
-			slog.F("value", val),
-			slog.F("goos", runtime.GOOS),
-		)
-		return
-	}
-
-	if a.processManagementTick == nil {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		a.processManagementTick = ticker.C
-	}
-
-	for {
-		procs, err := a.manageProcessPriority(ctx)
-		if err != nil {
-			a.logger.Error(ctx, "manage process priority",
-				slog.Error(err),
-			)
-		}
-		if a.modifiedProcs != nil {
-			a.modifiedProcs <- procs
-		}
-
-		select {
-		case <-a.processManagementTick:
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func (a *agent) manageProcessPriority(ctx context.Context) ([]*agentproc.Process, error) {
-	const (
-		niceness = 10
-	)
-
-	procs, err := agentproc.List(a.filesystem, a.syscaller)
-	if err != nil {
-		return nil, xerrors.Errorf("list: %w", err)
-	}
-
-	var (
-		modProcs = []*agentproc.Process{}
-		logger   slog.Logger
-	)
-
-	for _, proc := range procs {
-		logger = a.logger.With(
-			slog.F("cmd", proc.Cmd()),
-			slog.F("pid", proc.PID),
-		)
-
-		containsFn := func(e string) bool {
-			contains := strings.Contains(proc.Cmd(), e)
-			return contains
-		}
-
-		// If the process is prioritized we should adjust
-		// it's oom_score_adj and avoid lowering its niceness.
-		if slices.ContainsFunc[[]string, string](prioritizedProcs, containsFn) {
-			continue
-		}
-
-		score, err := proc.Niceness(a.syscaller)
-		if err != nil {
-			logger.Warn(ctx, "unable to get proc niceness",
-				slog.Error(err),
-			)
-			continue
-		}
-
-		// We only want processes that don't have a nice value set
-		// so we don't override user nice values.
-		// Getpriority actually returns priority for the nice value
-		// which is niceness + 20, so here 20 = a niceness of 0 (aka unset).
-		if score != 20 {
-			// We don't log here since it can get spammy
-			continue
-		}
-
-		err = proc.SetNiceness(a.syscaller, niceness)
-		if err != nil {
-			logger.Warn(ctx, "unable to set proc niceness",
-				slog.F("niceness", niceness),
-				slog.Error(err),
-			)
-			continue
-		}
-
-		modProcs = append(modProcs, proc)
-	}
-	return modProcs, nil
 }
 
 // isClosed returns whether the API is closed or not.
@@ -1727,7 +1498,7 @@ func (a *agent) HandleHTTPDebugLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
-	// Limit to 10MB.
+	// Limit to 10MiB.
 	w.WriteHeader(http.StatusOK)
 	_, err = io.Copy(w, io.LimitReader(f, 10*1024*1024))
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -1778,9 +1549,7 @@ func (a *agent) Close() error {
 	a.gracefulCancel()
 
 	lifecycleState := codersdk.WorkspaceAgentLifecycleOff
-	err = a.scriptRunner.Execute(a.hardCtx, func(script codersdk.WorkspaceAgentScript) bool {
-		return script.RunOnStop
-	})
+	err = a.scriptRunner.Execute(a.hardCtx, agentscripts.ExecuteStopScripts)
 	if err != nil {
 		a.logger.Warn(a.hardCtx, "shutdown script(s) failed", slog.Error(err))
 		if errors.Is(err, agentscripts.ErrTimeout) {
@@ -1914,13 +1683,17 @@ const (
 
 type apiConnRoutineManager struct {
 	logger    slog.Logger
-	conn      drpc.Conn
+	aAPI      proto.DRPCAgentClient23
+	tAPI      tailnetproto.DRPCTailnetClient23
 	eg        *errgroup.Group
 	stopCtx   context.Context
 	remainCtx context.Context
 }
 
-func newAPIConnRoutineManager(gracefulCtx, hardCtx context.Context, logger slog.Logger, conn drpc.Conn) *apiConnRoutineManager {
+func newAPIConnRoutineManager(
+	gracefulCtx, hardCtx context.Context, logger slog.Logger,
+	aAPI proto.DRPCAgentClient23, tAPI tailnetproto.DRPCTailnetClient23,
+) *apiConnRoutineManager {
 	// routines that remain in operation during graceful shutdown use the remainCtx.  They'll still
 	// exit if the errgroup hits an error, which usually means a problem with the conn.
 	eg, remainCtx := errgroup.WithContext(hardCtx)
@@ -1940,17 +1713,23 @@ func newAPIConnRoutineManager(gracefulCtx, hardCtx context.Context, logger slog.
 	stopCtx := eitherContext(remainCtx, gracefulCtx)
 	return &apiConnRoutineManager{
 		logger:    logger,
-		conn:      conn,
+		aAPI:      aAPI,
+		tAPI:      tAPI,
 		eg:        eg,
 		stopCtx:   stopCtx,
 		remainCtx: remainCtx,
 	}
 }
 
-func (a *apiConnRoutineManager) start(name string, b gracefulShutdownBehavior, f func(context.Context, drpc.Conn) error) {
+// startAgentAPI starts a routine that uses the Agent API. c.f. startTailnetAPI which is the same
+// but for Tailnet.
+func (a *apiConnRoutineManager) startAgentAPI(
+	name string, behavior gracefulShutdownBehavior,
+	f func(context.Context, proto.DRPCAgentClient23) error,
+) {
 	logger := a.logger.With(slog.F("name", name))
 	var ctx context.Context
-	switch b {
+	switch behavior {
 	case gracefulShutdownBehaviorStop:
 		ctx = a.stopCtx
 	case gracefulShutdownBehaviorRemain:
@@ -1959,8 +1738,45 @@ func (a *apiConnRoutineManager) start(name string, b gracefulShutdownBehavior, f
 		panic("unknown behavior")
 	}
 	a.eg.Go(func() error {
-		logger.Debug(ctx, "starting routine")
-		err := f(ctx, a.conn)
+		logger.Debug(ctx, "starting agent routine")
+		err := f(ctx, a.aAPI)
+		if xerrors.Is(err, context.Canceled) && ctx.Err() != nil {
+			logger.Debug(ctx, "swallowing context canceled")
+			// Don't propagate context canceled errors to the error group, because we don't want the
+			// graceful context being canceled to halt the work of routines with
+			// gracefulShutdownBehaviorRemain.  Note that we check both that the error is
+			// context.Canceled and that *our* context is currently canceled, because when Coderd
+			// unilaterally closes the API connection (for example if the build is outdated), it can
+			// sometimes show up as context.Canceled in our RPC calls.
+			return nil
+		}
+		logger.Debug(ctx, "routine exited", slog.Error(err))
+		if err != nil {
+			return xerrors.Errorf("error in routine %s: %w", name, err)
+		}
+		return nil
+	})
+}
+
+// startTailnetAPI starts a routine that uses the Tailnet API. c.f. startAgentAPI which is the same
+// but for the Agent API.
+func (a *apiConnRoutineManager) startTailnetAPI(
+	name string, behavior gracefulShutdownBehavior,
+	f func(context.Context, tailnetproto.DRPCTailnetClient23) error,
+) {
+	logger := a.logger.With(slog.F("name", name))
+	var ctx context.Context
+	switch behavior {
+	case gracefulShutdownBehaviorStop:
+		ctx = a.stopCtx
+	case gracefulShutdownBehaviorRemain:
+		ctx = a.remainCtx
+	default:
+		panic("unknown behavior")
+	}
+	a.eg.Go(func() error {
+		logger.Debug(ctx, "starting tailnet routine")
+		err := f(ctx, a.tAPI)
 		if xerrors.Is(err, context.Canceled) && ctx.Err() != nil {
 			logger.Debug(ctx, "swallowing context canceled")
 			// Don't propagate context canceled errors to the error group, because we don't want the

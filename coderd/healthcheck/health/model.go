@@ -15,10 +15,12 @@ const (
 	// CodeUnknown is a catch-all health code when something unexpected goes wrong (for example, a panic).
 	CodeUnknown Code = "EUNKNOWN"
 
-	CodeProxyUpdate          Code = "EWP01"
-	CodeProxyFetch           Code = "EWP02"
-	CodeProxyVersionMismatch Code = "EWP03"
-	CodeProxyUnhealthy       Code = "EWP04"
+	CodeProxyUpdate Code = "EWP01"
+	CodeProxyFetch  Code = "EWP02"
+	// CodeProxyVersionMismatch is no longer used as it's no longer a critical
+	// error.
+	// CodeProxyVersionMismatch Code = "EWP03"
+	CodeProxyUnhealthy Code = "EWP04"
 
 	CodeDatabasePingFailed Code = "EDB01"
 	CodeDatabasePingSlow   Code = "EDB02"
@@ -34,10 +36,19 @@ const (
 
 	CodeDERPNodeUsesWebsocket Code = `EDERP01`
 	CodeDERPOneNodeUnhealthy  Code = `EDERP02`
+	CodeSTUNNoNodes                = `ESTUN01`
+	CodeSTUNMapVaryDest            = `ESTUN02`
 
 	CodeProvisionerDaemonsNoProvisionerDaemons     Code = `EPD01`
 	CodeProvisionerDaemonVersionMismatch           Code = `EPD02`
 	CodeProvisionerDaemonAPIMajorVersionDeprecated Code = `EPD03`
+
+	CodeInterfaceSmallMTU = `EIF01`
+)
+
+// Default docs URL
+var (
+	docsURLDefault = "https://coder.com/docs"
 )
 
 // @typescript-generate Severity
@@ -66,6 +77,25 @@ func (m Message) String() string {
 	_, _ = sb.WriteRune(' ')
 	_, _ = sb.WriteString(m.Message)
 	return sb.String()
+}
+
+// URL returns a link to the admin/monitoring/health-check docs page for the given Message.
+// NOTE: if using a custom docs URL, specify base.
+func (m Message) URL(base string) string {
+	var codeAnchor string
+	if m.Code == "" {
+		codeAnchor = strings.ToLower(string(CodeUnknown))
+	} else {
+		codeAnchor = strings.ToLower(string(m.Code))
+	}
+
+	if base == "" {
+		base = docsURLDefault
+		return fmt.Sprintf("%s/admin/monitoring/health-check#%s", base, codeAnchor)
+	}
+
+	// We don't assume that custom docs URLs are versioned.
+	return fmt.Sprintf("%s/admin/monitoring/health-check#%s", base, codeAnchor)
 }
 
 // Code is a stable identifier used to link to documentation.

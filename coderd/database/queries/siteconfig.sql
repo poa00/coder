@@ -36,12 +36,12 @@ ON CONFLICT (key) DO UPDATE SET value = $1 WHERE site_configs.key = 'last_update
 -- name: GetLastUpdateCheck :one
 SELECT value FROM site_configs WHERE key = 'last_update_check';
 
--- name: UpsertServiceBanner :exec
-INSERT INTO site_configs (key, value) VALUES ('service_banner', $1)
-ON CONFLICT (key) DO UPDATE SET value = $1 WHERE site_configs.key = 'service_banner';
+-- name: UpsertAnnouncementBanners :exec
+INSERT INTO site_configs (key, value) VALUES ('announcement_banners', $1)
+ON CONFLICT (key) DO UPDATE SET value = $1 WHERE site_configs.key = 'announcement_banners';
 
--- name: GetServiceBanner :one
-SELECT value FROM site_configs WHERE key = 'service_banner';
+-- name: GetAnnouncementBanners :one
+SELECT value FROM site_configs WHERE key = 'announcement_banners';
 
 -- name: UpsertLogoURL :exec
 INSERT INTO site_configs (key, value) VALUES ('logo_url', $1)
@@ -71,6 +71,13 @@ SELECT value FROM site_configs WHERE key = 'oauth_signing_key';
 INSERT INTO site_configs (key, value) VALUES ('oauth_signing_key', $1)
 ON CONFLICT (key) DO UPDATE set value = $1 WHERE site_configs.key = 'oauth_signing_key';
 
+-- name: GetCoordinatorResumeTokenSigningKey :one
+SELECT value FROM site_configs WHERE key = 'coordinator_resume_token_signing_key';
+
+-- name: UpsertCoordinatorResumeTokenSigningKey :exec
+INSERT INTO site_configs (key, value) VALUES ('coordinator_resume_token_signing_key', $1)
+ON CONFLICT (key) DO UPDATE set value = $1 WHERE site_configs.key = 'coordinator_resume_token_signing_key';
+
 -- name: GetHealthSettings :one
 SELECT
 	COALESCE((SELECT value FROM site_configs WHERE key = 'health_settings'), '{}') :: text AS health_settings
@@ -79,3 +86,24 @@ SELECT
 -- name: UpsertHealthSettings :exec
 INSERT INTO site_configs (key, value) VALUES ('health_settings', $1)
 ON CONFLICT (key) DO UPDATE SET value = $1 WHERE site_configs.key = 'health_settings';
+
+-- name: GetNotificationsSettings :one
+SELECT
+	COALESCE((SELECT value FROM site_configs WHERE key = 'notifications_settings'), '{}') :: text AS notifications_settings
+;
+
+-- name: UpsertNotificationsSettings :exec
+INSERT INTO site_configs (key, value) VALUES ('notifications_settings', $1)
+ON CONFLICT (key) DO UPDATE SET value = $1 WHERE site_configs.key = 'notifications_settings';
+
+-- name: GetRuntimeConfig :one
+SELECT value FROM site_configs WHERE site_configs.key = $1;
+
+-- name: UpsertRuntimeConfig :exec
+INSERT INTO site_configs (key, value) VALUES ($1, $2)
+ON CONFLICT (key) DO UPDATE SET value = $2 WHERE site_configs.key = $1;
+
+-- name: DeleteRuntimeConfig :exec
+DELETE FROM site_configs
+WHERE site_configs.key = $1;
+

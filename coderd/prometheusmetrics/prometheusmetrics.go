@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/xerrors"
 	"tailscale.com/tailcfg"
 
 	"cdr.dev/slog"
@@ -22,12 +23,15 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/tailnet"
+	"github.com/coder/quartz"
 )
 
+const defaultRefreshRate = time.Minute
+
 // ActiveUsers tracks the number of users that have authenticated within the past hour.
-func ActiveUsers(ctx context.Context, registerer prometheus.Registerer, db database.Store, duration time.Duration) (func(), error) {
+func ActiveUsers(ctx context.Context, logger slog.Logger, registerer prometheus.Registerer, db database.Store, duration time.Duration) (func(), error) {
 	if duration == 0 {
-		duration = 5 * time.Minute
+		duration = defaultRefreshRate
 	}
 
 	gauge := prometheus.NewGauge(prometheus.GaugeOpts{
@@ -56,6 +60,7 @@ func ActiveUsers(ctx context.Context, registerer prometheus.Registerer, db datab
 
 			apiKeys, err := db.GetAPIKeysLastUsedAfter(ctx, dbtime.Now().Add(-1*time.Hour))
 			if err != nil {
+				logger.Error(ctx, "get api keys for active users prometheus metric", slog.Error(err))
 				continue
 			}
 			distinctUsers := map[uuid.UUID]struct{}{}
@@ -71,37 +76,107 @@ func ActiveUsers(ctx context.Context, registerer prometheus.Registerer, db datab
 	}, nil
 }
 
-// Workspaces tracks the total number of workspaces with labels on status.
-func Workspaces(ctx context.Context, registerer prometheus.Registerer, db database.Store, duration time.Duration) (func(), error) {
+// Users tracks the total number of registered users, partitioned by status.
+func Users(ctx context.Context, logger slog.Logger, clk quartz.Clock, registerer prometheus.Registerer, db database.Store, duration time.Duration) (func(), error) {
 	if duration == 0 {
-		duration = 5 * time.Minute
+		// It's not super important this tracks real-time.
+		duration = defaultRefreshRate * 5
 	}
 
 	gauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "coderd",
 		Subsystem: "api",
-		Name:      "workspace_latest_build_total",
-		Help:      "The latest workspace builds with a status.",
+		Name:      "total_user_count",
+		Help:      "The total number of registered users, partitioned by status.",
 	}, []string{"status"})
 	err := registerer.Register(gauge)
 	if err != nil {
+		return nil, xerrors.Errorf("register total_user_count gauge: %w", err)
+	}
+
+	ctx, cancelFunc := context.WithCancel(ctx)
+	done := make(chan struct{})
+	ticker := clk.NewTicker(duration)
+	go func() {
+		defer close(done)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			gauge.Reset()
+			//nolint:gocritic // This is a system service that needs full access
+			//to the users table.
+			users, err := db.GetUsers(dbauthz.AsSystemRestricted(ctx), database.GetUsersParams{})
+			if err != nil {
+				logger.Error(ctx, "get all users for prometheus metrics", slog.Error(err))
+				continue
+			}
+
+			for _, user := range users {
+				gauge.WithLabelValues(string(user.Status)).Inc()
+			}
+		}
+	}()
+	return func() {
+		cancelFunc()
+		<-done
+	}, nil
+}
+
+// Workspaces tracks the total number of workspaces with labels on status.
+func Workspaces(ctx context.Context, logger slog.Logger, registerer prometheus.Registerer, db database.Store, duration time.Duration) (func(), error) {
+	if duration == 0 {
+		duration = defaultRefreshRate
+	}
+
+	// TODO: deprecated: remove in the future
+	// See: https://github.com/coder/coder/issues/12999
+	// Deprecation reason: gauge metrics should avoid suffix `_total``
+	workspaceLatestBuildTotalsDeprecated := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "coderd",
+		Subsystem: "api",
+		Name:      "workspace_latest_build_total",
+		Help:      "DEPRECATED: use coderd_api_workspace_latest_build instead",
+	}, []string{"status"})
+	if err := registerer.Register(workspaceLatestBuildTotalsDeprecated); err != nil {
 		return nil, err
 	}
-	// This exists so the prometheus metric exports immediately when set.
-	// It helps with tests so they don't have to wait for a tick.
-	gauge.WithLabelValues("pending").Set(0)
+
+	workspaceLatestBuildTotals := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "coderd",
+		Subsystem: "api",
+		Name:      "workspace_latest_build",
+		Help:      "The current number of workspace builds by status.",
+	}, []string{"status"})
+	if err := registerer.Register(workspaceLatestBuildTotals); err != nil {
+		return nil, err
+	}
+
+	workspaceLatestBuildStatuses := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "coderd",
+		Name:      "workspace_latest_build_status",
+		Help:      "The current workspace statuses by template, transition, and owner.",
+	}, []string{"status", "template_name", "template_version", "workspace_owner", "workspace_transition"})
+	if err := registerer.Register(workspaceLatestBuildStatuses); err != nil {
+		return nil, err
+	}
 
 	ctx, cancelFunc := context.WithCancel(ctx)
 	done := make(chan struct{})
 
-	// Use time.Nanosecond to force an initial tick. It will be reset to the
-	// correct duration after executing once.
-	ticker := time.NewTicker(time.Nanosecond)
-	doTick := func() {
-		defer ticker.Reset(duration)
-
+	updateWorkspaceTotals := func() {
 		builds, err := db.GetLatestWorkspaceBuilds(ctx)
 		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// clear all series if there are no database entries
+				workspaceLatestBuildTotals.Reset()
+			} else {
+				logger.Warn(ctx, "failed to load latest workspace builds", slog.Error(err))
+			}
 			return
 		}
 		jobIDs := make([]uuid.UUID, 0, len(builds))
@@ -110,14 +185,53 @@ func Workspaces(ctx context.Context, registerer prometheus.Registerer, db databa
 		}
 		jobs, err := db.GetProvisionerJobsByIDs(ctx, jobIDs)
 		if err != nil {
+			ids := make([]string, 0, len(jobIDs))
+			for _, id := range jobIDs {
+				ids = append(ids, id.String())
+			}
+
+			logger.Warn(ctx, "failed to load provisioner jobs", slog.F("ids", ids), slog.Error(err))
 			return
 		}
 
-		gauge.Reset()
+		workspaceLatestBuildTotals.Reset()
 		for _, job := range jobs {
 			status := codersdk.ProvisionerJobStatus(job.JobStatus)
-			gauge.WithLabelValues(string(status)).Add(1)
+			workspaceLatestBuildTotals.WithLabelValues(string(status)).Add(1)
+			// TODO: deprecated: remove in the future
+			workspaceLatestBuildTotalsDeprecated.WithLabelValues(string(status)).Add(1)
 		}
+	}
+
+	updateWorkspaceStatuses := func() {
+		ws, err := db.GetWorkspaces(ctx, database.GetWorkspacesParams{
+			Deleted:     false,
+			WithSummary: false,
+		})
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// clear all series if there are no database entries
+				workspaceLatestBuildStatuses.Reset()
+			}
+
+			logger.Warn(ctx, "failed to load active workspaces", slog.Error(err))
+			return
+		}
+
+		workspaceLatestBuildStatuses.Reset()
+		for _, w := range ws {
+			workspaceLatestBuildStatuses.WithLabelValues(string(w.LatestBuildStatus), w.TemplateName, w.TemplateVersionName.String, w.OwnerUsername, string(w.LatestBuildTransition)).Add(1)
+		}
+	}
+
+	// Use time.Nanosecond to force an initial tick. It will be reset to the
+	// correct duration after executing once.
+	ticker := time.NewTicker(time.Nanosecond)
+	doTick := func() {
+		defer ticker.Reset(duration)
+
+		updateWorkspaceTotals()
+		updateWorkspaceStatuses()
 	}
 
 	go func() {
@@ -141,7 +255,7 @@ func Workspaces(ctx context.Context, registerer prometheus.Registerer, db databa
 // Agents tracks the total number of workspaces with labels on status.
 func Agents(ctx context.Context, logger slog.Logger, registerer prometheus.Registerer, db database.Store, coordinator *atomic.Pointer[tailnet.Coordinator], derpMapFn func() *tailcfg.DERPMap, agentInactiveDisconnectTimeout, duration time.Duration) (func(), error) {
 	if duration == 0 {
-		duration = 1 * time.Minute
+		duration = defaultRefreshRate
 	}
 
 	agentsGauge := NewCachedGaugeVec(prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -328,9 +442,10 @@ func Agents(ctx context.Context, logger slog.Logger, registerer prometheus.Regis
 	}, nil
 }
 
-func AgentStats(ctx context.Context, logger slog.Logger, registerer prometheus.Registerer, db database.Store, initialCreateAfter time.Time, duration time.Duration, aggregateByLabels []string) (func(), error) {
+// nolint:revive // This will be removed alongside the workspaceusage experiment
+func AgentStats(ctx context.Context, logger slog.Logger, registerer prometheus.Registerer, db database.Store, initialCreateAfter time.Time, duration time.Duration, aggregateByLabels []string, usage bool) (func(), error) {
 	if duration == 0 {
-		duration = 1 * time.Minute
+		duration = defaultRefreshRate
 	}
 
 	if len(aggregateByLabels) == 0 {
@@ -460,7 +575,20 @@ func AgentStats(ctx context.Context, logger slog.Logger, registerer prometheus.R
 			timer := prometheus.NewTimer(metricsCollectorAgentStats)
 
 			checkpoint := time.Now()
-			stats, err := db.GetWorkspaceAgentStatsAndLabels(ctx, createdAfter)
+			var (
+				stats []database.GetWorkspaceAgentStatsAndLabelsRow
+				err   error
+			)
+			if usage {
+				var agentUsageStats []database.GetWorkspaceAgentUsageStatsAndLabelsRow
+				agentUsageStats, err = db.GetWorkspaceAgentUsageStatsAndLabels(ctx, createdAfter)
+				stats = make([]database.GetWorkspaceAgentStatsAndLabelsRow, 0, len(agentUsageStats))
+				for _, agentUsageStat := range agentUsageStats {
+					stats = append(stats, database.GetWorkspaceAgentStatsAndLabelsRow(agentUsageStat))
+				}
+			} else {
+				stats, err = db.GetWorkspaceAgentStatsAndLabels(ctx, createdAfter)
+			}
 			if err != nil {
 				logger.Error(ctx, "can't get agent stats", slog.Error(err))
 			} else {
@@ -514,6 +642,32 @@ func AgentStats(ctx context.Context, logger slog.Logger, registerer prometheus.R
 		cancelFunc()
 		<-done
 	}, nil
+}
+
+// Experiments registers a metric which indicates whether each experiment is enabled or not.
+func Experiments(registerer prometheus.Registerer, active codersdk.Experiments) error {
+	experimentsGauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "coderd",
+		Name:      "experiments",
+		Help:      "Indicates whether each experiment is enabled (1) or not (0)",
+	}, []string{"experiment"})
+	if err := registerer.Register(experimentsGauge); err != nil {
+		return err
+	}
+
+	for _, exp := range codersdk.ExperimentsAll {
+		var val float64
+		for _, enabled := range active {
+			if exp == enabled {
+				val = 1
+				break
+			}
+		}
+
+		experimentsGauge.WithLabelValues(string(exp)).Set(val)
+	}
+
+	return nil
 }
 
 // filterAcceptableAgentLabels handles a slightly messy situation whereby `prometheus-aggregate-agent-stats-by` can control on

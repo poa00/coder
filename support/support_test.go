@@ -30,7 +30,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m, testutil.GoleakOptions...)
 }
 
 func TestRun(t *testing.T) {
@@ -50,7 +50,7 @@ func TestRun(t *testing.T) {
 
 		bun, err := support.Run(ctx, &support.Deps{
 			Client:      client,
-			Log:         slogtest.Make(t, nil).Named("bundle").Leveled(slog.LevelDebug),
+			Log:         testutil.Logger(t).Named("bundle"),
 			WorkspaceID: ws.ID,
 			AgentID:     agt.ID,
 		})
@@ -62,9 +62,11 @@ func TestRun(t *testing.T) {
 		assertSanitizedDeploymentConfig(t, bun.Deployment.Config)
 		assertNotNilNotEmpty(t, bun.Deployment.HealthReport, "deployment health report should be present")
 		assertNotNilNotEmpty(t, bun.Deployment.Experiments, "deployment experiments should be present")
+		assertNotNilNotEmpty(t, bun.Network.ConnectionInfo, "agent connection info should be present")
 		assertNotNilNotEmpty(t, bun.Network.CoordinatorDebug, "network coordinator debug should be present")
-		assertNotNilNotEmpty(t, bun.Network.TailnetDebug, "network tailnet debug should be present")
 		assertNotNilNotEmpty(t, bun.Network.Netcheck, "network netcheck should be present")
+		assertNotNilNotEmpty(t, bun.Network.TailnetDebug, "network tailnet debug should be present")
+		assertNotNilNotEmpty(t, bun.Network.Interfaces, "network interfaces health should be present")
 		assertNotNilNotEmpty(t, bun.Workspace.Workspace, "workspace should be present")
 		assertSanitizedWorkspace(t, bun.Workspace.Workspace)
 		assertNotNilNotEmpty(t, bun.Workspace.BuildLogs, "workspace build logs should be present")
@@ -73,9 +75,11 @@ func TestRun(t *testing.T) {
 		assertNotNilNotEmpty(t, bun.Workspace.TemplateFileBase64, "workspace template file should be present")
 		require.NotNil(t, bun.Workspace.Parameters, "workspace parameters should be present")
 		assertNotNilNotEmpty(t, bun.Agent.Agent, "agent should be present")
-		assertSanitizedAgent(t, *bun.Agent.Agent)
+		assertSanitizedEnv(t, bun.Agent.Agent.EnvironmentVariables)
 		assertNotNilNotEmpty(t, bun.Agent.ListeningPorts, "agent listening ports should be present")
 		assertNotNilNotEmpty(t, bun.Agent.Logs, "agent logs should be present")
+		assertNotNilNotEmpty(t, bun.Agent.Manifest, "agent manifest should be present")
+		assertSanitizedEnv(t, bun.Agent.Manifest.EnvironmentVariables)
 		assertNotNilNotEmpty(t, bun.Agent.AgentMagicsockHTML, "agent magicsock should be present")
 		assertNotNilNotEmpty(t, bun.Agent.ClientMagicsockHTML, "client magicsock should be present")
 		assertNotNilNotEmpty(t, bun.Agent.PeerDiagnostics, "agent peer diagnostics should be present")
@@ -107,9 +111,11 @@ func TestRun(t *testing.T) {
 		assertSanitizedDeploymentConfig(t, bun.Deployment.Config)
 		assertNotNilNotEmpty(t, bun.Deployment.HealthReport, "deployment health report should be present")
 		assertNotNilNotEmpty(t, bun.Deployment.Experiments, "deployment experiments should be present")
+		assertNotNilNotEmpty(t, bun.Network.ConnectionInfo, "agent connection info should be present")
 		assertNotNilNotEmpty(t, bun.Network.CoordinatorDebug, "network coordinator debug should be present")
+		assertNotNilNotEmpty(t, bun.Network.Netcheck, "network netcheck should be present")
 		assertNotNilNotEmpty(t, bun.Network.TailnetDebug, "network tailnet debug should be present")
-		assert.Empty(t, bun.Network.Netcheck, "did not expect netcheck to be present")
+		assertNotNilNotEmpty(t, bun.Network.Interfaces, "network interfaces health should be present")
 		assert.Empty(t, bun.Workspace.Workspace, "did not expect workspace to be present")
 		assert.Empty(t, bun.Agent, "did not expect agent to be present")
 		assertNotNilNotEmpty(t, bun.Logs, "bundle logs should be present")
@@ -143,7 +149,7 @@ func TestRun(t *testing.T) {
 		memberClient, _ := coderdtest.CreateAnotherUser(t, client, admin.OrganizationID)
 		bun, err := support.Run(ctx, &support.Deps{
 			Client: memberClient,
-			Log:    slogtest.Make(t, nil).Named("bundle").Leveled(slog.LevelDebug),
+			Log:    testutil.Logger(t).Named("bundle"),
 		})
 		require.ErrorContains(t, err, "failed authorization check")
 		require.NotEmpty(t, bun)
@@ -164,15 +170,15 @@ func assertSanitizedWorkspace(t *testing.T, ws codersdk.Workspace) {
 	t.Helper()
 	for _, res := range ws.LatestBuild.Resources {
 		for _, agt := range res.Agents {
-			assertSanitizedAgent(t, agt)
+			assertSanitizedEnv(t, agt.EnvironmentVariables)
 		}
 	}
 }
 
-func assertSanitizedAgent(t *testing.T, agt codersdk.WorkspaceAgent) {
+func assertSanitizedEnv(t *testing.T, env map[string]string) {
 	t.Helper()
-	for k, v := range agt.EnvironmentVariables {
-		assert.Equal(t, "***REDACTED***", v, "agent %q environment variable %q not sanitized", agt.Name, k)
+	for k, v := range env {
+		assert.Equal(t, "***REDACTED***", v, "environment variable %q not sanitized", k)
 	}
 }
 
@@ -193,7 +199,7 @@ func setupWorkspaceAndAgent(ctx context.Context, t *testing.T, client *codersdk.
 			CreatedBy:      user.UserID,
 		}).
 		Do()
-	wbr := dbfake.WorkspaceBuild(t, db, database.Workspace{
+	wbr := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
 		OrganizationID: user.OrganizationID,
 		OwnerID:        user.UserID,
 		TemplateID:     tv.Template.ID,

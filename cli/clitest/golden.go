@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/coder/coder/v2/cli/config"
@@ -87,42 +88,47 @@ ExtractCommandPathsLoop:
 
 			StartWithWaiter(t, inv.WithContext(ctx)).RequireSuccess()
 
-			actual := outBuf.Bytes()
-			if len(actual) == 0 {
-				t.Fatal("no output")
-			}
-
-			for k, v := range replacements {
-				actual = bytes.ReplaceAll(actual, []byte(k), []byte(v))
-			}
-
-			actual = NormalizeGoldenFile(t, actual)
-			goldenPath := filepath.Join("testdata", strings.Replace(tt.Name, " ", "_", -1)+".golden")
-			if *UpdateGoldenFiles {
-				t.Logf("update golden file for: %q: %s", tt.Name, goldenPath)
-				err := os.WriteFile(goldenPath, actual, 0o600)
-				require.NoError(t, err, "update golden file")
-			}
-
-			expected, err := os.ReadFile(goldenPath)
-			require.NoError(t, err, "read golden file, run \"make update-golden-files\" and commit the changes")
-
-			expected = NormalizeGoldenFile(t, expected)
-			require.Equal(
-				t, string(expected), string(actual),
-				"golden file mismatch: %s, run \"make update-golden-files\", verify and commit the changes",
-				goldenPath,
-			)
+			TestGoldenFile(t, tt.Name, outBuf.Bytes(), replacements)
 		})
 	}
 }
 
-// NormalizeGoldenFile replaces any strings that are system or timing dependent
+// TestGoldenFile will test the given bytes slice input against the
+// golden file with the given file name, optionally using the given replacements.
+func TestGoldenFile(t *testing.T, fileName string, actual []byte, replacements map[string]string) {
+	if len(actual) == 0 {
+		t.Fatal("no output")
+	}
+
+	for k, v := range replacements {
+		actual = bytes.ReplaceAll(actual, []byte(k), []byte(v))
+	}
+
+	actual = normalizeGoldenFile(t, actual)
+	goldenPath := filepath.Join("testdata", strings.ReplaceAll(fileName, " ", "_")+".golden")
+	if *UpdateGoldenFiles {
+		t.Logf("update golden file for: %q: %s", fileName, goldenPath)
+		err := os.WriteFile(goldenPath, actual, 0o600)
+		require.NoError(t, err, "update golden file")
+	}
+
+	expected, err := os.ReadFile(goldenPath)
+	require.NoError(t, err, "read golden file, run \"make update-golden-files\" and commit the changes")
+
+	expected = normalizeGoldenFile(t, expected)
+	require.Equal(
+		t, string(expected), string(actual),
+		"golden file mismatch: %s, run \"make update-golden-files\", verify and commit the changes",
+		goldenPath,
+	)
+}
+
+// normalizeGoldenFile replaces any strings that are system or timing dependent
 // with a placeholder so that the golden files can be compared with a simple
 // equality check.
-func NormalizeGoldenFile(t *testing.T, byt []byte) []byte {
+func normalizeGoldenFile(t *testing.T, byt []byte) []byte {
 	// Replace any timestamps with a placeholder.
-	byt = timestampRegex.ReplaceAll(byt, []byte("[timestamp]"))
+	byt = timestampRegex.ReplaceAll(byt, []byte(pad("[timestamp]", 20)))
 
 	homeDir, err := os.UserHomeDir()
 	require.NoError(t, err)
@@ -178,11 +184,11 @@ func prepareTestData(t *testing.T) (*codersdk.Client, map[string]string) {
 		IncludeProvisionerDaemon: true,
 	})
 	firstUser := coderdtest.CreateFirstUser(t, rootClient)
-	secondUser, err := rootClient.CreateUser(ctx, codersdk.CreateUserRequest{
-		Email:          "testuser2@coder.com",
-		Username:       "testuser2",
-		Password:       coderdtest.FirstUserParams.Password,
-		OrganizationID: firstUser.OrganizationID,
+	secondUser, err := rootClient.CreateUserWithOrgs(ctx, codersdk.CreateUserRequestWithOrgs{
+		Email:           "testuser2@coder.com",
+		Username:        "testuser2",
+		Password:        coderdtest.FirstUserParams.Password,
+		OrganizationIDs: []uuid.UUID{firstUser.OrganizationID},
 	})
 	require.NoError(t, err)
 	version := coderdtest.CreateTemplateVersion(t, rootClient, firstUser.OrganizationID, nil)
@@ -190,27 +196,37 @@ func prepareTestData(t *testing.T) (*codersdk.Client, map[string]string) {
 	template := coderdtest.CreateTemplate(t, rootClient, firstUser.OrganizationID, version.ID, func(req *codersdk.CreateTemplateRequest) {
 		req.Name = "test-template"
 	})
-	workspace := coderdtest.CreateWorkspace(t, rootClient, firstUser.OrganizationID, template.ID, func(req *codersdk.CreateWorkspaceRequest) {
+	workspace := coderdtest.CreateWorkspace(t, rootClient, template.ID, func(req *codersdk.CreateWorkspaceRequest) {
 		req.Name = "test-workspace"
 	})
 	workspaceBuild := coderdtest.AwaitWorkspaceBuildJobCompleted(t, rootClient, workspace.LatestBuild.ID)
 
 	replacements := map[string]string{
-		firstUser.UserID.String():            "[first user ID]",
-		secondUser.ID.String():               "[second user ID]",
-		firstUser.OrganizationID.String():    "[first org ID]",
-		version.ID.String():                  "[version ID]",
-		version.Name:                         "[version name]",
-		version.Job.ID.String():              "[version job ID]",
-		version.Job.FileID.String():          "[version file ID]",
-		version.Job.WorkerID.String():        "[version worker ID]",
-		template.ID.String():                 "[template ID]",
-		workspace.ID.String():                "[workspace ID]",
-		workspaceBuild.ID.String():           "[workspace build ID]",
-		workspaceBuild.Job.ID.String():       "[workspace build job ID]",
-		workspaceBuild.Job.FileID.String():   "[workspace build file ID]",
-		workspaceBuild.Job.WorkerID.String(): "[workspace build worker ID]",
+		firstUser.UserID.String():            pad("[first user ID]", 36),
+		secondUser.ID.String():               pad("[second user ID]", 36),
+		firstUser.OrganizationID.String():    pad("[first org ID]", 36),
+		version.ID.String():                  pad("[version ID]", 36),
+		version.Name:                         pad("[version name]", 36),
+		version.Job.ID.String():              pad("[version job ID]", 36),
+		version.Job.FileID.String():          pad("[version file ID]", 36),
+		version.Job.WorkerID.String():        pad("[version worker ID]", 36),
+		template.ID.String():                 pad("[template ID]", 36),
+		workspace.ID.String():                pad("[workspace ID]", 36),
+		workspaceBuild.ID.String():           pad("[workspace build ID]", 36),
+		workspaceBuild.Job.ID.String():       pad("[workspace build job ID]", 36),
+		workspaceBuild.Job.FileID.String():   pad("[workspace build file ID]", 36),
+		workspaceBuild.Job.WorkerID.String(): pad("[workspace build worker ID]", 36),
 	}
 
 	return rootClient, replacements
+}
+
+func pad(s string, n int) string {
+	if len(s) >= n {
+		return s
+	}
+	n -= len(s)
+	pre := n / 2
+	post := n - pre
+	return strings.Repeat("=", pre) + s + strings.Repeat("=", post)
 }

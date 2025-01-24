@@ -36,6 +36,7 @@ GOOS         := $(shell go env GOOS)
 GOARCH       := $(shell go env GOARCH)
 GOOS_BIN_EXT := $(if $(filter windows, $(GOOS)),.exe,)
 VERSION      := $(shell ./scripts/version.sh)
+POSTGRES_VERSION ?= 16
 
 # Use the highest ZSTD compression level in CI.
 ifdef CI
@@ -56,6 +57,9 @@ GO_SRC_FILES := $(shell find . $(FIND_EXCLUSIONS) -type f -name '*.go' -not -nam
 # All the shell files in the repo, excluding ignored files.
 SHELL_SRC_FILES := $(shell find . $(FIND_EXCLUSIONS) -type f -name '*.sh')
 
+# Ensure we don't use the user's git configs which might cause side-effects
+GIT_FLAGS = GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 # All ${OS}_${ARCH} combos we build for. Windows binaries have the .exe suffix.
 OS_ARCHES := \
 	linux_amd64 linux_arm64 linux_armv7 \
@@ -75,8 +79,12 @@ PACKAGE_OS_ARCHES := linux_amd64 linux_armv7 linux_arm64
 # All architectures we build Docker images for (Linux only).
 DOCKER_ARCHES := amd64 arm64 armv7
 
+# All ${OS}_${ARCH} combos we build the desktop dylib for.
+DYLIB_ARCHES := darwin_amd64 darwin_arm64
+
 # Computed variables based on the above.
 CODER_SLIM_BINARIES      := $(addprefix build/coder-slim_$(VERSION)_,$(OS_ARCHES))
+CODER_DYLIBS             := $(foreach os_arch, $(DYLIB_ARCHES), build/coder-vpn_$(VERSION)_$(os_arch).dylib)
 CODER_FAT_BINARIES       := $(addprefix build/coder_$(VERSION)_,$(OS_ARCHES))
 CODER_ALL_BINARIES       := $(CODER_SLIM_BINARIES) $(CODER_FAT_BINARIES)
 CODER_TAR_GZ_ARCHIVES    := $(foreach os_arch, $(ARCHIVE_TAR_GZ), build/coder_$(VERSION)_$(os_arch).tar.gz)
@@ -200,7 +208,8 @@ endef
 # calling this manually.
 $(CODER_ALL_BINARIES): go.mod go.sum \
 	$(GO_SRC_FILES) \
-	$(shell find ./examples/templates)
+	$(shell find ./examples/templates) \
+	site/static/error.html
 
 	$(get-mode-os-arch-ext)
 	if [[ "$$os" != "windows" ]] && [[ "$$ext" != "" ]]; then
@@ -232,6 +241,26 @@ $(CODER_ALL_BINARIES): go.mod go.sum \
 
 		cp "$@" "./site/out/bin/coder-$$os-$$arch$$dot_ext"
 	fi
+
+# This task builds Coder Desktop dylibs
+$(CODER_DYLIBS): go.mod go.sum $(GO_SRC_FILES)
+	@if [ "$(shell uname)" = "Darwin" ]; then
+		$(get-mode-os-arch-ext)
+		./scripts/build_go.sh \
+			--os "$$os" \
+			--arch "$$arch" \
+			--version "$(VERSION)" \
+			--output "$@" \
+			--dylib
+
+	else
+		echo "ERROR: Can't build dylib on non-Darwin OS" 1>&2
+		exit 1
+	fi
+
+# This task builds both dylibs
+build/coder-dylib: $(CODER_DYLIBS)
+.PHONY: build/coder-dylib
 
 # This task builds all archives. It parses the target name to get the metadata
 # for the build, so it must be specified in this format:
@@ -359,15 +388,35 @@ $(foreach chart,$(charts),build/$(chart)_helm_$(VERSION).tgz): build/%_helm_$(VE
 		--chart $* \
 		--output "$@"
 
-site/out/index.html: site/package.json $(shell find ./site $(FIND_EXCLUSIONS) -type f \( -name '*.ts' -o -name '*.tsx' \))
-	cd site
+node_modules/.installed: package.json
+	./scripts/pnpm_install.sh
+
+offlinedocs/node_modules/.installed: offlinedocs/package.json
+	cd offlinedocs/
+	../scripts/pnpm_install.sh
+
+site/node_modules/.installed: site/package.json
+	cd site/
+	../scripts/pnpm_install.sh
+
+SITE_GEN_FILES := \
+	site/src/api/typesGenerated.ts \
+	site/src/api/rbacresourcesGenerated.ts \
+	site/src/api/countriesGenerated.ts \
+	site/src/theme/icons.json
+
+site/out/index.html: \
+	site/node_modules/.installed \
+	site/static/install.sh \
+	$(SITE_GEN_FILES) \
+	$(shell find ./site $(FIND_EXCLUSIONS) -type f \( -name '*.ts' -o -name '*.tsx' \))
+	cd site/
 	# prevents this directory from getting to big, and causing "too much data" errors
 	rm -rf out/assets/
-	../scripts/pnpm_install.sh
 	pnpm build
 
-offlinedocs/out/index.html: $(shell find ./offlinedocs $(FIND_EXCLUSIONS) -type f) $(shell find ./docs $(FIND_EXCLUSIONS) -type f | sed 's: :\\ :g')
-	cd offlinedocs
+offlinedocs/out/index.html: offlinedocs/node_modules/.installed $(shell find ./offlinedocs $(FIND_EXCLUSIONS) -type f) $(shell find ./docs $(FIND_EXCLUSIONS) -type f | sed 's: :\\ :g')
+	cd offlinedocs/
 	../scripts/pnpm_install.sh
 	pnpm export
 
@@ -382,36 +431,44 @@ install: build/coder_$(VERSION)_$(GOOS)_$(GOARCH)$(GOOS_BIN_EXT)
 	cp "$<" "$$output_file"
 .PHONY: install
 
-BOLD := $(shell tput bold)
-GREEN := $(shell tput setaf 2)
-RESET := $(shell tput sgr0)
+BOLD := $(shell tput bold 2>/dev/null)
+GREEN := $(shell tput setaf 2 2>/dev/null)
+RESET := $(shell tput sgr0 2>/dev/null)
 
-fmt: fmt/eslint fmt/prettier fmt/terraform fmt/shfmt fmt/go
+fmt: fmt/ts fmt/go fmt/terraform fmt/shfmt fmt/biome fmt/markdown
 .PHONY: fmt
 
 fmt/go:
+	go mod tidy
 	echo "$(GREEN)==>$(RESET) $(BOLD)fmt/go$(RESET)"
 	# VS Code users should check out
 	# https://github.com/mvdan/gofumpt#visual-studio-code
-	go run mvdan.cc/gofumpt@v0.4.0 -w -l .
+	find . $(FIND_EXCLUSIONS) -type f -name '*.go' -print0 | \
+		xargs -0 grep --null -L "DO NOT EDIT" | \
+		xargs -0 go run mvdan.cc/gofumpt@v0.4.0 -w -l
 .PHONY: fmt/go
 
-fmt/eslint:
-	echo "$(GREEN)==>$(RESET) $(BOLD)fmt/eslint$(RESET)"
+fmt/ts: site/node_modules/.installed
+	echo "$(GREEN)==>$(RESET) $(BOLD)fmt/ts$(RESET)"
 	cd site
-	pnpm run lint:fix
-.PHONY: fmt/eslint
+# Avoid writing files in CI to reduce file write activity
+ifdef CI
+	pnpm run check --linter-enabled=false
+else
+	pnpm run check:fix
+endif
+.PHONY: fmt/ts
 
-fmt/prettier:
-	echo "$(GREEN)==>$(RESET) $(BOLD)fmt/prettier$(RESET)"
-	cd site
+fmt/biome: site/node_modules/.installed
+	echo "$(GREEN)==>$(RESET) $(BOLD)fmt/biome$(RESET)"
+	cd site/
 # Avoid writing files in CI to reduce file write activity
 ifdef CI
 	pnpm run format:check
 else
 	pnpm run format
 endif
-.PHONY: fmt/prettier
+.PHONY: fmt/biome
 
 fmt/terraform: $(wildcard *.tf)
 	echo "$(GREEN)==>$(RESET) $(BOLD)fmt/terraform$(RESET)"
@@ -428,23 +485,28 @@ else
 endif
 .PHONY: fmt/shfmt
 
-lint: lint/shellcheck lint/go lint/ts lint/examples lint/helm lint/site-icons
+fmt/markdown: node_modules/.installed
+	echo "$(GREEN)==>$(RESET) $(BOLD)fmt/markdown$(RESET)"
+	pnpm format-docs
+.PHONY: fmt/markdown
+
+lint: lint/shellcheck lint/go lint/ts lint/examples lint/helm lint/site-icons lint/markdown
 .PHONY: lint
 
 lint/site-icons:
 	./scripts/check_site_icons.sh
 .PHONY: lint/site-icons
 
-lint/ts:
-	cd site
-	pnpm i && pnpm lint
+lint/ts: site/node_modules/.installed
+	cd site/
+	pnpm lint
 .PHONY: lint/ts
 
 lint/go:
 	./scripts/check_enterprise_imports.sh
-	linter_ver=$(shell egrep -o 'GOLANGCI_LINT_VERSION=\S+' dogfood/Dockerfile | cut -d '=' -f 2)
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@v$$linter_ver
-	golangci-lint run
+	./scripts/check_codersdk_imports.sh
+	linter_ver=$(shell egrep -o 'GOLANGCI_LINT_VERSION=\S+' dogfood/contents/Dockerfile | cut -d '=' -f 2)
+	go run github.com/golangci/golangci-lint/cmd/golangci-lint@v$$linter_ver run
 .PHONY: lint/go
 
 lint/examples:
@@ -458,13 +520,18 @@ lint/shellcheck: $(SHELL_SRC_FILES)
 .PHONY: lint/shellcheck
 
 lint/helm:
-	cd helm
+	cd helm/
 	make lint
 .PHONY: lint/helm
+
+lint/markdown: node_modules/.installed
+	pnpm lint-docs
+.PHONY: lint/markdown
 
 # All files generated by the database should be added here, and this can be used
 # as a target for jobs that need to run after the database is generated.
 DB_GEN_FILES := \
+	coderd/database/dump.sql \
 	coderd/database/querier.go \
 	coderd/database/unique_constraint.go \
 	coderd/database/dbmem/dbmem.go \
@@ -472,32 +539,39 @@ DB_GEN_FILES := \
 	coderd/database/dbauthz/dbauthz.go \
 	coderd/database/dbmock/dbmock.go
 
-# all gen targets should be added here and to gen/mark-fresh
-gen: \
+TAILNETTEST_MOCKS := \
+	tailnet/tailnettest/coordinatormock.go \
+	tailnet/tailnettest/coordinateemock.go \
+	tailnet/tailnettest/workspaceupdatesprovidermock.go \
+	tailnet/tailnettest/subscriptionmock.go
+
+GEN_FILES := \
 	tailnet/proto/tailnet.pb.go \
 	agent/proto/agent.pb.go \
 	provisionersdk/proto/provisioner.pb.go \
 	provisionerd/proto/provisionerd.pb.go \
-	coderd/database/dump.sql \
+	vpn/vpn.pb.go \
 	$(DB_GEN_FILES) \
-	site/src/api/typesGenerated.ts \
+	$(SITE_GEN_FILES) \
 	coderd/rbac/object_gen.go \
-	docs/admin/prometheus.md \
-	docs/cli.md \
-	docs/admin/audit-logs.md \
+	codersdk/rbacresources_gen.go \
+	docs/admin/integrations/prometheus.md \
+	docs/reference/cli/index.md \
+	docs/admin/security/audit-logs.md \
 	coderd/apidoc/swagger.json \
-	.prettierignore.include \
-	.prettierignore \
-	site/.prettierrc.yaml \
-	site/.prettierignore \
-	site/.eslintignore \
+	provisioner/terraform/testdata/version \
 	site/e2e/provisionerGenerated.ts \
-	site/src/theme/icons.json \
 	examples/examples.gen.json \
-	tailnet/tailnettest/coordinatormock.go \
-	tailnet/tailnettest/coordinateemock.go \
-	tailnet/tailnettest/multiagentmock.go
+	$(TAILNETTEST_MOCKS) \
+	coderd/database/pubsub/psmock/psmock.go
+
+
+# all gen targets should be added here and to gen/mark-fresh
+gen: gen/db $(GEN_FILES)
 .PHONY: gen
+
+gen/db: $(DB_GEN_FILES)
+.PHONY: gen/db
 
 # Mark all generated files as fresh so make thinks they're up-to-date. This is
 # used during releases so we don't run generation scripts.
@@ -507,26 +581,25 @@ gen/mark-fresh:
 		agent/proto/agent.pb.go \
 		provisionersdk/proto/provisioner.pb.go \
 		provisionerd/proto/provisionerd.pb.go \
+		vpn/vpn.pb.go \
 		coderd/database/dump.sql \
 		$(DB_GEN_FILES) \
 		site/src/api/typesGenerated.ts \
 		coderd/rbac/object_gen.go \
-		docs/admin/prometheus.md \
-		docs/cli.md \
-		docs/admin/audit-logs.md \
+		codersdk/rbacresources_gen.go \
+		site/src/api/rbacresourcesGenerated.ts \
+		site/src/api/countriesGenerated.ts \
+		docs/admin/integrations/prometheus.md \
+		docs/reference/cli/index.md \
+		docs/admin/security/audit-logs.md \
 		coderd/apidoc/swagger.json \
-		.prettierignore.include \
-		.prettierignore \
-		site/.prettierrc.yaml \
-		site/.prettierignore \
-		site/.eslintignore \
 		site/e2e/provisionerGenerated.ts \
 		site/src/theme/icons.json \
 		examples/examples.gen.json \
-		tailnet/tailnettest/coordinatormock.go \
-		tailnet/tailnettest/coordinateemock.go \
-		tailnet/tailnettest/multiagentmock.go \
-	"
+		$(TAILNETTEST_MOCKS) \
+		coderd/database/pubsub/psmock/psmock.go \
+		"
+
 	for file in $$files; do
 		echo "$$file"
 		if [ ! -f "$$file" ]; then
@@ -535,7 +608,7 @@ gen/mark-fresh:
 		fi
 
 		# touch sets the mtime of the file to the current time
-		touch $$file
+		touch "$$file"
 	done
 .PHONY: gen/mark-fresh
 
@@ -553,7 +626,10 @@ coderd/database/querier.go: coderd/database/sqlc.yaml coderd/database/dump.sql $
 coderd/database/dbmock/dbmock.go: coderd/database/db.go coderd/database/querier.go
 	go generate ./coderd/database/dbmock/
 
-tailnet/tailnettest/coordinatormock.go tailnet/tailnettest/multiagentmock.go tailnet/tailnettest/coordinateemock.go: tailnet/coordinator.go tailnet/multiagent.go
+coderd/database/pubsub/psmock/psmock.go: coderd/database/pubsub/pubsub.go
+	go generate ./coderd/database/pubsub/psmock
+
+$(TAILNETTEST_MOCKS): tailnet/coordinator.go tailnet/service.go
 	go generate ./tailnet/tailnettest/
 
 tailnet/proto/tailnet.pb.go: tailnet/proto/tailnet.proto
@@ -588,61 +664,105 @@ provisionerd/proto/provisionerd.pb.go: provisionerd/proto/provisionerd.proto
 		--go-drpc_opt=paths=source_relative \
 		./provisionerd/proto/provisionerd.proto
 
-site/src/api/typesGenerated.ts: $(wildcard scripts/apitypings/*) $(shell find ./codersdk $(FIND_EXCLUSIONS) -type f -name '*.go')
-	go run ./scripts/apitypings/ > $@
-	./scripts/pnpm_install.sh
-	pnpm exec prettier --write "$@"
+vpn/vpn.pb.go: vpn/vpn.proto
+	protoc \
+		--go_out=. \
+		--go_opt=paths=source_relative \
+		./vpn/vpn.proto
 
-site/e2e/provisionerGenerated.ts: provisionerd/proto/provisionerd.pb.go provisionersdk/proto/provisioner.pb.go
-	cd site
-	../scripts/pnpm_install.sh
+site/src/api/typesGenerated.ts: site/node_modules/.installed $(wildcard scripts/apitypings/*) $(shell find ./codersdk $(FIND_EXCLUSIONS) -type f -name '*.go')
+	# -C sets the directory for the go run command
+	go run -C ./scripts/apitypings main.go > $@
+	cd site/
+	pnpm exec biome format --write src/api/typesGenerated.ts
+
+site/e2e/provisionerGenerated.ts: site/node_modules/.installed provisionerd/proto/provisionerd.pb.go provisionersdk/proto/provisioner.pb.go
+	cd site/
 	pnpm run gen:provisioner
 
-site/src/theme/icons.json: $(wildcard scripts/gensite/*) $(wildcard site/static/icon/*)
+site/src/theme/icons.json: site/node_modules/.installed $(wildcard scripts/gensite/*) $(wildcard site/static/icon/*)
 	go run ./scripts/gensite/ -icons "$@"
-	./scripts/pnpm_install.sh
-	pnpm exec prettier --write "$@"
+	cd site/
+	pnpm exec biome format --write src/theme/icons.json
 
 examples/examples.gen.json: scripts/examplegen/main.go examples/examples.go $(shell find ./examples/templates)
 	go run ./scripts/examplegen/main.go > examples/examples.gen.json
 
-coderd/rbac/object_gen.go: scripts/rbacgen/main.go coderd/rbac/object.go
-	go run scripts/rbacgen/main.go ./coderd/rbac > coderd/rbac/object_gen.go
+coderd/rbac/object_gen.go: scripts/typegen/rbacobject.gotmpl scripts/typegen/main.go coderd/rbac/object.go coderd/rbac/policy/policy.go
+	tempdir=$(shell mktemp -d /tmp/typegen_rbac_object.XXXXXX)
+	go run ./scripts/typegen/main.go rbac object > "$$tempdir/object_gen.go"
+	mv -v "$$tempdir/object_gen.go" coderd/rbac/object_gen.go
+	rmdir -v "$$tempdir"
 
-docs/admin/prometheus.md: scripts/metricsdocgen/main.go scripts/metricsdocgen/metrics
+codersdk/rbacresources_gen.go: scripts/typegen/codersdk.gotmpl scripts/typegen/main.go coderd/rbac/object.go coderd/rbac/policy/policy.go
+	# Do no overwrite codersdk/rbacresources_gen.go directly, as it would make the file empty, breaking
+ 	# the `codersdk` package and any parallel build targets.
+	go run scripts/typegen/main.go rbac codersdk > /tmp/rbacresources_gen.go
+	mv /tmp/rbacresources_gen.go codersdk/rbacresources_gen.go
+
+site/src/api/rbacresourcesGenerated.ts: site/node_modules/.installed scripts/typegen/codersdk.gotmpl scripts/typegen/main.go coderd/rbac/object.go coderd/rbac/policy/policy.go
+	go run scripts/typegen/main.go rbac typescript > "$@"
+	cd site/
+	pnpm exec biome format --write src/api/rbacresourcesGenerated.ts
+
+site/src/api/countriesGenerated.ts: site/node_modules/.installed scripts/typegen/countries.tstmpl scripts/typegen/main.go codersdk/countries.go
+	go run scripts/typegen/main.go countries > "$@"
+	cd site/
+	pnpm exec biome format --write src/api/countriesGenerated.ts
+
+docs/admin/integrations/prometheus.md: node_modules/.installed scripts/metricsdocgen/main.go scripts/metricsdocgen/metrics
 	go run scripts/metricsdocgen/main.go
-	./scripts/pnpm_install.sh
-	pnpm exec prettier --write ./docs/admin/prometheus.md
+	pnpm exec markdownlint-cli2 --fix ./docs/admin/integrations/prometheus.md
+	pnpm exec markdown-table-formatter ./docs/admin/integrations/prometheus.md
 
-docs/cli.md: scripts/clidocgen/main.go examples/examples.gen.json $(GO_SRC_FILES)
+docs/reference/cli/index.md: node_modules/.installed site/node_modules/.installed scripts/clidocgen/main.go examples/examples.gen.json $(GO_SRC_FILES)
 	CI=true BASE_PATH="." go run ./scripts/clidocgen
-	./scripts/pnpm_install.sh
-	pnpm exec prettier --write ./docs/cli.md ./docs/cli/*.md ./docs/manifest.json
+	pnpm exec markdownlint-cli2 --fix ./docs/reference/cli/*.md
+	pnpm exec markdown-table-formatter ./docs/reference/cli/*.md
+	cd site/
+	pnpm exec biome format --write ../docs/manifest.json
 
-docs/admin/audit-logs.md: coderd/database/querier.go scripts/auditdocgen/main.go enterprise/audit/table.go coderd/rbac/object_gen.go
+docs/admin/security/audit-logs.md: node_modules/.installed coderd/database/querier.go scripts/auditdocgen/main.go enterprise/audit/table.go coderd/rbac/object_gen.go
 	go run scripts/auditdocgen/main.go
-	./scripts/pnpm_install.sh
-	pnpm exec prettier --write ./docs/admin/audit-logs.md
+	pnpm exec markdownlint-cli2 --fix ./docs/admin/security/audit-logs.md
+	pnpm exec markdown-table-formatter ./docs/admin/security/audit-logs.md
 
-coderd/apidoc/swagger.json: $(shell find ./scripts/apidocgen $(FIND_EXCLUSIONS) -type f) $(wildcard coderd/*.go) $(wildcard enterprise/coderd/*.go) $(wildcard codersdk/*.go) $(wildcard enterprise/wsproxy/wsproxysdk/*.go) $(DB_GEN_FILES) .swaggo docs/manifest.json coderd/rbac/object_gen.go
+coderd/apidoc/swagger.json: node_modules/.installed site/node_modules/.installed $(shell find ./scripts/apidocgen $(FIND_EXCLUSIONS) -type f) $(wildcard coderd/*.go) $(wildcard enterprise/coderd/*.go) $(wildcard codersdk/*.go) $(wildcard enterprise/wsproxy/wsproxysdk/*.go) $(DB_GEN_FILES) .swaggo docs/manifest.json coderd/rbac/object_gen.go
 	./scripts/apidocgen/generate.sh
-	./scripts/pnpm_install.sh
-	pnpm exec prettier --write ./docs/api ./docs/manifest.json ./coderd/apidoc/swagger.json
+	pnpm exec markdownlint-cli2 --fix ./docs/reference/api/*.md
+	pnpm exec markdown-table-formatter ./docs/reference/api/*.md
+	cd site/
+	pnpm exec biome format --write ../docs/manifest.json ../coderd/apidoc/swagger.json
 
 update-golden-files: \
 	cli/testdata/.gen-golden \
-	helm/coder/tests/testdata/.gen-golden \
-	helm/provisioner/tests/testdata/.gen-golden \
-	scripts/ci-report/testdata/.gen-golden \
+	coderd/.gen-golden \
+	coderd/notifications/.gen-golden \
 	enterprise/cli/testdata/.gen-golden \
 	enterprise/tailnet/testdata/.gen-golden \
-	tailnet/testdata/.gen-golden \
-	coderd/.gen-golden \
-	provisioner/terraform/testdata/.gen-golden
+	helm/coder/tests/testdata/.gen-golden \
+	helm/provisioner/tests/testdata/.gen-golden \
+	provisioner/terraform/testdata/.gen-golden \
+	tailnet/testdata/.gen-golden
 .PHONY: update-golden-files
 
+clean/golden-files:
+	find . -type f -name '.gen-golden' -delete
+	find \
+		cli/testdata \
+		coderd/notifications/testdata \
+		coderd/testdata \
+		enterprise/cli/testdata \
+		enterprise/tailnet/testdata \
+		helm/coder/tests/testdata \
+		helm/provisioner/tests/testdata \
+		provisioner/terraform/testdata \
+		tailnet/testdata \
+		-type f -name '*.golden' -delete
+.PHONY: clean/golden-files
+
 cli/testdata/.gen-golden: $(wildcard cli/testdata/*.golden) $(wildcard cli/*.tpl) $(GO_SRC_FILES) $(wildcard cli/*_test.go)
-	go test ./cli -run="Test(CommandHelp|ServerYAML)" -update
+	go test ./cli -run="Test(CommandHelp|ServerYAML|ErrorExamples|.*Golden)" -update
 	touch "$@"
 
 enterprise/cli/testdata/.gen-golden: $(wildcard enterprise/cli/testdata/*.golden) $(wildcard cli/*.tpl) $(GO_SRC_FILES) $(wildcard enterprise/cli/*_test.go)
@@ -669,77 +789,27 @@ coderd/.gen-golden: $(wildcard coderd/testdata/*/*.golden) $(GO_SRC_FILES) $(wil
 	go test ./coderd -run="Test.*Golden$$" -update
 	touch "$@"
 
+coderd/notifications/.gen-golden: $(wildcard coderd/notifications/testdata/*/*.golden) $(GO_SRC_FILES) $(wildcard coderd/notifications/*_test.go)
+	go test ./coderd/notifications -run="Test.*Golden$$" -update
+	touch "$@"
+
 provisioner/terraform/testdata/.gen-golden: $(wildcard provisioner/terraform/testdata/*/*.golden) $(GO_SRC_FILES) $(wildcard provisioner/terraform/*_test.go)
 	go test ./provisioner/terraform -run="Test.*Golden$$" -update
 	touch "$@"
 
-scripts/ci-report/testdata/.gen-golden: $(wildcard scripts/ci-report/testdata/*) $(wildcard scripts/ci-report/*.go)
-	go test ./scripts/ci-report -run=TestOutputMatchesGoldenFile -update
-	touch "$@"
-
-# Generate a prettierrc for the site package that uses relative paths for
-# overrides. This allows us to share the same prettier config between the
-# site and the root of the repo.
-site/.prettierrc.yaml: .prettierrc.yaml
-	. ./scripts/lib.sh
-	dependencies yq
-
-	echo "# Code generated by Makefile (../$<). DO NOT EDIT." > "$@"
-	echo "" >> "$@"
-
-	# Replace all listed override files with relative paths inside site/.
-	# - ./ -> ../
-	# - ./site -> ./
-	yq \
-		'.overrides[].files |= map(. | sub("^./"; "") | sub("^"; "../") | sub("../site/"; "./") | sub("../!"; "!../"))' \
-		"$<" >> "$@"
-
-# Combine .gitignore with .prettierignore.include to generate .prettierignore.
-.prettierignore: .gitignore .prettierignore.include
-	echo "# Code generated by Makefile ($^). DO NOT EDIT." > "$@"
-	echo "" >> "$@"
-	for f in $^; do
-		echo "# $${f}:" >> "$@"
-		cat "$$f" >> "$@"
-	done
-
-# Generate ignore files based on gitignore into the site directory. We turn all
-# rules into relative paths for the `site/` directory (where applicable),
-# following the pattern format defined by git:
-# https://git-scm.com/docs/gitignore#_pattern_format
-#
-# This is done for compatibility reasons, see:
-# https://github.com/prettier/prettier/issues/8048
-# https://github.com/prettier/prettier/issues/8506
-# https://github.com/prettier/prettier/issues/8679
-site/.eslintignore site/.prettierignore: .prettierignore Makefile
-	rm -f "$@"
-	touch "$@"
-	# Skip generated by header, inherit `.prettierignore` header as-is.
-	while read -r rule; do
-		# Remove leading ! if present to simplify rule, added back at the end.
-		tmp="$${rule#!}"
-		ignore="$${rule%"$$tmp"}"
-		rule="$$tmp"
-		case "$$rule" in
-			# Comments or empty lines (include).
-			\#*|'') ;;
-			# Generic rules (include).
-			\*\**) ;;
-			# Site prefixed rules (include).
-			site/*) rule="$${rule#site/}";;
-			./site/*) rule="$${rule#./site/}";;
-			# Rules that are non-generic and don't start with site (rewrite).
-			/*) rule=.."$$rule";;
-			*/?*) rule=../"$$rule";;
-			*) ;;
-		esac
-		echo "$${ignore}$${rule}" >> "$@"
-	done < "$<"
+provisioner/terraform/testdata/version:
+	if [[ "$(shell cat provisioner/terraform/testdata/version.txt)" != "$(shell terraform version -json | jq -r '.terraform_version')" ]]; then
+		./provisioner/terraform/testdata/generate.sh
+	fi
+.PHONY: provisioner/terraform/testdata/version
 
 test:
-	gotestsum --format standard-quiet -- -v -short -count=1 ./...
+	$(GIT_FLAGS) gotestsum --format standard-quiet -- -v -short -count=1 ./...
 .PHONY: test
+
+test-cli:
+	$(GIT_FLAGS) gotestsum --format standard-quiet -- -v -short -count=1 ./cli/...
+.PHONY: test-cli
 
 # sqlc-cloud-is-setup will fail if no SQLc auth token is set. Use this as a
 # dependency for any sqlc-cloud related targets.
@@ -774,7 +844,7 @@ sqlc-vet: test-postgres-docker
 test-postgres: test-postgres-docker
 	# The postgres test is prone to failure, so we limit parallelism for
 	# more consistent execution.
-	DB=ci DB_FROM=$(shell go run scripts/migrate-ci/main.go) gotestsum \
+	$(GIT_FLAGS)  DB=ci gotestsum \
 		--junitfile="gotests.xml" \
 		--jsonfile="gotests.json" \
 		--packages="./..." -- \
@@ -783,8 +853,45 @@ test-postgres: test-postgres-docker
 		-count=1
 .PHONY: test-postgres
 
+test-migrations: test-postgres-docker
+	echo "--- test migrations"
+	set -euo pipefail
+	COMMIT_FROM=$(shell git log -1 --format='%h' HEAD)
+	echo "COMMIT_FROM=$${COMMIT_FROM}"
+	COMMIT_TO=$(shell git log -1 --format='%h' origin/main)
+	echo "COMMIT_TO=$${COMMIT_TO}"
+	if [[ "$${COMMIT_FROM}" == "$${COMMIT_TO}" ]]; then echo "Nothing to do!"; exit 0; fi
+	echo "DROP DATABASE IF EXISTS migrate_test_$${COMMIT_FROM}; CREATE DATABASE migrate_test_$${COMMIT_FROM};" | psql 'postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable'
+	go run ./scripts/migrate-test/main.go --from="$$COMMIT_FROM" --to="$$COMMIT_TO" --postgres-url="postgresql://postgres:postgres@localhost:5432/migrate_test_$${COMMIT_FROM}?sslmode=disable"
+.PHONY: test-migrations
+
+# NOTE: we set --memory to the same size as a GitHub runner.
 test-postgres-docker:
-	docker rm -f test-postgres-docker || true
+	docker rm -f test-postgres-docker-${POSTGRES_VERSION} || true
+
+	# Try pulling up to three times to avoid CI flakes.
+	docker pull gcr.io/coder-dev-1/postgres:${POSTGRES_VERSION} || {
+		retries=2
+		for try in $(seq 1 ${retries}); do
+			echo "Failed to pull image, retrying (${try}/${retries})..."
+			sleep 1
+			if docker pull gcr.io/coder-dev-1/postgres:${POSTGRES_VERSION}; then
+				break
+			fi
+		done
+	}
+
+	# Make sure to not overallocate work_mem and max_connections as each
+	# connection will be allowed to use this much memory. Try adjusting
+	# shared_buffers instead, if needed.
+	#
+	# - work_mem=8MB * max_connections=1000 = 8GB
+	# - shared_buffers=2GB + effective_cache_size=1GB = 3GB
+	#
+	# This leaves 5GB for the rest of the system _and_ storing the
+	# database in memory (--tmpfs).
+	#
+	# https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-WORK-MEM
 	docker run \
 		--env POSTGRES_PASSWORD=postgres \
 		--env POSTGRES_USER=postgres \
@@ -792,13 +899,14 @@ test-postgres-docker:
 		--env PGDATA=/tmp \
 		--tmpfs /tmp \
 		--publish 5432:5432 \
-		--name test-postgres-docker \
+		--name test-postgres-docker-${POSTGRES_VERSION} \
 		--restart no \
 		--detach \
-		gcr.io/coder-dev-1/postgres:13 \
-		-c shared_buffers=1GB \
-		-c work_mem=1GB \
+		--memory 16GB \
+		gcr.io/coder-dev-1/postgres:${POSTGRES_VERSION} \
+		-c shared_buffers=2GB \
 		-c effective_cache_size=1GB \
+		-c work_mem=8MB \
 		-c max_connections=1000 \
 		-c fsync=off \
 		-c synchronous_commit=off \
@@ -813,8 +921,21 @@ test-postgres-docker:
 
 # Make sure to keep this in sync with test-go-race from .github/workflows/ci.yaml.
 test-race:
-	gotestsum --junitfile="gotests.xml" -- -race -count=1 ./...
+	$(GIT_FLAGS) gotestsum --junitfile="gotests.xml" -- -race -count=1 -parallel 4 -p 4 ./...
 .PHONY: test-race
+
+test-tailnet-integration:
+	env \
+		CODER_TAILNET_TESTS=true \
+		CODER_MAGICSOCK_DEBUG_LOGGING=true \
+		TS_DEBUG_NETCHECK=true \
+		GOTRACEBACK=single \
+		go test \
+			-exec "sudo -E" \
+			-timeout=5m \
+			-count=1 \
+			./tailnet/test/integration
+.PHONY: test-tailnet-integration
 
 # Note: we used to add this to the test target, but it's not necessary and we can
 # achieve the desired result by specifying -count=1 in the go test invocation
@@ -822,3 +943,17 @@ test-race:
 test-clean:
 	go clean -testcache
 .PHONY: test-clean
+
+site/e2e/bin/coder: go.mod go.sum $(GO_SRC_FILES)
+	go build -o $@ \
+		-tags ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube \
+		./enterprise/cmd/coder
+
+test-e2e: site/e2e/bin/coder site/node_modules/.installed site/out/index.html
+	cd site/
+ifdef CI
+	DEBUG=pw:api pnpm playwright:test --forbid-only --workers 1
+else
+	pnpm playwright:test
+endif
+.PHONY: test-e2e

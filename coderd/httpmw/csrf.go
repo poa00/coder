@@ -1,6 +1,7 @@
 package httpmw
 
 import (
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
@@ -20,6 +21,22 @@ func CSRF(secureCookie bool) func(next http.Handler) http.Handler {
 		mw := nosurf.New(next)
 		mw.SetBaseCookie(http.Cookie{Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: secureCookie})
 		mw.SetFailureHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sessCookie, err := r.Cookie(codersdk.SessionTokenCookie)
+			if err == nil &&
+				r.Header.Get(codersdk.SessionTokenHeader) != "" &&
+				r.Header.Get(codersdk.SessionTokenHeader) != sessCookie.Value {
+				// If a user is using header authentication and cookie auth, but the values
+				// do not match, the cookie value takes priority.
+				// At the very least, return a more helpful error to the user.
+				http.Error(w,
+					fmt.Sprintf("CSRF error encountered. Authentication via %q cookie and %q header detected, but the values do not match. "+
+						"To resolve this issue ensure the values used in both match, or only use one of the authentication methods. "+
+						"You can also try clearing your cookies if this error persists.",
+						codersdk.SessionTokenCookie, codersdk.SessionTokenHeader),
+					http.StatusBadRequest)
+				return
+			}
+
 			http.Error(w, "Something is wrong with your CSRF token. Please refresh the page. If this error persists, try clearing your cookies.", http.StatusBadRequest)
 		}))
 
@@ -72,6 +89,13 @@ func CSRF(secureCookie bool) func(next http.Handler) http.Handler {
 			}
 
 			if r.Header.Get(codersdk.ProvisionerDaemonPSK) != "" {
+				// If present, the provisioner daemon also is providing an api key
+				// that will make them exempt from CSRF. But this is still useful
+				// for enumerating the external auths.
+				return true
+			}
+
+			if r.Header.Get(codersdk.ProvisionerDaemonKey) != "" {
 				// If present, the provisioner daemon also is providing an api key
 				// that will make them exempt from CSRF. But this is still useful
 				// for enumerating the external auths.

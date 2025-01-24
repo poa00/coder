@@ -1,6 +1,7 @@
 package terraform
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -9,7 +10,11 @@ import (
 	"github.com/mitchellh/mapstructure"
 	"golang.org/x/xerrors"
 
+	"cdr.dev/slog"
+
 	"github.com/coder/terraform-provider-coder/provider"
+
+	tfaddr "github.com/hashicorp/go-terraform-address"
 
 	"github.com/coder/coder/v2/coderd/util/slice"
 	stringutil "github.com/coder/coder/v2/coderd/util/strings"
@@ -78,6 +83,8 @@ type agentAppAttributes struct {
 	Subdomain   bool                       `mapstructure:"subdomain"`
 	Healthcheck []appHealthcheckAttributes `mapstructure:"healthcheck"`
 	Order       int64                      `mapstructure:"order"`
+	Hidden      bool                       `mapstructure:"hidden"`
+	OpenIn      string                     `mapstructure:"open_in"`
 }
 
 type agentEnvAttributes struct {
@@ -128,10 +135,12 @@ type State struct {
 	ExternalAuthProviders []*proto.ExternalAuthProviderResource
 }
 
+var ErrInvalidTerraformAddr = xerrors.New("invalid terraform address")
+
 // ConvertState consumes Terraform state and a GraphViz representation
 // produced by `terraform graph` to produce resources consumable by Coder.
 // nolint:gocognit // This function makes more sense being large for now, until refactored.
-func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error) {
+func ConvertState(ctx context.Context, modules []*tfjson.StateModule, rawGraph string, logger slog.Logger) (*State, error) {
 	parsedGraph, err := gographviz.ParseString(rawGraph)
 	if err != nil {
 		return nil, xerrors.Errorf("parse graph: %w", err)
@@ -424,12 +433,22 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 				sharingLevel = proto.AppSharingLevel_PUBLIC
 			}
 
+			openIn := proto.AppOpenIn_SLIM_WINDOW
+			switch strings.ToLower(attrs.OpenIn) {
+			case "slim-window":
+				openIn = proto.AppOpenIn_SLIM_WINDOW
+			case "tab":
+				openIn = proto.AppOpenIn_TAB
+			}
+
 			for _, agents := range resourceAgents {
 				for _, agent := range agents {
 					// Find agents with the matching ID and associate them!
-					if agent.Id != attrs.AgentID {
+
+					if !dependsOnAgent(graph, agent, attrs.AgentID, resource) {
 						continue
 					}
+
 					agent.Apps = append(agent.Apps, &proto.App{
 						Slug:         attrs.Slug,
 						DisplayName:  attrs.DisplayName,
@@ -441,6 +460,8 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 						SharingLevel: sharingLevel,
 						Healthcheck:  healthcheck,
 						Order:        attrs.Order,
+						Hidden:       attrs.Hidden,
+						OpenIn:       openIn,
 					})
 				}
 			}
@@ -461,7 +482,7 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 			for _, agents := range resourceAgents {
 				for _, agent := range agents {
 					// Find agents with the matching ID and associate them!
-					if agent.Id != attrs.AgentID {
+					if !dependsOnAgent(graph, agent, attrs.AgentID, resource) {
 						continue
 					}
 					agent.ExtraEnvs = append(agent.ExtraEnvs, &proto.Env{
@@ -487,7 +508,7 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 			for _, agents := range resourceAgents {
 				for _, agent := range agents {
 					// Find agents with the matching ID and associate them!
-					if agent.Id != attrs.AgentID {
+					if !dependsOnAgent(graph, agent, attrs.AgentID, resource) {
 						continue
 					}
 					agent.Scripts = append(agent.Scripts, &proto.Script{
@@ -589,6 +610,20 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 				continue
 			}
 			label := convertAddressToLabel(resource.Address)
+			modulePath, err := convertAddressToModulePath(resource.Address)
+			if err != nil {
+				// Module path recording was added primarily to keep track of
+				// modules in telemetry. We're adding this sentinel value so
+				// we can detect if there are any issues with the address
+				// parsing.
+				//
+				// We don't want to set modulePath to null here because, in
+				// the database, a null value in WorkspaceResource's ModulePath
+				// indicates "this resource was created before module paths
+				// were tracked."
+				modulePath = fmt.Sprintf("%s", ErrInvalidTerraformAddr)
+				logger.Error(ctx, "failed to parse Terraform address", slog.F("address", resource.Address))
+			}
 
 			agents, exists := resourceAgents[label]
 			if exists {
@@ -604,6 +639,7 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 				Icon:         resourceIcon[label],
 				DailyCost:    resourceCost[label],
 				InstanceType: applyInstanceType(resource),
+				ModulePath:   modulePath,
 			})
 		}
 	}
@@ -746,6 +782,44 @@ func PtrInt32(number int) *int32 {
 func convertAddressToLabel(address string) string {
 	cut, _, _ := strings.Cut(address, "[")
 	return cut
+}
+
+// convertAddressToModulePath returns the module path from a Terraform address.
+// eg. "module.ec2_dev.ec2_instance.dev[0]" becomes "module.ec2_dev".
+// Empty string is returned for the root module.
+//
+// Module paths are defined in the Terraform spec:
+// https://github.com/hashicorp/terraform/blob/ef071f3d0e49ba421ae931c65b263827a8af1adb/website/docs/internals/resource-addressing.html.markdown#module-path
+func convertAddressToModulePath(address string) (string, error) {
+	addr, err := tfaddr.NewAddress(address)
+	if err != nil {
+		return "", xerrors.Errorf("parse terraform address: %w", err)
+	}
+	return addr.ModulePath.String(), nil
+}
+
+func dependsOnAgent(graph *gographviz.Graph, agent *proto.Agent, resourceAgentID string, resource *tfjson.StateResource) bool {
+	// Plan: we need to find if there is edge between the agent and the resource.
+	if agent.Id == "" && resourceAgentID == "" {
+		resourceNodeSuffix := fmt.Sprintf(`] %s.%s (expand)"`, resource.Type, resource.Name)
+		agentNodeSuffix := fmt.Sprintf(`] coder_agent.%s (expand)"`, agent.Name)
+
+		// Traverse the graph to check if the coder_<resource_type> depends on coder_agent.
+		for _, dst := range graph.Edges.SrcToDsts {
+			for _, edges := range dst {
+				for _, edge := range edges {
+					if strings.HasSuffix(edge.Src, resourceNodeSuffix) &&
+						strings.HasSuffix(edge.Dst, agentNodeSuffix) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	// Provision: agent ID and child resource ID are present
+	return agent.Id == resourceAgentID
 }
 
 type graphResource struct {

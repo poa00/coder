@@ -138,6 +138,7 @@ func Test_sshConfigSplitOnCoderSection(t *testing.T) {
 
 // This test tries to mimic the behavior of OpenSSH
 // when executing e.g. a ProxyCommand.
+// nolint:tparallel
 func Test_sshConfigExecEscape(t *testing.T) {
 	t.Parallel()
 
@@ -154,11 +155,10 @@ func Test_sshConfigExecEscape(t *testing.T) {
 		{"tabs", "path with \ttabs", false},
 		{"newline fails", "path with \nnewline", true},
 	}
+	// nolint:paralleltest // Fixes a flake
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
 			if runtime.GOOS == "windows" {
 				t.Skip("Windows doesn't typically execute via /bin/sh or cmd.exe, so this test is not applicable.")
 			}
@@ -272,24 +272,25 @@ func Test_sshConfigOptions_addOption(t *testing.T) {
 			},
 		},
 		{
-			Name: "Replace",
+			Name: "AddTwo",
 			Start: []string{
 				"foo bar",
 			},
 			Add: []string{"Foo baz"},
 			Expect: []string{
+				"foo bar",
 				"Foo baz",
 			},
 		},
 		{
-			Name: "AddAndReplace",
+			Name: "AddAndRemove",
 			Start: []string{
-				"a b",
 				"foo bar",
 				"buzz bazz",
 			},
 			Add: []string{
 				"b c",
+				"a ", // Empty value, means remove all following entries that start with "a", i.e. next line.
 				"A hello",
 				"hello world",
 			},
@@ -297,7 +298,6 @@ func Test_sshConfigOptions_addOption(t *testing.T) {
 				"foo bar",
 				"buzz bazz",
 				"b c",
-				"A hello",
 				"hello world",
 			},
 		},

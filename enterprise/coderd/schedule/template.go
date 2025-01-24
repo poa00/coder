@@ -6,6 +6,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cdr.dev/slog"
+
+	"github.com/dustin/go-humanize"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -14,9 +17,11 @@ import (
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
+	"github.com/coder/coder/v2/coderd/notifications"
 	agpl "github.com/coder/coder/v2/coderd/schedule"
 	"github.com/coder/coder/v2/coderd/tracing"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/quartz"
 )
 
 // EnterpriseTemplateScheduleStore provides an agpl.TemplateScheduleStore that
@@ -26,23 +31,30 @@ type EnterpriseTemplateScheduleStore struct {
 	// update.
 	UserQuietHoursScheduleStore *atomic.Pointer[agpl.UserQuietHoursScheduleStore]
 
-	// Custom time.Now() function to use in tests. Defaults to dbtime.Now().
-	TimeNowFn func() time.Time
+	// Clock for testing
+	Clock quartz.Clock
+
+	enqueuer notifications.Enqueuer
+	logger   slog.Logger
 }
 
 var _ agpl.TemplateScheduleStore = &EnterpriseTemplateScheduleStore{}
 
-func NewEnterpriseTemplateScheduleStore(userQuietHoursStore *atomic.Pointer[agpl.UserQuietHoursScheduleStore]) *EnterpriseTemplateScheduleStore {
+func NewEnterpriseTemplateScheduleStore(userQuietHoursStore *atomic.Pointer[agpl.UserQuietHoursScheduleStore], enqueuer notifications.Enqueuer, logger slog.Logger, clock quartz.Clock) *EnterpriseTemplateScheduleStore {
+	if clock == nil {
+		clock = quartz.NewReal()
+	}
+
 	return &EnterpriseTemplateScheduleStore{
 		UserQuietHoursScheduleStore: userQuietHoursStore,
+		Clock:                       clock,
+		enqueuer:                    enqueuer,
+		logger:                      logger,
 	}
 }
 
 func (s *EnterpriseTemplateScheduleStore) now() time.Time {
-	if s.TimeNowFn != nil {
-		return s.TimeNowFn()
-	}
-	return dbtime.Now()
+	return dbtime.Time(s.Clock.Now())
 }
 
 // Get implements agpl.TemplateScheduleStore.
@@ -76,8 +88,6 @@ func (*EnterpriseTemplateScheduleStore) Get(ctx context.Context, db database.Sto
 		UserAutostopEnabled:  tpl.AllowUserAutostop,
 		DefaultTTL:           time.Duration(tpl.DefaultTTL),
 		ActivityBump:         time.Duration(tpl.ActivityBump),
-		MaxTTL:               time.Duration(tpl.MaxTTL),
-		UseMaxTTL:            tpl.UseMaxTtl,
 		AutostopRequirement: agpl.TemplateAutostopRequirement{
 			DaysOfWeek: uint8(tpl.AutostopRequirementDaysOfWeek),
 			Weeks:      tpl.AutostopRequirementWeeks,
@@ -105,8 +115,6 @@ func (s *EnterpriseTemplateScheduleStore) Set(ctx context.Context, db database.S
 
 	if int64(opts.DefaultTTL) == tpl.DefaultTTL &&
 		int64(opts.ActivityBump) == tpl.ActivityBump &&
-		opts.UseMaxTTL != tpl.UseMaxTtl &&
-		int64(opts.MaxTTL) == tpl.MaxTTL &&
 		int16(opts.AutostopRequirement.DaysOfWeek) == tpl.AutostopRequirementDaysOfWeek &&
 		opts.AutostartRequirement.DaysOfWeek == tpl.AutostartAllowedDays() &&
 		opts.AutostopRequirement.Weeks == tpl.AutostopRequirementWeeks &&
@@ -129,7 +137,10 @@ func (s *EnterpriseTemplateScheduleStore) Set(ctx context.Context, db database.S
 		return database.Template{}, xerrors.Errorf("verify autostart requirement: %w", err)
 	}
 
-	var template database.Template
+	var (
+		template          database.Template
+		markedForDeletion []database.WorkspaceTable
+	)
 	err = db.InTx(func(tx database.Store) error {
 		ctx, span := tracing.StartSpanWithName(ctx, "(*schedule.EnterpriseTemplateScheduleStore).Set()-InTx()")
 		defer span.End()
@@ -141,8 +152,6 @@ func (s *EnterpriseTemplateScheduleStore) Set(ctx context.Context, db database.S
 			AllowUserAutostop:             opts.UserAutostopEnabled,
 			DefaultTTL:                    int64(opts.DefaultTTL),
 			ActivityBump:                  int64(opts.ActivityBump),
-			UseMaxTtl:                     opts.UseMaxTTL,
-			MaxTTL:                        int64(opts.MaxTTL),
 			AutostopRequirementDaysOfWeek: int16(opts.AutostopRequirement.DaysOfWeek),
 			AutostopRequirementWeeks:      opts.AutostopRequirement.Weeks,
 			// Database stores the inverse of the allowed days of the week.
@@ -158,14 +167,14 @@ func (s *EnterpriseTemplateScheduleStore) Set(ctx context.Context, db database.S
 
 		var dormantAt time.Time
 		if opts.UpdateWorkspaceDormantAt {
-			dormantAt = dbtime.Now()
+			dormantAt = s.now()
 		}
 
 		// If we updated the time_til_dormant_autodelete we need to update all the workspaces deleting_at
 		// to ensure workspaces are being cleaned up correctly. Similarly if we are
 		// disabling it (by passing 0), then we want to delete nullify the deleting_at
 		// fields of all the template workspaces.
-		err = tx.UpdateWorkspacesDormantDeletingAtByTemplateID(ctx, database.UpdateWorkspacesDormantDeletingAtByTemplateIDParams{
+		markedForDeletion, err = tx.UpdateWorkspacesDormantDeletingAtByTemplateID(ctx, database.UpdateWorkspacesDormantDeletingAtByTemplateIDParams{
 			TemplateID:                 tpl.ID,
 			TimeTilDormantAutodeleteMs: opts.TimeTilDormantAutoDelete.Milliseconds(),
 			DormantAt:                  dormantAt,
@@ -174,19 +183,33 @@ func (s *EnterpriseTemplateScheduleStore) Set(ctx context.Context, db database.S
 			return xerrors.Errorf("update deleting_at of all workspaces for new time_til_dormant_autodelete %q: %w", opts.TimeTilDormantAutoDelete, err)
 		}
 
-		if opts.UpdateWorkspaceLastUsedAt {
-			err = tx.UpdateTemplateWorkspacesLastUsedAt(ctx, database.UpdateTemplateWorkspacesLastUsedAtParams{
-				TemplateID: tpl.ID,
-				LastUsedAt: dbtime.Now(),
-			})
+		if opts.UpdateWorkspaceLastUsedAt != nil {
+			err = opts.UpdateWorkspaceLastUsedAt(ctx, tx, tpl.ID, s.now())
 			if err != nil {
-				return xerrors.Errorf("update template workspaces last_used_at: %w", err)
+				return xerrors.Errorf("update workspace last used at: %w", err)
 			}
 		}
 
 		template, err = tx.GetTemplateByID(ctx, tpl.ID)
 		if err != nil {
 			return xerrors.Errorf("get updated template schedule: %w", err)
+		}
+
+		// Update all workspace's TTL using this template if either of the following:
+		//   - The template's AllowUserAutostop has just been disabled
+		//   - The template's TTL has been modified and AllowUserAutostop is disabled
+		if !opts.UserAutostopEnabled && (tpl.AllowUserAutostop || int64(opts.DefaultTTL) != tpl.DefaultTTL) {
+			var ttl sql.NullInt64
+			if opts.DefaultTTL != 0 {
+				ttl = sql.NullInt64{Valid: true, Int64: int64(opts.DefaultTTL)}
+			}
+
+			if err = tx.UpdateWorkspacesTTLByTemplateID(ctx, database.UpdateWorkspacesTTLByTemplateIDParams{
+				TemplateID: template.ID,
+				Ttl:        ttl,
+			}); err != nil {
+				return xerrors.Errorf("update workspaces ttl by template id %q: %w", template.ID, err)
+			}
 		}
 
 		// Recalculate max_deadline and deadline for all running workspace
@@ -200,6 +223,67 @@ func (s *EnterpriseTemplateScheduleStore) Set(ctx context.Context, db database.S
 	}, nil)
 	if err != nil {
 		return database.Template{}, err
+	}
+
+	if opts.AutostartRequirement.DaysOfWeek != tpl.AutostartAllowedDays() {
+		templateSchedule, err := s.Get(ctx, db, tpl.ID)
+		if err != nil {
+			return database.Template{}, xerrors.Errorf("get template schedule: %w", err)
+		}
+
+		//nolint:gocritic // We need to be able to read information about all workspaces.
+		workspaces, err := db.GetWorkspacesByTemplateID(dbauthz.AsSystemRestricted(ctx), tpl.ID)
+		if err != nil {
+			return database.Template{}, xerrors.Errorf("get workspaces by template id: %w", err)
+		}
+
+		workspaceIDs := []uuid.UUID{}
+		nextStartAts := []time.Time{}
+
+		for _, workspace := range workspaces {
+			nextStartAt := time.Time{}
+			if workspace.AutostartSchedule.Valid {
+				next, err := agpl.NextAllowedAutostart(s.now(), workspace.AutostartSchedule.String, templateSchedule)
+				if err == nil {
+					nextStartAt = dbtime.Time(next.UTC())
+				}
+			}
+
+			workspaceIDs = append(workspaceIDs, workspace.ID)
+			nextStartAts = append(nextStartAts, nextStartAt)
+		}
+
+		//nolint:gocritic // We need to be able to update information about all workspaces.
+		if err := db.BatchUpdateWorkspaceNextStartAt(dbauthz.AsSystemRestricted(ctx), database.BatchUpdateWorkspaceNextStartAtParams{
+			IDs:          workspaceIDs,
+			NextStartAts: nextStartAts,
+		}); err != nil {
+			return database.Template{}, xerrors.Errorf("update workspace next start at: %w", err)
+		}
+	}
+
+	for _, ws := range markedForDeletion {
+		dormantTime := s.now().Add(opts.TimeTilDormantAutoDelete)
+		_, err = s.enqueuer.Enqueue(
+			// nolint:gocritic // Need actor to enqueue notification
+			dbauthz.AsNotifier(ctx),
+			ws.OwnerID,
+			notifications.TemplateWorkspaceMarkedForDeletion,
+			map[string]string{
+				"name":           ws.Name,
+				"reason":         "an update to the template's dormancy",
+				"timeTilDormant": humanize.Time(dormantTime),
+			},
+			"scheduletemplate",
+			// Associate this notification with all the related entities.
+			ws.ID,
+			ws.OwnerID,
+			ws.TemplateID,
+			ws.OrganizationID,
+		)
+		if err != nil {
+			s.logger.Warn(ctx, "failed to notify of workspace marked for deletion", slog.Error(err), slog.F("workspace_id", ws.ID))
+		}
 	}
 
 	return template, nil
@@ -269,11 +353,29 @@ func (s *EnterpriseTemplateScheduleStore) updateWorkspaceBuild(ctx context.Conte
 		TemplateScheduleStore:       s,
 		UserQuietHoursScheduleStore: *s.UserQuietHoursScheduleStore.Load(),
 		// Use the job completion time as the time we calculate autostop from.
-		Now:       job.CompletedAt.Time,
-		Workspace: workspace,
+		Now:                job.CompletedAt.Time,
+		Workspace:          workspace.WorkspaceTable(),
+		WorkspaceAutostart: workspace.AutostartSchedule.String,
 	})
 	if err != nil {
 		return xerrors.Errorf("calculate new autostop for workspace %q: %w", workspace.ID, err)
+	}
+
+	if workspace.AutostartSchedule.Valid {
+		templateScheduleOptions, err := s.Get(ctx, db, workspace.TemplateID)
+		if err != nil {
+			return xerrors.Errorf("get template schedule options: %w", err)
+		}
+
+		nextStartAt, _ := agpl.NextAutostart(s.now(), workspace.AutostartSchedule.String, templateScheduleOptions)
+
+		err = db.UpdateWorkspaceNextStartAt(ctx, database.UpdateWorkspaceNextStartAtParams{
+			ID:          workspace.ID,
+			NextStartAt: sql.NullTime{Valid: true, Time: nextStartAt},
+		})
+		if err != nil {
+			return xerrors.Errorf("update workspace next start at: %w", err)
+		}
 	}
 
 	// If max deadline is before now()+2h, then set it to that.

@@ -11,8 +11,6 @@ import (
 	"golang.org/x/xerrors"
 	protobuf "google.golang.org/protobuf/proto"
 
-	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent/proto"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/codersdk"
@@ -23,7 +21,7 @@ func TestLogSender_Mainline(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -128,7 +126,7 @@ func TestLogSender_Mainline(t *testing.T) {
 func TestLogSender_LogLimitExceeded(t *testing.T) {
 	t.Parallel()
 	ctx := testutil.Context(t, testutil.WaitShort)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -189,7 +187,7 @@ func TestLogSender_SkipHugeLog(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -231,11 +229,56 @@ func TestLogSender_SkipHugeLog(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
+func TestLogSender_InvalidUTF8(t *testing.T) {
+	t.Parallel()
+	testCtx := testutil.Context(t, testutil.WaitShort)
+	ctx, cancel := context.WithCancel(testCtx)
+	logger := testutil.Logger(t)
+	fDest := newFakeLogDest()
+	uut := NewLogSender(logger)
+
+	t0 := dbtime.Now()
+	ls1 := uuid.UUID{0x11}
+
+	uut.Enqueue(ls1,
+		Log{
+			CreatedAt: t0,
+			Output:    "test log 0, src 1\xc3\x28",
+			Level:     codersdk.LogLevelInfo,
+		},
+		Log{
+			CreatedAt: t0,
+			Output:    "test log 1, src 1",
+			Level:     codersdk.LogLevelInfo,
+		})
+
+	loopErr := make(chan error, 1)
+	go func() {
+		err := uut.SendLoop(ctx, fDest)
+		loopErr <- err
+	}()
+
+	req := testutil.RequireRecvCtx(ctx, t, fDest.reqs)
+	require.NotNil(t, req)
+	require.Len(t, req.Logs, 2, "it should sanitize invalid UTF-8, but still send")
+	// the 0xc3, 0x28 is an invalid 2-byte sequence in UTF-8.  The sanitizer replaces 0xc3 with ❌, and then
+	// interprets 0x28 as a 1-byte sequence "("
+	require.Equal(t, "test log 0, src 1❌(", req.Logs[0].GetOutput())
+	require.Equal(t, proto.Log_INFO, req.Logs[0].GetLevel())
+	require.Equal(t, "test log 1, src 1", req.Logs[1].GetOutput())
+	require.Equal(t, proto.Log_INFO, req.Logs[1].GetLevel())
+	testutil.RequireSendCtx(ctx, t, fDest.resps, &proto.BatchCreateLogsResponse{})
+
+	cancel()
+	err := testutil.RequireRecvCtx(testCtx, t, loopErr)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestLogSender_Batch(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -285,7 +328,7 @@ func TestLogSender_MaxQueuedLogs(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -344,7 +387,7 @@ func TestLogSender_MaxQueuedLogs(t *testing.T) {
 func TestLogSender_SendError(t *testing.T) {
 	t.Parallel()
 	ctx := testutil.Context(t, testutil.WaitShort)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	expectedErr := xerrors.New("test")
 	fDest.err = expectedErr
@@ -386,7 +429,7 @@ func TestLogSender_WaitUntilEmpty_ContextExpired(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	uut := NewLogSender(logger)
 
 	t0 := dbtime.Now()

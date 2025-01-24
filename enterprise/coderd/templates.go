@@ -15,7 +15,8 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/httpapi"
 	"github.com/coder/coder/v2/coderd/httpmw"
-	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/policy"
+	"github.com/coder/coder/v2/coderd/util/slice"
 	"github.com/coder/coder/v2/codersdk"
 )
 
@@ -35,7 +36,7 @@ func (api *API) templateAvailablePermissions(rw http.ResponseWriter, r *http.Req
 
 	// Requires update permission on the template to list all avail users/groups
 	// for assignment.
-	if !api.Authorize(r, rbac.ActionUpdate, template) {
+	if !api.Authorize(r, policy.ActionUpdate, template) {
 		httpapi.ResourceNotFound(rw)
 		return
 	}
@@ -50,7 +51,9 @@ func (api *API) templateAvailablePermissions(rw http.ResponseWriter, r *http.Req
 
 	// Perm check is the template update check.
 	// nolint:gocritic
-	groups, err := api.Database.GetGroupsByOrganizationID(dbauthz.AsSystemRestricted(ctx), template.OrganizationID)
+	groups, err := api.Database.GetGroups(dbauthz.AsSystemRestricted(ctx), database.GetGroupsParams{
+		OrganizationID: template.OrganizationID,
+	})
 	if err != nil {
 		httpapi.InternalServerError(rw, err)
 		return
@@ -59,13 +62,20 @@ func (api *API) templateAvailablePermissions(rw http.ResponseWriter, r *http.Req
 	sdkGroups := make([]codersdk.Group, 0, len(groups))
 	for _, group := range groups {
 		// nolint:gocritic
-		members, err := api.Database.GetGroupMembers(dbauthz.AsSystemRestricted(ctx), group.ID)
+		members, err := api.Database.GetGroupMembersByGroupID(dbauthz.AsSystemRestricted(ctx), group.Group.ID)
 		if err != nil {
 			httpapi.InternalServerError(rw, err)
 			return
 		}
 
-		sdkGroups = append(sdkGroups, db2sdk.Group(group, members))
+		// nolint:gocritic
+		memberCount, err := api.Database.GetGroupMembersCountByGroupID(dbauthz.AsSystemRestricted(ctx), group.Group.ID)
+		if err != nil {
+			httpapi.InternalServerError(rw, err)
+			return
+		}
+
+		sdkGroups = append(sdkGroups, db2sdk.Group(group, members, int(memberCount)))
 	}
 
 	httpapi.Write(ctx, rw, http.StatusOK, codersdk.ACLAvailable{
@@ -121,21 +131,31 @@ func (api *API) templateACL(rw http.ResponseWriter, r *http.Request) {
 
 	groups := make([]codersdk.TemplateGroup, 0, len(dbGroups))
 	for _, group := range dbGroups {
-		var members []database.User
+		var members []database.GroupMember
 
 		// This is a bit of a hack. The caller might not have permission to do this,
 		// but they can read the acl list if the function got this far. So we let
 		// them read the group members.
 		// We should probably at least return more truncated user data here.
 		// nolint:gocritic
-		members, err = api.Database.GetGroupMembers(dbauthz.AsSystemRestricted(ctx), group.ID)
+		members, err = api.Database.GetGroupMembersByGroupID(dbauthz.AsSystemRestricted(ctx), group.ID)
+		if err != nil {
+			httpapi.InternalServerError(rw, err)
+			return
+		}
+		// nolint:gocritic
+		memberCount, err := api.Database.GetGroupMembersCountByGroupID(dbauthz.AsSystemRestricted(ctx), group.ID)
 		if err != nil {
 			httpapi.InternalServerError(rw, err)
 			return
 		}
 		groups = append(groups, codersdk.TemplateGroup{
-			Group: db2sdk.Group(group.Group, members),
-			Role:  convertToTemplateRole(group.Actions),
+			Group: db2sdk.Group(database.GetGroupsRow{
+				Group:                   group.Group,
+				OrganizationName:        template.OrganizationName,
+				OrganizationDisplayName: template.OrganizationDisplayName,
+			}, members, int(memberCount)),
+			Role: convertToTemplateRole(group.Actions),
 		})
 	}
 
@@ -203,7 +223,7 @@ func (api *API) patchTemplateACL(rw http.ResponseWriter, r *http.Request) {
 					delete(template.UserACL, id)
 					continue
 				}
-				template.UserACL[id] = convertSDKTemplateRole(role)
+				template.UserACL[id] = db2sdk.TemplateRoleActions(role)
 			}
 		}
 
@@ -215,7 +235,7 @@ func (api *API) patchTemplateACL(rw http.ResponseWriter, r *http.Request) {
 					delete(template.GroupACL, id)
 					continue
 				}
-				template.GroupACL[id] = convertSDKTemplateRole(role)
+				template.GroupACL[id] = db2sdk.TemplateRoleActions(role)
 			}
 		}
 
@@ -297,65 +317,43 @@ func convertTemplateUsers(tus []database.TemplateUser, orgIDsByUserIDs map[uuid.
 }
 
 func validateTemplateRole(role codersdk.TemplateRole) error {
-	actions := convertSDKTemplateRole(role)
-	if actions == nil && role != codersdk.TemplateRoleDeleted {
+	actions := db2sdk.TemplateRoleActions(role)
+	if len(actions) == 0 && role != codersdk.TemplateRoleDeleted {
 		return xerrors.Errorf("role %q is not a valid Template role", role)
 	}
 
 	return nil
 }
 
-func convertToTemplateRole(actions []rbac.Action) codersdk.TemplateRole {
+func convertToTemplateRole(actions []policy.Action) codersdk.TemplateRole {
 	switch {
-	case len(actions) == 1 && actions[0] == rbac.ActionRead:
+	case len(actions) == 2 && slice.SameElements(actions, []policy.Action{policy.ActionUse, policy.ActionRead}):
 		return codersdk.TemplateRoleUse
-	case len(actions) == 1 && actions[0] == rbac.WildcardSymbol:
+	case len(actions) == 1 && actions[0] == policy.WildcardSymbol:
 		return codersdk.TemplateRoleAdmin
 	}
 
 	return ""
 }
 
-func convertSDKTemplateRole(role codersdk.TemplateRole) []rbac.Action {
-	switch role {
-	case codersdk.TemplateRoleAdmin:
-		return []rbac.Action{rbac.WildcardSymbol}
-	case codersdk.TemplateRoleUse:
-		return []rbac.Action{rbac.ActionRead}
-	}
-
-	return nil
-}
-
-// TODO reduce the duplication across all of these.
+// TODO move to api.RequireFeatureMW when we are OK with changing the behavior.
 func (api *API) templateRBACEnabledMW(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		api.entitlementsMu.RLock()
-		rbac := api.entitlements.Features[codersdk.FeatureTemplateRBAC].Enabled
-		api.entitlementsMu.RUnlock()
-
-		if !rbac {
-			httpapi.RouteNotFound(rw)
-			return
-		}
-
-		next.ServeHTTP(rw, r)
-	})
+	return api.RequireFeatureMW(codersdk.FeatureTemplateRBAC)(next)
 }
 
-func (api *API) moonsEnabledMW(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// Entitlement must be enabled.
-		api.entitlementsMu.RLock()
-		proxy := api.entitlements.Features[codersdk.FeatureWorkspaceProxy].Enabled
-		api.entitlementsMu.RUnlock()
-		if !proxy {
-			httpapi.Write(r.Context(), rw, http.StatusForbidden, codersdk.Response{
-				Message: "External workspace proxies is an Enterprise feature. Contact sales!",
-			})
-			return
-		}
+func (api *API) RequireFeatureMW(feat codersdk.FeatureName) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			// Entitlement must be enabled.
+			if !api.Entitlements.Enabled(feat) {
+				// All feature warnings should be "Premium", not "Enterprise".
+				httpapi.Write(r.Context(), rw, http.StatusForbidden, codersdk.Response{
+					Message: fmt.Sprintf("%s is a Premium feature. Contact sales!", feat.Humanize()),
+				})
+				return
+			}
 
-		next.ServeHTTP(rw, r)
-	})
+			next.ServeHTTP(rw, r)
+		})
+	}
 }

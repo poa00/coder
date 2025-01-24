@@ -19,10 +19,9 @@ import (
 	"go.uber.org/goleak"
 	"tailscale.com/tailcfg"
 
-	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbfake"
+	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/coder/v2/provisionersdk/proto"
 
 	"github.com/coder/coder/v2/agent/agenttest"
@@ -40,7 +39,7 @@ import (
 var updateGoldenFiles = flag.Bool("update", false, "Update golden files")
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m, testutil.GoleakOptions...)
 }
 
 func TestBuildInfo(t *testing.T) {
@@ -61,7 +60,7 @@ func TestDERP(t *testing.T) {
 	ctx := testutil.Context(t, testutil.WaitMedium)
 	client := coderdtest.New(t, nil)
 
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 
 	derpPort, err := strconv.Atoi(client.URL.Port())
 	require.NoError(t, err)
@@ -82,7 +81,7 @@ func TestDERP(t *testing.T) {
 			},
 		},
 	}
-	w1IP := tailnet.IP()
+	w1IP := tailnet.TailscaleServicePrefix.RandomAddr()
 	w1, err := tailnet.NewConn(&tailnet.Options{
 		Addresses: []netip.Prefix{netip.PrefixFrom(w1IP, 128)},
 		Logger:    logger.Named("w1"),
@@ -91,7 +90,7 @@ func TestDERP(t *testing.T) {
 	require.NoError(t, err)
 
 	w2, err := tailnet.NewConn(&tailnet.Options{
-		Addresses: []netip.Prefix{netip.PrefixFrom(tailnet.IP(), 128)},
+		Addresses: []netip.Prefix{tailnet.TailscaleServicePrefix.RandomPrefix()},
 		Logger:    logger.Named("w2"),
 		DERPMap:   derpMap,
 	})
@@ -189,9 +188,10 @@ func TestDERPForceWebSockets(t *testing.T) {
 	t.Cleanup(func() {
 		client.HTTPClient.CloseIdleConnections()
 	})
+	wsclient := workspacesdk.New(client)
 	user := coderdtest.CreateFirstUser(t, client)
 
-	gen, err := client.WorkspaceAgentConnectionInfoGeneric(context.Background())
+	gen, err := wsclient.AgentConnectionInfoGeneric(context.Background())
 	require.NoError(t, err)
 	t.Log(spew.Sdump(gen))
 
@@ -203,7 +203,7 @@ func TestDERPForceWebSockets(t *testing.T) {
 	})
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 	_ = agenttest.New(t, client.URL, authToken)
@@ -213,9 +213,9 @@ func TestDERPForceWebSockets(t *testing.T) {
 	defer cancel()
 
 	resources := coderdtest.AwaitWorkspaceAgents(t, client, workspace.ID)
-	conn, err := client.DialWorkspaceAgent(ctx, resources[0].Agents[0].ID,
-		&codersdk.DialWorkspaceAgentOptions{
-			Logger: slogtest.Make(t, nil).Leveled(slog.LevelDebug).Named("client"),
+	conn, err := wsclient.DialAgent(ctx, resources[0].Agents[0].ID,
+		&workspacesdk.DialAgentOptions{
+			Logger: testutil.Logger(t).Named("client"),
 		},
 	)
 	require.NoError(t, err)
@@ -353,7 +353,7 @@ func TestCSRFExempt(t *testing.T) {
 		// Create a workspace.
 		const agentSlug = "james"
 		const appSlug = "web"
-		wrk := dbfake.WorkspaceBuild(t, api.Database, database.Workspace{
+		wrk := dbfake.WorkspaceBuild(t, api.Database, database.WorkspaceTable{
 			OwnerID:        owner.ID,
 			OrganizationID: first.OrganizationID,
 		}).

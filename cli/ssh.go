@@ -3,14 +3,18 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,43 +23,59 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/google/uuid"
 	"github.com/mattn/go-isatty"
+	"github.com/spf13/afero"
 	gossh "golang.org/x/crypto/ssh"
 	gosshagent "golang.org/x/crypto/ssh/agent"
 	"golang.org/x/term"
 	"golang.org/x/xerrors"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-
-	"github.com/coder/retry"
-	"github.com/coder/serpent"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/netlogtype"
 
 	"cdr.dev/slog"
 	"cdr.dev/slog/sloggers/sloghuman"
-
 	"github.com/coder/coder/v2/cli/cliui"
 	"github.com/coder/coder/v2/cli/cliutil"
 	"github.com/coder/coder/v2/coderd/autobuild/notify"
 	"github.com/coder/coder/v2/coderd/util/ptr"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/coder/v2/cryptorand"
+	"github.com/coder/coder/v2/pty"
+	"github.com/coder/quartz"
+	"github.com/coder/retry"
+	"github.com/coder/serpent"
+)
+
+const (
+	disableUsageApp = "disable"
 )
 
 var (
 	workspacePollInterval   = time.Minute
 	autostopNotifyCountdown = []time.Duration{30 * time.Minute}
+	// gracefulShutdownTimeout is the timeout, per item in the stack of things to close
+	gracefulShutdownTimeout = 2 * time.Second
 )
 
 func (r *RootCmd) ssh() *serpent.Command {
 	var (
-		stdio            bool
-		forwardAgent     bool
-		forwardGPG       bool
-		identityAgent    string
-		wsPollInterval   time.Duration
-		waitEnum         string
-		noWait           bool
-		logDirPath       string
-		remoteForwards   []string
-		disableAutostart bool
+		stdio               bool
+		hostPrefix          string
+		forwardAgent        bool
+		forwardGPG          bool
+		identityAgent       string
+		wsPollInterval      time.Duration
+		waitEnum            string
+		noWait              bool
+		logDirPath          string
+		remoteForwards      []string
+		env                 []string
+		usageApp            string
+		disableAutostart    bool
+		appearanceConfig    codersdk.AppearanceConfig
+		networkInfoDir      string
+		networkInfoInterval time.Duration
 	)
 	client := new(codersdk.Client)
 	cmd := &serpent.Command{
@@ -65,6 +85,7 @@ func (r *RootCmd) ssh() *serpent.Command {
 		Middleware: serpent.Chain(
 			serpent.RequireNArgs(1),
 			r.InitClient(client),
+			initAppearance(client, &appearanceConfig),
 		),
 		Handler: func(inv *serpent.Invocation) (retErr error) {
 			// Before dialing the SSH server over TCP, capture Interrupt signals
@@ -77,6 +98,10 @@ func (r *RootCmd) ssh() *serpent.Command {
 			defer stop()
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
+
+			// Prevent unnecessary logs from the stdlib from messing up the TTY.
+			// See: https://github.com/coder/coder/issues/13144
+			log.SetOutput(io.Discard)
 
 			logger := inv.Logger
 			defer func() {
@@ -107,18 +132,26 @@ func (r *RootCmd) ssh() *serpent.Command {
 				if err != nil {
 					return xerrors.Errorf("generate nonce: %w", err)
 				}
-				logFilePath := filepath.Join(
-					logDirPath,
-					fmt.Sprintf(
-						"coder-ssh-%s-%s.log",
-						// The time portion makes it easier to find the right
-						// log file.
-						time.Now().Format("20060102-150405"),
-						// The nonce prevents collisions, as SSH invocations
-						// frequently happen in parallel.
-						nonce,
-					),
+				logFileBaseName := fmt.Sprintf(
+					"coder-ssh-%s-%s",
+					// The time portion makes it easier to find the right
+					// log file.
+					time.Now().Format("20060102-150405"),
+					// The nonce prevents collisions, as SSH invocations
+					// frequently happen in parallel.
+					nonce,
 				)
+				if stdio {
+					// The VS Code extension obtains the PID of the SSH process to
+					// find the log file associated with a SSH session.
+					//
+					// We get the parent PID because it's assumed `ssh` is calling this
+					// command via the ProxyCommand SSH option.
+					logFileBaseName += fmt.Sprintf("-%d", os.Getppid())
+				}
+				logFileBaseName += ".log"
+
+				logFilePath := filepath.Join(logDirPath, logFileBaseName)
 				logFile, err := os.OpenFile(
 					logFilePath,
 					os.O_CREATE|os.O_APPEND|os.O_WRONLY|os.O_EXCL,
@@ -141,22 +174,33 @@ func (r *RootCmd) ssh() *serpent.Command {
 				// log HTTP requests
 				client.SetLogger(logger)
 			}
-			stack := newCloserStack(ctx, logger)
+			stack := newCloserStack(ctx, logger, quartz.NewReal())
 			defer stack.close(nil)
 
-			if len(remoteForwards) > 0 {
-				for _, remoteForward := range remoteForwards {
-					isValid := validateRemoteForward(remoteForward)
-					if !isValid {
-						return xerrors.Errorf(`invalid format of remote-forward, expected: remote_port:local_address:local_port`)
-					}
-					if isValid && stdio {
-						return xerrors.Errorf(`remote-forward can't be enabled in the stdio mode`)
-					}
+			for _, remoteForward := range remoteForwards {
+				isValid := validateRemoteForward(remoteForward)
+				if !isValid {
+					return xerrors.Errorf(`invalid format of remote-forward, expected: remote_port:local_address:local_port`)
+				}
+				if isValid && stdio {
+					return xerrors.Errorf(`remote-forward can't be enabled in the stdio mode`)
 				}
 			}
 
-			workspace, workspaceAgent, err := getWorkspaceAndAgent(ctx, inv, client, !disableAutostart, codersdk.Me, inv.Args[0])
+			var parsedEnv [][2]string
+			for _, e := range env {
+				k, v, ok := strings.Cut(e, "=")
+				if !ok {
+					return xerrors.Errorf("invalid environment variable setting %q", e)
+				}
+				parsedEnv = append(parsedEnv, [2]string{k, v})
+			}
+
+			namedWorkspace := strings.TrimPrefix(inv.Args[0], hostPrefix)
+			// Support "--" as a delimiter between owner and workspace name
+			namedWorkspace = strings.Replace(namedWorkspace, "--", "/", 1)
+
+			workspace, workspaceAgent, err := getWorkspaceAndAgent(ctx, inv, client, !disableAutostart, namedWorkspace)
 			if err != nil {
 				return err
 			}
@@ -208,9 +252,11 @@ func (r *RootCmd) ssh() *serpent.Command {
 			// OpenSSH passes stderr directly to the calling TTY.
 			// This is required in "stdio" mode so a connecting indicator can be displayed.
 			err = cliui.Agent(ctx, inv.Stderr, workspaceAgent.ID, cliui.AgentOptions{
-				Fetch:     client.WorkspaceAgent,
-				FetchLogs: client.WorkspaceAgentLogsAfter,
-				Wait:      wait,
+				FetchInterval: 0,
+				Fetch:         client.WorkspaceAgent,
+				FetchLogs:     client.WorkspaceAgentLogsAfter,
+				Wait:          wait,
+				DocsURL:       appearanceConfig.DocsURL,
 			})
 			if err != nil {
 				if xerrors.Is(err, context.Canceled) {
@@ -222,10 +268,12 @@ func (r *RootCmd) ssh() *serpent.Command {
 			if r.disableDirect {
 				_, _ = fmt.Fprintln(inv.Stderr, "Direct connections disabled.")
 			}
-			conn, err := client.DialWorkspaceAgent(ctx, workspaceAgent.ID, &codersdk.DialWorkspaceAgentOptions{
-				Logger:         logger,
-				BlockEndpoints: r.disableDirect,
-			})
+			conn, err := workspacesdk.New(client).
+				DialAgent(ctx, workspaceAgent.ID, &workspacesdk.DialAgentOptions{
+					Logger:          logger,
+					BlockEndpoints:  r.disableDirect,
+					EnableTelemetry: !r.disableNetworkTelemetry,
+				})
 			if err != nil {
 				return xerrors.Errorf("dial agent: %w", err)
 			}
@@ -237,6 +285,15 @@ func (r *RootCmd) ssh() *serpent.Command {
 			stopPolling := tryPollWorkspaceAutostop(ctx, client, workspace)
 			defer stopPolling()
 
+			usageAppName := getUsageAppName(usageApp)
+			if usageAppName != "" {
+				closeUsage := client.UpdateWorkspaceUsageWithBodyContext(ctx, workspace.ID, codersdk.PostWorkspaceUsageRequest{
+					AgentID: workspaceAgent.ID,
+					AppName: usageAppName,
+				})
+				defer closeUsage()
+			}
+
 			if stdio {
 				rawSSH, err := conn.SSH(ctx)
 				if err != nil {
@@ -247,13 +304,21 @@ func (r *RootCmd) ssh() *serpent.Command {
 					return err
 				}
 
+				var errCh <-chan error
+				if networkInfoDir != "" {
+					errCh, err = setStatsCallback(ctx, conn, logger, networkInfoDir, networkInfoInterval)
+					if err != nil {
+						return err
+					}
+				}
+
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
 					watchAndClose(ctx, func() error {
 						stack.close(xerrors.New("watchAndClose"))
 						return nil
-					}, logger, client, workspace)
+					}, logger, client, workspace, errCh)
 				}()
 				copier.copy(&wg)
 				return nil
@@ -275,6 +340,14 @@ func (r *RootCmd) ssh() *serpent.Command {
 				return err
 			}
 
+			var errCh <-chan error
+			if networkInfoDir != "" {
+				errCh, err = setStatsCallback(ctx, conn, logger, networkInfoDir, networkInfoInterval)
+				if err != nil {
+					return err
+				}
+			}
+
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -287,6 +360,7 @@ func (r *RootCmd) ssh() *serpent.Command {
 					logger,
 					client,
 					workspace,
+					errCh,
 				)
 			}()
 
@@ -339,15 +413,22 @@ func (r *RootCmd) ssh() *serpent.Command {
 				}
 			}
 
-			stdoutFile, validOut := inv.Stdout.(*os.File)
 			stdinFile, validIn := inv.Stdin.(*os.File)
-			if validOut && validIn && isatty.IsTerminal(stdoutFile.Fd()) {
-				state, err := term.MakeRaw(int(stdinFile.Fd()))
+			stdoutFile, validOut := inv.Stdout.(*os.File)
+			if validIn && validOut && isatty.IsTerminal(stdinFile.Fd()) && isatty.IsTerminal(stdoutFile.Fd()) {
+				inState, err := pty.MakeInputRaw(stdinFile.Fd())
 				if err != nil {
 					return err
 				}
 				defer func() {
-					_ = term.Restore(int(stdinFile.Fd()), state)
+					_ = pty.RestoreTerminal(stdinFile.Fd(), inState)
+				}()
+				outState, err := pty.MakeOutputRaw(stdoutFile.Fd())
+				if err != nil {
+					return err
+				}
+				defer func() {
+					_ = pty.RestoreTerminal(stdoutFile.Fd(), outState)
 				}()
 
 				windowChange := listenWindowSize(ctx)
@@ -365,6 +446,12 @@ func (r *RootCmd) ssh() *serpent.Command {
 						_ = sshSession.WindowChange(height, width)
 					}
 				}()
+			}
+
+			for _, kv := range parsedEnv {
+				if err := sshSession.Setenv(kv[0], kv[1]); err != nil {
+					return xerrors.Errorf("setenv: %w", err)
+				}
 			}
 
 			err = sshSession.RequestPty("xterm-256color", 128, 128, gossh.TerminalModes{})
@@ -394,6 +481,7 @@ func (r *RootCmd) ssh() *serpent.Command {
 			}
 
 			err = sshSession.Wait()
+			conn.SendDisconnectedTelemetry()
 			if err != nil {
 				if exitErr := (&gossh.ExitError{}); errors.As(err, &exitErr) {
 					// Clear the error since it's not useful beyond
@@ -425,6 +513,12 @@ func (r *RootCmd) ssh() *serpent.Command {
 			Env:         "CODER_SSH_STDIO",
 			Description: "Specifies whether to emit SSH output over stdin/stdout.",
 			Value:       serpent.BoolOf(&stdio),
+		},
+		{
+			Flag:        "ssh-host-prefix",
+			Env:         "CODER_SSH_SSH_HOST_PREFIX",
+			Description: "Strip this prefix from the provided hostname to determine the workspace name. This is useful when used as part of an OpenSSH proxy command.",
+			Value:       serpent.StringOf(&hostPrefix),
 		},
 		{
 			Flag:          "forward-agent",
@@ -475,6 +569,31 @@ func (r *RootCmd) ssh() *serpent.Command {
 			FlagShorthand: "R",
 			Value:         serpent.StringArrayOf(&remoteForwards),
 		},
+		{
+			Flag:          "env",
+			Description:   "Set environment variable(s) for session (key1=value1,key2=value2,...).",
+			Env:           "CODER_SSH_ENV",
+			FlagShorthand: "e",
+			Value:         serpent.StringArrayOf(&env),
+		},
+		{
+			Flag:        "usage-app",
+			Description: "Specifies the usage app to use for workspace activity tracking.",
+			Env:         "CODER_SSH_USAGE_APP",
+			Value:       serpent.StringOf(&usageApp),
+			Hidden:      true,
+		},
+		{
+			Flag:        "network-info-dir",
+			Description: "Specifies a directory to write network information periodically.",
+			Value:       serpent.StringOf(&networkInfoDir),
+		},
+		{
+			Flag:        "network-info-interval",
+			Description: "Specifies the interval to update network information.",
+			Default:     "5s",
+			Value:       serpent.DurationOf(&networkInfoInterval),
+		},
 		sshDisableAutostartOption(serpent.BoolOf(&disableAutostart)),
 	}
 	return cmd
@@ -490,7 +609,7 @@ func (r *RootCmd) ssh() *serpent.Command {
 // will usually not propagate.
 //
 // See: https://github.com/coder/coder/issues/6180
-func watchAndClose(ctx context.Context, closer func() error, logger slog.Logger, client *codersdk.Client, workspace codersdk.Workspace) {
+func watchAndClose(ctx context.Context, closer func() error, logger slog.Logger, client *codersdk.Client, workspace codersdk.Workspace, errCh <-chan error) {
 	// Ensure session is ended on both context cancellation
 	// and workspace stop.
 	defer func() {
@@ -541,6 +660,9 @@ startWatchLoop:
 					logger.Info(ctx, "workspace stopped")
 					return
 				}
+			case err := <-errCh:
+				logger.Error(ctx, "failed to collect network stats", slog.Error(err))
+				return
 			}
 		}
 	}
@@ -549,10 +671,12 @@ startWatchLoop:
 // getWorkspaceAgent returns the workspace and agent selected using either the
 // `<workspace>[.<agent>]` syntax via `in`.
 // If autoStart is true, the workspace will be started if it is not already running.
-func getWorkspaceAndAgent(ctx context.Context, inv *serpent.Invocation, client *codersdk.Client, autostart bool, userID string, in string) (codersdk.Workspace, codersdk.WorkspaceAgent, error) { //nolint:revive
+func getWorkspaceAndAgent(ctx context.Context, inv *serpent.Invocation, client *codersdk.Client, autostart bool, input string) (codersdk.Workspace, codersdk.WorkspaceAgent, error) { //nolint:revive
 	var (
-		workspace      codersdk.Workspace
-		workspaceParts = strings.Split(in, ".")
+		workspace codersdk.Workspace
+		// The input will be `owner/name.agent`
+		// The agent is optional.
+		workspaceParts = strings.Split(input, ".")
 		err            error
 	)
 
@@ -589,12 +713,19 @@ func getWorkspaceAndAgent(ctx context.Context, inv *serpent.Invocation, client *
 		// It's possible for a workspace build to fail due to the template requiring starting
 		// workspaces with the active version.
 		_, _ = fmt.Fprintf(inv.Stderr, "Workspace was stopped, starting workspace to allow connecting to %q...\n", workspace.Name)
-		_, err = startWorkspace(inv, client, workspace, workspaceParameterFlags{}, WorkspaceStart)
-		if cerr, ok := codersdk.AsError(err); ok && cerr.StatusCode() == http.StatusForbidden {
-			_, _ = fmt.Fprintln(inv.Stdout, "Unable to start the workspace with template version from last build. The auto-update policy may require you to restart with the current active template version.")
-			_, err = startWorkspace(inv, client, workspace, workspaceParameterFlags{}, WorkspaceUpdate)
-			if err != nil {
-				return codersdk.Workspace{}, codersdk.WorkspaceAgent{}, xerrors.Errorf("start workspace with active template version: %w", err)
+		_, err = startWorkspace(inv, client, workspace, workspaceParameterFlags{}, buildFlags{}, WorkspaceStart)
+		if cerr, ok := codersdk.AsError(err); ok {
+			switch cerr.StatusCode() {
+			case http.StatusConflict:
+				_, _ = fmt.Fprintln(inv.Stderr, "Unable to start the workspace due to conflict, the workspace may be starting, retrying without autostart...")
+				return getWorkspaceAndAgent(ctx, inv, client, false, input)
+
+			case http.StatusForbidden:
+				_, err = startWorkspace(inv, client, workspace, workspaceParameterFlags{}, buildFlags{}, WorkspaceUpdate)
+				if err != nil {
+					return codersdk.Workspace{}, codersdk.WorkspaceAgent{}, xerrors.Errorf("start workspace with active template version: %w", err)
+				}
+				_, _ = fmt.Fprintln(inv.Stdout, "Unable to start the workspace with template version from last build. Your workspace has been updated to the current active template version.")
 			}
 		} else if err != nil {
 			return codersdk.Workspace{}, codersdk.WorkspaceAgent{}, xerrors.Errorf("start workspace with current template version: %w", err)
@@ -675,12 +806,12 @@ func tryPollWorkspaceAutostop(ctx context.Context, client *codersdk.Client, work
 	lock := flock.New(filepath.Join(os.TempDir(), "coder-autostop-notify-"+workspace.ID.String()))
 	conditionCtx, cancelCondition := context.WithCancel(ctx)
 	condition := notifyCondition(conditionCtx, client, workspace.ID, lock)
-	stopFunc := notify.Notify(condition, workspacePollInterval, autostopNotifyCountdown...)
+	notifier := notify.New(condition, workspacePollInterval, autostopNotifyCountdown)
 	return func() {
 		// With many "ssh" processes running, `lock.TryLockContext` can be hanging until the context canceled.
 		// Without this cancellation, a CLI process with failed remote-forward could be hanging indefinitely.
 		cancelCondition()
-		stopFunc()
+		notifier.Close()
 	}
 }
 
@@ -876,11 +1007,18 @@ type closerStack struct {
 	closed  bool
 	logger  slog.Logger
 	err     error
-	wg      sync.WaitGroup
+	allDone chan struct{}
+
+	// for testing
+	clock quartz.Clock
 }
 
-func newCloserStack(ctx context.Context, logger slog.Logger) *closerStack {
-	cs := &closerStack{logger: logger}
+func newCloserStack(ctx context.Context, logger slog.Logger, clock quartz.Clock) *closerStack {
+	cs := &closerStack{
+		logger:  logger,
+		allDone: make(chan struct{}),
+		clock:   clock,
+	}
 	go cs.closeAfterContext(ctx)
 	return cs
 }
@@ -894,20 +1032,58 @@ func (c *closerStack) close(err error) {
 	c.Lock()
 	if c.closed {
 		c.Unlock()
-		c.wg.Wait()
+		<-c.allDone
 		return
 	}
 	c.closed = true
 	c.err = err
-	c.wg.Add(1)
-	defer c.wg.Done()
 	c.Unlock()
+	defer close(c.allDone)
+	if len(c.closers) == 0 {
+		return
+	}
 
-	for i := len(c.closers) - 1; i >= 0; i-- {
-		cwn := c.closers[i]
-		cErr := cwn.closer.Close()
-		c.logger.Debug(context.Background(),
-			"closed item from stack", slog.F("name", cwn.name), slog.Error(cErr))
+	// We are going to work down the stack in order.  If things close quickly, we trigger the
+	// closers serially, in order. `done` is a channel that indicates the nth closer is done
+	// closing, and we should trigger the (n-1) closer.  However, if things take too long we don't
+	// want to wait, so we also start a ticker that works down the stack and sends on `done` as
+	// well.
+	next := len(c.closers) - 1
+	// here we make the buffer 2x the number of closers because we could write once for it being
+	// actually done and once via the countdown for each closer
+	done := make(chan int, len(c.closers)*2)
+	startNext := func() {
+		go func(i int) {
+			defer func() { done <- i }()
+			cwn := c.closers[i]
+			cErr := cwn.closer.Close()
+			c.logger.Debug(context.Background(),
+				"closed item from stack", slog.F("name", cwn.name), slog.Error(cErr))
+		}(next)
+		next--
+	}
+	done <- len(c.closers) // kick us off right away
+
+	// start a ticking countdown in case we hang/don't close quickly
+	countdown := len(c.closers) - 1
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.clock.TickerFunc(ctx, gracefulShutdownTimeout, func() error {
+		if countdown < 0 {
+			return nil
+		}
+		done <- countdown
+		countdown--
+		return nil
+	}, "closerStack")
+
+	for n := range done { // the nth closer is done
+		if n == 0 {
+			return
+		}
+		if n-1 == next {
+			startNext()
+		}
 	}
 }
 
@@ -1007,4 +1183,177 @@ type stdioErrLogReader struct {
 func (r stdioErrLogReader) Read(_ []byte) (int, error) {
 	r.l.Error(context.Background(), "reading from stdin in stdio mode is not allowed")
 	return 0, io.EOF
+}
+
+func getUsageAppName(usageApp string) codersdk.UsageAppName {
+	if usageApp == disableUsageApp {
+		return ""
+	}
+
+	allowedUsageApps := []string{
+		string(codersdk.UsageAppNameSSH),
+		string(codersdk.UsageAppNameVscode),
+		string(codersdk.UsageAppNameJetbrains),
+	}
+	if slices.Contains(allowedUsageApps, usageApp) {
+		return codersdk.UsageAppName(usageApp)
+	}
+
+	return codersdk.UsageAppNameSSH
+}
+
+func setStatsCallback(
+	ctx context.Context,
+	agentConn *workspacesdk.AgentConn,
+	logger slog.Logger,
+	networkInfoDir string,
+	networkInfoInterval time.Duration,
+) (<-chan error, error) {
+	fs, ok := ctx.Value("fs").(afero.Fs)
+	if !ok {
+		fs = afero.NewOsFs()
+	}
+	if err := fs.MkdirAll(networkInfoDir, 0o700); err != nil {
+		return nil, xerrors.Errorf("mkdir: %w", err)
+	}
+
+	// The VS Code extension obtains the PID of the SSH process to
+	// read files to display logs and network info.
+	//
+	// We get the parent PID because it's assumed `ssh` is calling this
+	// command via the ProxyCommand SSH option.
+	pid := os.Getppid()
+
+	// The VS Code extension obtains the PID of the SSH process to
+	// read the file below which contains network information to display.
+	//
+	// We get the parent PID because it's assumed `ssh` is calling this
+	// command via the ProxyCommand SSH option.
+	networkInfoFilePath := filepath.Join(networkInfoDir, fmt.Sprintf("%d.json", pid))
+
+	var (
+		firstErrTime time.Time
+		errCh        = make(chan error, 1)
+	)
+	cb := func(start, end time.Time, virtual, _ map[netlogtype.Connection]netlogtype.Counts) {
+		sendErr := func(tolerate bool, err error) {
+			logger.Error(ctx, "collect network stats", slog.Error(err))
+			// Tolerate up to 1 minute of errors.
+			if tolerate {
+				if firstErrTime.IsZero() {
+					logger.Info(ctx, "tolerating network stats errors for up to 1 minute")
+					firstErrTime = time.Now()
+				}
+				if time.Since(firstErrTime) < time.Minute {
+					return
+				}
+			}
+
+			select {
+			case errCh <- err:
+			default:
+			}
+		}
+
+		stats, err := collectNetworkStats(ctx, agentConn, start, end, virtual)
+		if err != nil {
+			sendErr(true, err)
+			return
+		}
+
+		rawStats, err := json.Marshal(stats)
+		if err != nil {
+			sendErr(false, err)
+			return
+		}
+		err = afero.WriteFile(fs, networkInfoFilePath, rawStats, 0o600)
+		if err != nil {
+			sendErr(false, err)
+			return
+		}
+
+		firstErrTime = time.Time{}
+	}
+
+	now := time.Now()
+	cb(now, now.Add(time.Nanosecond), map[netlogtype.Connection]netlogtype.Counts{}, map[netlogtype.Connection]netlogtype.Counts{})
+	agentConn.SetConnStatsCallback(networkInfoInterval, 2048, cb)
+	return errCh, nil
+}
+
+type sshNetworkStats struct {
+	P2P              bool               `json:"p2p"`
+	Latency          float64            `json:"latency"`
+	PreferredDERP    string             `json:"preferred_derp"`
+	DERPLatency      map[string]float64 `json:"derp_latency"`
+	UploadBytesSec   int64              `json:"upload_bytes_sec"`
+	DownloadBytesSec int64              `json:"download_bytes_sec"`
+}
+
+func collectNetworkStats(ctx context.Context, agentConn *workspacesdk.AgentConn, start, end time.Time, counts map[netlogtype.Connection]netlogtype.Counts) (*sshNetworkStats, error) {
+	latency, p2p, pingResult, err := agentConn.Ping(ctx)
+	if err != nil {
+		return nil, err
+	}
+	node := agentConn.Node()
+	derpMap := agentConn.DERPMap()
+	derpLatency := map[string]float64{}
+
+	// Convert DERP region IDs to friendly names for display in the UI.
+	for rawRegion, latency := range node.DERPLatency {
+		regionParts := strings.SplitN(rawRegion, "-", 2)
+		regionID, err := strconv.Atoi(regionParts[0])
+		if err != nil {
+			continue
+		}
+		region, found := derpMap.Regions[regionID]
+		if !found {
+			// It's possible that a workspace agent is using an old DERPMap
+			// and reports regions that do not exist. If that's the case,
+			// report the region as unknown!
+			region = &tailcfg.DERPRegion{
+				RegionID:   regionID,
+				RegionName: fmt.Sprintf("Unnamed %d", regionID),
+			}
+		}
+		// Convert the microseconds to milliseconds.
+		derpLatency[region.RegionName] = latency * 1000
+	}
+
+	totalRx := uint64(0)
+	totalTx := uint64(0)
+	for _, stat := range counts {
+		totalRx += stat.RxBytes
+		totalTx += stat.TxBytes
+	}
+	// Tracking the time since last request is required because
+	// ExtractTrafficStats() resets its counters after each call.
+	dur := end.Sub(start)
+	uploadSecs := float64(totalTx) / dur.Seconds()
+	downloadSecs := float64(totalRx) / dur.Seconds()
+
+	// Sometimes the preferred DERP doesn't match the one we're actually
+	// connected with. Perhaps because the agent prefers a different DERP and
+	// we're using that server instead.
+	preferredDerpID := node.PreferredDERP
+	if pingResult.DERPRegionID != 0 {
+		preferredDerpID = pingResult.DERPRegionID
+	}
+	preferredDerp, ok := derpMap.Regions[preferredDerpID]
+	preferredDerpName := fmt.Sprintf("Unnamed %d", preferredDerpID)
+	if ok {
+		preferredDerpName = preferredDerp.RegionName
+	}
+	if _, ok := derpLatency[preferredDerpName]; !ok {
+		derpLatency[preferredDerpName] = 0
+	}
+
+	return &sshNetworkStats{
+		P2P:              p2p,
+		Latency:          float64(latency.Microseconds()) / 1000,
+		PreferredDERP:    preferredDerpName,
+		DERPLatency:      derpLatency,
+		UploadBytesSec:   int64(uploadSecs),
+		DownloadBytesSec: int64(downloadSecs),
+	}, nil
 }

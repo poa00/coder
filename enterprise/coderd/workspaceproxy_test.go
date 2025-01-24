@@ -1,16 +1,17 @@
 package coderd_test
 
 import (
+	"database/sql"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/moby/moby/pkg/namesgenerator"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -18,6 +19,8 @@ import (
 	"github.com/coder/coder/v2/buildinfo"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/db2sdk"
+	"github.com/coder/coder/v2/coderd/database/dbgen"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/workspaceapps"
@@ -166,10 +169,16 @@ func TestRegions(t *testing.T) {
 		require.Equal(t, proxy.Url, regions[1].PathAppURL)
 		require.Equal(t, proxy.WildcardHostname, regions[1].WildcardHostname)
 
+		waitTime := testutil.WaitShort / 10
+		// windows needs more time
+		if runtime.GOOS == "windows" {
+			waitTime = testutil.WaitShort / 5
+		}
+
 		// Unfortunately need to wait to assert createdAt/updatedAt
-		<-time.After(testutil.WaitShort / 10)
-		require.WithinDuration(t, approxCreateTime, proxy.CreatedAt, testutil.WaitShort/10)
-		require.WithinDuration(t, approxCreateTime, proxy.UpdatedAt, testutil.WaitShort/10)
+		<-time.After(waitTime)
+		require.WithinDuration(t, approxCreateTime, proxy.CreatedAt, waitTime)
+		require.WithinDuration(t, approxCreateTime, proxy.UpdatedAt, waitTime)
 	})
 
 	t.Run("RequireAuth", func(t *testing.T) {
@@ -204,7 +213,7 @@ func TestWorkspaceProxyCRUD(t *testing.T) {
 		})
 		ctx := testutil.Context(t, testutil.WaitLong)
 		proxyRes, err := client.CreateWorkspaceProxy(ctx, codersdk.CreateWorkspaceProxyRequest{
-			Name: namesgenerator.GetRandomName(1),
+			Name: testutil.GetRandomName(t),
 			Icon: "/emojis/flag.png",
 		})
 		require.NoError(t, err)
@@ -217,9 +226,9 @@ func TestWorkspaceProxyCRUD(t *testing.T) {
 		require.NotEmpty(t, proxyRes.ProxyToken)
 
 		// Update the proxy
-		expName := namesgenerator.GetRandomName(1)
-		expDisplayName := namesgenerator.GetRandomName(1)
-		expIcon := namesgenerator.GetRandomName(1)
+		expName := testutil.GetRandomName(t)
+		expDisplayName := testutil.GetRandomName(t)
+		expIcon := testutil.GetRandomName(t)
 		_, err = client.PatchWorkspaceProxy(ctx, codersdk.PatchWorkspaceProxy{
 			ID:          proxyRes.Proxy.ID,
 			Name:        expName,
@@ -247,7 +256,7 @@ func TestWorkspaceProxyCRUD(t *testing.T) {
 		})
 		ctx := testutil.Context(t, testutil.WaitLong)
 		proxyRes, err := client.CreateWorkspaceProxy(ctx, codersdk.CreateWorkspaceProxyRequest{
-			Name: namesgenerator.GetRandomName(1),
+			Name: testutil.GetRandomName(t),
 			Icon: "/emojis/flag.png",
 		})
 		require.NoError(t, err)
@@ -318,7 +327,6 @@ func TestProxyRegisterDeregister(t *testing.T) {
 		}
 		registerRes1, err := proxyClient.RegisterWorkspaceProxy(ctx, req)
 		require.NoError(t, err)
-		require.NotEmpty(t, registerRes1.AppSecurityKey)
 		require.NotEmpty(t, registerRes1.DERPMeshKey)
 		require.EqualValues(t, 10001, registerRes1.DERPRegionID)
 		require.Empty(t, registerRes1.SiblingReplicas)
@@ -607,11 +615,8 @@ func TestProxyRegisterDeregister(t *testing.T) {
 func TestIssueSignedAppToken(t *testing.T) {
 	t.Parallel()
 
-	db, pubsub := dbtestutil.NewDB(t)
 	client, user := coderdenttest.New(t, &coderdenttest.Options{
 		Options: &coderdtest.Options{
-			Database:                 db,
-			Pubsub:                   pubsub,
 			IncludeProvisionerDaemon: true,
 		},
 		LicenseOptions: &coderdenttest.LicenseOptions{
@@ -629,7 +634,7 @@ func TestIssueSignedAppToken(t *testing.T) {
 	})
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	build := coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 	workspace.LatestBuild = build
 
@@ -639,7 +644,7 @@ func TestIssueSignedAppToken(t *testing.T) {
 
 	createProxyCtx := testutil.Context(t, testutil.WaitLong)
 	proxyRes, err := client.CreateWorkspaceProxy(createProxyCtx, codersdk.CreateWorkspaceProxyRequest{
-		Name: namesgenerator.GetRandomName(1),
+		Name: testutil.GetRandomName(t),
 		Icon: "/emojis/flag.png",
 	})
 	require.NoError(t, err)
@@ -714,6 +719,10 @@ func TestReconnectingPTYSignedToken(t *testing.T) {
 		closer.Close()
 	})
 
+	_ = dbgen.CryptoKey(t, db, database.CryptoKey{
+		Feature: database.CryptoKeyFeatureWorkspaceAppsToken,
+	})
+
 	// Create a workspace + apps
 	authToken := uuid.NewString()
 	version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, &echo.Responses{
@@ -722,7 +731,7 @@ func TestReconnectingPTYSignedToken(t *testing.T) {
 	})
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	build := coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 	workspace.LatestBuild = build
 
@@ -731,11 +740,11 @@ func TestReconnectingPTYSignedToken(t *testing.T) {
 	_ = agenttest.New(t, client.URL, authToken)
 	_ = coderdtest.AwaitWorkspaceAgents(t, client, workspace.ID)
 
-	proxyURL, err := url.Parse(fmt.Sprintf("https://%s.com", namesgenerator.GetRandomName(1)))
+	proxyURL, err := url.Parse(fmt.Sprintf("https://%s.com", testutil.GetRandomName(t)))
 	require.NoError(t, err)
 
 	_ = coderdenttest.NewWorkspaceProxyReplica(t, api, client, &coderdenttest.ProxyOptions{
-		Name:        namesgenerator.GetRandomName(1),
+		Name:        testutil.GetRandomName(t),
 		ProxyURL:    proxyURL,
 		AppHostname: "*.sub.example.com",
 	})
@@ -887,4 +896,172 @@ func TestReconnectingPTYSignedToken(t *testing.T) {
 		// The token is validated in the apptest suite, so we don't need to
 		// validate it here.
 	})
+}
+
+func TestGetCryptoKeys(t *testing.T) {
+	t.Parallel()
+
+	t.Run("OK", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t, testutil.WaitMedium)
+		db, pubsub := dbtestutil.NewDB(t)
+		cclient, _, api, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
+			Options: &coderdtest.Options{
+				Database:                 db,
+				Pubsub:                   pubsub,
+				IncludeProvisionerDaemon: true,
+			},
+			LicenseOptions: &coderdenttest.LicenseOptions{
+				Features: license.Features{
+					codersdk.FeatureWorkspaceProxy: 1,
+				},
+			},
+		})
+
+		now := time.Now()
+
+		expectedKey1 := dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature:  database.CryptoKeyFeatureWorkspaceAppsAPIKey,
+			StartsAt: now.Add(-time.Hour),
+			Sequence: 2,
+		})
+		encryptionKey := db2sdk.CryptoKey(expectedKey1)
+
+		expectedKey2 := dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature:  database.CryptoKeyFeatureWorkspaceAppsToken,
+			StartsAt: now,
+			Sequence: 3,
+		})
+		signingKey := db2sdk.CryptoKey(expectedKey2)
+
+		// Create a deleted key.
+		_ = dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature:  database.CryptoKeyFeatureWorkspaceAppsAPIKey,
+			StartsAt: now.Add(-time.Hour),
+			Secret: sql.NullString{
+				String: "secret1",
+				Valid:  false,
+			},
+			Sequence: 4,
+		})
+
+		proxy := coderdenttest.NewWorkspaceProxyReplica(t, api, cclient, &coderdenttest.ProxyOptions{
+			Name: testutil.GetRandomName(t),
+		})
+
+		keys, err := proxy.SDKClient.CryptoKeys(ctx, codersdk.CryptoKeyFeatureWorkspaceAppsAPIKey)
+		require.NoError(t, err)
+		require.NotEmpty(t, keys)
+		// 1 key is generated on startup, the other we manually generated.
+		require.Equal(t, 2, len(keys.CryptoKeys))
+		requireContainsKeys(t, keys.CryptoKeys, encryptionKey)
+		requireNotContainsKeys(t, keys.CryptoKeys, signingKey)
+
+		keys, err = proxy.SDKClient.CryptoKeys(ctx, codersdk.CryptoKeyFeatureWorkspaceAppsToken)
+		require.NoError(t, err)
+		require.NotEmpty(t, keys)
+		// 1 key is generated on startup, the other we manually generated.
+		require.Equal(t, 2, len(keys.CryptoKeys))
+		requireContainsKeys(t, keys.CryptoKeys, signingKey)
+		requireNotContainsKeys(t, keys.CryptoKeys, encryptionKey)
+	})
+
+	t.Run("InvalidFeature", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t, testutil.WaitMedium)
+		db, pubsub := dbtestutil.NewDB(t)
+		cclient, _, api, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
+			Options: &coderdtest.Options{
+				Database:                 db,
+				Pubsub:                   pubsub,
+				IncludeProvisionerDaemon: true,
+			},
+			LicenseOptions: &coderdenttest.LicenseOptions{
+				Features: license.Features{
+					codersdk.FeatureWorkspaceProxy: 1,
+				},
+			},
+		})
+
+		proxy := coderdenttest.NewWorkspaceProxyReplica(t, api, cclient, &coderdenttest.ProxyOptions{
+			Name: testutil.GetRandomName(t),
+		})
+
+		_, err := proxy.SDKClient.CryptoKeys(ctx, codersdk.CryptoKeyFeatureOIDCConvert)
+		require.Error(t, err)
+		var sdkErr *codersdk.Error
+		require.ErrorAs(t, err, &sdkErr)
+		require.Equal(t, http.StatusBadRequest, sdkErr.StatusCode())
+		_, err = proxy.SDKClient.CryptoKeys(ctx, codersdk.CryptoKeyFeatureTailnetResume)
+		require.Error(t, err)
+		require.ErrorAs(t, err, &sdkErr)
+		require.Equal(t, http.StatusBadRequest, sdkErr.StatusCode())
+		_, err = proxy.SDKClient.CryptoKeys(ctx, "invalid")
+		require.Error(t, err)
+		require.ErrorAs(t, err, &sdkErr)
+		require.Equal(t, http.StatusBadRequest, sdkErr.StatusCode())
+	})
+
+	t.Run("Unauthorized", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t, testutil.WaitMedium)
+		db, pubsub := dbtestutil.NewDB(t)
+		cclient, _, api, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
+			Options: &coderdtest.Options{
+				Database:                 db,
+				Pubsub:                   pubsub,
+				IncludeProvisionerDaemon: true,
+			},
+			LicenseOptions: &coderdenttest.LicenseOptions{
+				Features: license.Features{
+					codersdk.FeatureWorkspaceProxy: 1,
+				},
+			},
+		})
+
+		_ = coderdenttest.NewWorkspaceProxyReplica(t, api, cclient, &coderdenttest.ProxyOptions{
+			Name: testutil.GetRandomName(t),
+		})
+
+		client := wsproxysdk.New(cclient.URL)
+		client.SetSessionToken(cclient.SessionToken())
+
+		_, err := client.CryptoKeys(ctx, codersdk.CryptoKeyFeatureWorkspaceAppsAPIKey)
+		require.Error(t, err)
+		var sdkErr *codersdk.Error
+		require.ErrorAs(t, err, &sdkErr)
+		require.Equal(t, http.StatusUnauthorized, sdkErr.StatusCode())
+	})
+}
+
+func requireNotContainsKeys(t *testing.T, keys []codersdk.CryptoKey, unexpected ...codersdk.CryptoKey) {
+	t.Helper()
+
+	for _, unexpectedKey := range unexpected {
+		for _, key := range keys {
+			if key.Feature == unexpectedKey.Feature && key.Sequence == unexpectedKey.Sequence {
+				t.Fatalf("unexpected key %+v found", unexpectedKey)
+			}
+		}
+	}
+}
+
+func requireContainsKeys(t *testing.T, keys []codersdk.CryptoKey, expected ...codersdk.CryptoKey) {
+	t.Helper()
+
+	for _, expectedKey := range expected {
+		var found bool
+		for _, key := range keys {
+			if key.Feature == expectedKey.Feature && key.Sequence == expectedKey.Sequence {
+				require.True(t, expectedKey.StartsAt.Equal(key.StartsAt), "expected starts at %s, got %s", expectedKey.StartsAt, key.StartsAt)
+				require.Equal(t, expectedKey.Secret, key.Secret)
+				require.True(t, expectedKey.DeletesAt.Equal(key.DeletesAt), "expected deletes at %s, got %s", expectedKey.DeletesAt, key.DeletesAt)
+				found = true
+			}
+		}
+		require.True(t, found, "expected key %+v not found", expectedKey)
+	}
 }

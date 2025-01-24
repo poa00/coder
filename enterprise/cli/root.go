@@ -17,10 +17,11 @@ func (r *RootCmd) enterpriseOnly() []*serpent.Command {
 		r.licenses(),
 		r.groups(),
 		r.provisionerDaemons(),
+		r.provisionerd(),
 	}
 }
 
 func (r *RootCmd) EnterpriseSubcommands() []*serpent.Command {
-	all := append(r.Core(), r.enterpriseOnly()...)
+	all := append(r.CoreSubcommands(), r.enterpriseOnly()...)
 	return all
 }

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,6 +21,7 @@ import (
 	"github.com/coder/coder/v2/agent/agenttest"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/httpmw"
+	"github.com/coder/coder/v2/coderd/jwtutils"
 	"github.com/coder/coder/v2/coderd/workspaceapps"
 	"github.com/coder/coder/v2/coderd/workspaceapps/appurl"
 	"github.com/coder/coder/v2/codersdk"
@@ -40,6 +42,7 @@ func Test_ResolveRequest(t *testing.T) {
 		// Users can access unhealthy and initializing apps (as of 2024-02).
 		appNameUnhealthy    = "app-unhealthy"
 		appNameInitializing = "app-initializing"
+		appNameEndsInS      = "app-ends-in-s"
 
 		// This agent will never connect, so it will never become "connected".
 		// Users cannot access unhealthy agents.
@@ -93,8 +96,7 @@ func Test_ResolveRequest(t *testing.T) {
 		_ = closer.Close()
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitMedium)
-	t.Cleanup(cancel)
+	ctx := testutil.Context(t, testutil.WaitMedium)
 
 	firstUser := coderdtest.CreateFirstUser(t, client)
 	me, err := client.User(ctx, codersdk.Me)
@@ -166,6 +168,12 @@ func Test_ResolveRequest(t *testing.T) {
 											Threshold: 1000,
 										},
 									},
+									{
+										Slug:         appNameEndsInS,
+										DisplayName:  appNameEndsInS,
+										SharingLevel: proto.AppSharingLevel_OWNER,
+										Url:          appURL,
+									},
 								},
 							},
 							{
@@ -191,7 +199,7 @@ func Test_ResolveRequest(t *testing.T) {
 	})
 	template := coderdtest.CreateTemplate(t, client, firstUser.OrganizationID, version.ID)
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, firstUser.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 	_ = agenttest.New(t, client.URL, agentAuthToken)
@@ -269,15 +277,17 @@ func Test_ResolveRequest(t *testing.T) {
 					_ = w.Body.Close()
 
 					require.Equal(t, &workspaceapps.SignedToken{
+						RegisteredClaims: jwtutils.RegisteredClaims{
+							Expiry: jwt.NewNumericDate(token.Expiry.Time()),
+						},
 						Request:     req,
-						Expiry:      token.Expiry, // ignored to avoid flakiness
 						UserID:      me.ID,
 						WorkspaceID: workspace.ID,
 						AgentID:     agentID,
 						AppURL:      appURL,
 					}, token)
 					require.NotZero(t, token.Expiry)
-					require.WithinDuration(t, time.Now().Add(workspaceapps.DefaultTokenExpiry), token.Expiry, time.Minute)
+					require.WithinDuration(t, time.Now().Add(workspaceapps.DefaultTokenExpiry), token.Expiry.Time(), time.Minute)
 
 					// Check that the token was set in the response and is valid.
 					require.Len(t, w.Cookies(), 1)
@@ -285,10 +295,11 @@ func Test_ResolveRequest(t *testing.T) {
 					require.Equal(t, codersdk.SignedAppTokenCookie, cookie.Name)
 					require.Equal(t, req.BasePath, cookie.Path)
 
-					parsedToken, err := api.AppSecurityKey.VerifySignedToken(cookie.Value)
+					var parsedToken workspaceapps.SignedToken
+					err := jwtutils.Verify(ctx, api.AppSigningKeyCache, cookie.Value, &parsedToken)
 					require.NoError(t, err)
 					// normalize expiry
-					require.WithinDuration(t, token.Expiry, parsedToken.Expiry, 2*time.Second)
+					require.WithinDuration(t, token.Expiry.Time(), parsedToken.Expiry.Time(), 2*time.Second)
 					parsedToken.Expiry = token.Expiry
 					require.Equal(t, token, &parsedToken)
 
@@ -307,7 +318,7 @@ func Test_ResolveRequest(t *testing.T) {
 					})
 					require.True(t, ok)
 					// normalize expiry
-					require.WithinDuration(t, token.Expiry, secondToken.Expiry, 2*time.Second)
+					require.WithinDuration(t, token.Expiry.Time(), secondToken.Expiry.Time(), 2*time.Second)
 					secondToken.Expiry = token.Expiry
 					require.Equal(t, token, secondToken)
 				}
@@ -533,13 +544,16 @@ func Test_ResolveRequest(t *testing.T) {
 				// App name differs
 				AppSlugOrPort: appNamePublic,
 			}).Normalize(),
-			Expiry:      time.Now().Add(time.Minute),
+			RegisteredClaims: jwtutils.RegisteredClaims{
+				Expiry: jwt.NewNumericDate(time.Now().Add(time.Minute)),
+			},
 			UserID:      me.ID,
 			WorkspaceID: workspace.ID,
 			AgentID:     agentID,
 			AppURL:      appURL,
 		}
-		badTokenStr, err := api.AppSecurityKey.SignToken(badToken)
+
+		badTokenStr, err := jwtutils.Sign(ctx, api.AppSigningKeyCache, badToken)
 		require.NoError(t, err)
 
 		req := (workspaceapps.Request{
@@ -582,7 +596,8 @@ func Test_ResolveRequest(t *testing.T) {
 		require.Len(t, cookies, 1)
 		require.Equal(t, cookies[0].Name, codersdk.SignedAppTokenCookie)
 		require.NotEqual(t, cookies[0].Value, badTokenStr)
-		parsedToken, err := api.AppSecurityKey.VerifySignedToken(cookies[0].Value)
+		var parsedToken workspaceapps.SignedToken
+		err = jwtutils.Verify(ctx, api.AppSigningKeyCache, cookies[0].Value, &parsedToken)
 		require.NoError(t, err)
 		require.Equal(t, appNameOwner, parsedToken.AppSlugOrPort)
 	})
@@ -642,6 +657,67 @@ func Test_ResolveRequest(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, req.AppSlugOrPort, token.AppSlugOrPort)
 		require.Equal(t, "http://127.0.0.1:9090", token.AppURL)
+	})
+
+	t.Run("PortSubdomainHTTPSS", func(t *testing.T) {
+		t.Parallel()
+
+		req := (workspaceapps.Request{
+			AccessMethod:      workspaceapps.AccessMethodSubdomain,
+			BasePath:          "/",
+			UsernameOrID:      me.Username,
+			WorkspaceNameOrID: workspace.Name,
+			AgentNameOrID:     agentName,
+			AppSlugOrPort:     "9090ss",
+		}).Normalize()
+
+		rw := httptest.NewRecorder()
+		r := httptest.NewRequest("GET", "/", nil)
+		r.Header.Set(codersdk.SessionTokenHeader, client.SessionToken())
+
+		_, ok := workspaceapps.ResolveRequest(rw, r, workspaceapps.ResolveRequestOptions{
+			Logger:              api.Logger,
+			SignedTokenProvider: api.WorkspaceAppsProvider,
+			DashboardURL:        api.AccessURL,
+			PathAppBaseURL:      api.AccessURL,
+			AppHostname:         api.AppHostname,
+			AppRequest:          req,
+		})
+		// should parse as app and fail to find app "9090ss"
+		require.False(t, ok)
+		w := rw.Result()
+		_ = w.Body.Close()
+		b, err := io.ReadAll(w.Body)
+		require.NoError(t, err)
+		require.Contains(t, string(b), "404 - Application Not Found")
+	})
+
+	t.Run("SubdomainEndsInS", func(t *testing.T) {
+		t.Parallel()
+
+		req := (workspaceapps.Request{
+			AccessMethod:      workspaceapps.AccessMethodSubdomain,
+			BasePath:          "/",
+			UsernameOrID:      me.Username,
+			WorkspaceNameOrID: workspace.Name,
+			AgentNameOrID:     agentName,
+			AppSlugOrPort:     appNameEndsInS,
+		}).Normalize()
+
+		rw := httptest.NewRecorder()
+		r := httptest.NewRequest("GET", "/", nil)
+		r.Header.Set(codersdk.SessionTokenHeader, client.SessionToken())
+
+		token, ok := workspaceapps.ResolveRequest(rw, r, workspaceapps.ResolveRequestOptions{
+			Logger:              api.Logger,
+			SignedTokenProvider: api.WorkspaceAppsProvider,
+			DashboardURL:        api.AccessURL,
+			PathAppBaseURL:      api.AccessURL,
+			AppHostname:         api.AppHostname,
+			AppRequest:          req,
+		})
+		require.True(t, ok)
+		require.Equal(t, req.AppSlugOrPort, token.AppSlugOrPort)
 	})
 
 	t.Run("Terminal", func(t *testing.T) {

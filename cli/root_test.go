@@ -55,6 +55,22 @@ func TestCommandHelp(t *testing.T) {
 			Name: "coder users list",
 			Cmd:  []string{"users", "list"},
 		},
+		clitest.CommandHelpCase{
+			Name: "coder provisioner list",
+			Cmd:  []string{"provisioner", "list"},
+		},
+		clitest.CommandHelpCase{
+			Name: "coder provisioner list --output json",
+			Cmd:  []string{"provisioner", "list", "--output", "json"},
+		},
+		clitest.CommandHelpCase{
+			Name: "coder provisioner jobs list",
+			Cmd:  []string{"provisioner", "jobs", "list"},
+		},
+		clitest.CommandHelpCase{
+			Name: "coder provisioner jobs list --output json",
+			Cmd:  []string{"provisioner", "jobs", "list", "--output", "json"},
+		},
 	))
 }
 
@@ -253,7 +269,7 @@ func TestHandlersOK(t *testing.T) {
 	t.Parallel()
 
 	var root cli.RootCmd
-	cmd, err := root.Command(root.Core())
+	cmd, err := root.Command(root.CoreSubcommands())
 	require.NoError(t, err)
 
 	clitest.HandlersOK(t, cmd)

@@ -1,8 +1,6 @@
 package provisionerd_test
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -32,7 +30,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m, testutil.GoleakOptions...)
 }
 
 func closedWithin(c chan struct{}, d time.Duration) func() bool {
@@ -72,8 +70,11 @@ func TestProvisionerd(t *testing.T) {
 			close(done)
 		})
 		completeChan := make(chan struct{})
+		var completed sync.Once
 		closer := createProvisionerd(t, func(ctx context.Context) (proto.DRPCProvisionerDaemonClient, error) {
-			defer close(completeChan)
+			completed.Do(func() {
+				defer close(completeChan)
+			})
 			return nil, xerrors.New("an error")
 		}, provisionerd.LocalProvisioners{})
 		require.Condition(t, closedWithin(completeChan, testutil.WaitShort))
@@ -97,7 +98,7 @@ func TestProvisionerd(t *testing.T) {
 					err := stream.Send(&proto.AcquiredJob{
 						JobId:       "test",
 						Provisioner: "someprovisioner",
-						TemplateSourceArchive: createTar(t, map[string]string{
+						TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 							"test.txt": "content",
 						}),
 						Type: &proto.AcquiredJob_TemplateImport_{
@@ -150,7 +151,7 @@ func TestProvisionerd(t *testing.T) {
 			acq          = newAcquireOne(t, &proto.AcquiredJob{
 				JobId:       "test",
 				Provisioner: "someprovisioner",
-				TemplateSourceArchive: createTar(t, map[string]string{
+				TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 					"../../../etc/passwd": "content",
 				}),
 				Type: &proto.AcquiredJob_TemplateImport_{
@@ -194,7 +195,7 @@ func TestProvisionerd(t *testing.T) {
 					err := stream.Send(&proto.AcquiredJob{
 						JobId:       "test",
 						Provisioner: "someprovisioner",
-						TemplateSourceArchive: createTar(t, map[string]string{
+						TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 							"test.txt": "content",
 						}),
 						Type: &proto.AcquiredJob_TemplateImport_{
@@ -243,7 +244,7 @@ func TestProvisionerd(t *testing.T) {
 			acq         = newAcquireOne(t, &proto.AcquiredJob{
 				JobId:       "test",
 				Provisioner: "someprovisioner",
-				TemplateSourceArchive: createTar(t, map[string]string{
+				TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 					"test.txt":                "content",
 					provisionersdk.ReadmeFile: "# A cool template 😎\n",
 				}),
@@ -325,7 +326,7 @@ func TestProvisionerd(t *testing.T) {
 			acq         = newAcquireOne(t, &proto.AcquiredJob{
 				JobId:       "test",
 				Provisioner: "someprovisioner",
-				TemplateSourceArchive: createTar(t, map[string]string{
+				TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 					"test.txt": "content",
 				}),
 				Type: &proto.AcquiredJob_TemplateDryRun_{
@@ -396,7 +397,7 @@ func TestProvisionerd(t *testing.T) {
 			acq         = newAcquireOne(t, &proto.AcquiredJob{
 				JobId:       "test",
 				Provisioner: "someprovisioner",
-				TemplateSourceArchive: createTar(t, map[string]string{
+				TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 					"test.txt": "content",
 				}),
 				Type: &proto.AcquiredJob_WorkspaceBuild_{
@@ -459,7 +460,7 @@ func TestProvisionerd(t *testing.T) {
 			acq         = newAcquireOne(t, &proto.AcquiredJob{
 				JobId:       "test",
 				Provisioner: "someprovisioner",
-				TemplateSourceArchive: createTar(t, map[string]string{
+				TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 					"test.txt": "content",
 				}),
 				Type: &proto.AcquiredJob_WorkspaceBuild_{
@@ -549,7 +550,7 @@ func TestProvisionerd(t *testing.T) {
 			acq     = newAcquireOne(t, &proto.AcquiredJob{
 				JobId:       "test",
 				Provisioner: "someprovisioner",
-				TemplateSourceArchive: createTar(t, map[string]string{
+				TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 					"test.txt": "content",
 				}),
 				Type: &proto.AcquiredJob_WorkspaceBuild_{
@@ -597,6 +598,38 @@ func TestProvisionerd(t *testing.T) {
 		assert.True(t, didFail.Load(), "should fail the job")
 	})
 
+	// Simulates when there is no coderd to connect to. So the client connection
+	// will never be established.
+	t.Run("ShutdownNoCoderd", func(t *testing.T) {
+		t.Parallel()
+		done := make(chan struct{})
+		t.Cleanup(func() {
+			close(done)
+		})
+
+		connectAttemptedClose := sync.Once{}
+		connectAttempted := make(chan struct{})
+		server := createProvisionerd(t, func(ctx context.Context) (proto.DRPCProvisionerDaemonClient, error) {
+			// This is the dial out to Coderd, which in this unit test will always fail.
+			connectAttemptedClose.Do(func() { close(connectAttempted) })
+			return nil, xerrors.New("client connection always fails")
+		}, provisionerd.LocalProvisioners{
+			"someprovisioner": createProvisionerClient(t, done, provisionerTestServer{}),
+		})
+
+		// Wait for at least 1 attempt to connect to ensure the connect go routine
+		// is running.
+		require.Condition(t, closedWithin(connectAttempted, testutil.WaitShort))
+
+		// The test is ensuring this Shutdown call does not block indefinitely.
+		// If it does, the context will return with an error, and the test will
+		// fail.
+		shutdownCtx := testutil.Context(t, testutil.WaitShort)
+		err := server.Shutdown(shutdownCtx, true)
+		require.NoError(t, err, "shutdown did not unblock. Failed to close the server gracefully.")
+		require.NoError(t, server.Close())
+	})
+
 	t.Run("Shutdown", func(t *testing.T) {
 		t.Parallel()
 		done := make(chan struct{})
@@ -613,7 +646,7 @@ func TestProvisionerd(t *testing.T) {
 					err := stream.Send(&proto.AcquiredJob{
 						JobId:       "test",
 						Provisioner: "someprovisioner",
-						TemplateSourceArchive: createTar(t, map[string]string{
+						TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 							"test.txt": "content",
 						}),
 						Type: &proto.AcquiredJob_WorkspaceBuild_{
@@ -693,7 +726,7 @@ func TestProvisionerd(t *testing.T) {
 					err := stream.Send(&proto.AcquiredJob{
 						JobId:       "test",
 						Provisioner: "someprovisioner",
-						TemplateSourceArchive: createTar(t, map[string]string{
+						TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 							"test.txt": "content",
 						}),
 						Type: &proto.AcquiredJob_WorkspaceBuild_{
@@ -787,7 +820,7 @@ func TestProvisionerd(t *testing.T) {
 					job := &proto.AcquiredJob{
 						JobId:       "test",
 						Provisioner: "someprovisioner",
-						TemplateSourceArchive: createTar(t, map[string]string{
+						TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 							"test.txt": "content",
 						}),
 						Type: &proto.AcquiredJob_WorkspaceBuild_{
@@ -884,7 +917,7 @@ func TestProvisionerd(t *testing.T) {
 					job := &proto.AcquiredJob{
 						JobId:       "test",
 						Provisioner: "someprovisioner",
-						TemplateSourceArchive: createTar(t, map[string]string{
+						TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 							"test.txt": "content",
 						}),
 						Type: &proto.AcquiredJob_WorkspaceBuild_{
@@ -978,7 +1011,7 @@ func TestProvisionerd(t *testing.T) {
 					err := stream.Send(&proto.AcquiredJob{
 						JobId:       "test",
 						Provisioner: "someprovisioner",
-						TemplateSourceArchive: createTar(t, map[string]string{
+						TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
 							"test.txt": "content",
 						}),
 						Type: &proto.AcquiredJob_WorkspaceBuild_{
@@ -1044,26 +1077,6 @@ func TestProvisionerd(t *testing.T) {
 		assert.Equal(t, ops[len(ops)-1], "CompleteJob")
 		assert.Contains(t, ops[0:len(ops)-1], "Log: Cleaning Up | ")
 	})
-}
-
-// Creates an in-memory tar of the files provided.
-func createTar(t *testing.T, files map[string]string) []byte {
-	var buffer bytes.Buffer
-	writer := tar.NewWriter(&buffer)
-	for path, content := range files {
-		err := writer.WriteHeader(&tar.Header{
-			Name: path,
-			Size: int64(len(content)),
-		})
-		require.NoError(t, err)
-
-		_, err = writer.Write([]byte(content))
-		require.NoError(t, err)
-	}
-
-	err := writer.Flush()
-	require.NoError(t, err)
-	return buffer.Bytes()
 }
 
 // Creates a provisionerd implementation with the provided dialer and provisioners.
@@ -1142,7 +1155,7 @@ func createProvisionerClient(t *testing.T, done <-chan struct{}, server provisio
 		defer close(closed)
 		_ = provisionersdk.Serve(ctx, &server, &provisionersdk.ServeOptions{
 			Listener:      serverPipe,
-			Logger:        slogtest.Make(t, nil).Leveled(slog.LevelDebug).Named("test-provisioner"),
+			Logger:        testutil.Logger(t).Named("test-provisioner"),
 			WorkDirectory: tempDir,
 		})
 	}()

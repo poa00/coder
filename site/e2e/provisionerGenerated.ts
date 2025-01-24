@@ -1,6 +1,7 @@
 /* eslint-disable */
 import * as _m0 from "protobufjs/minimal";
 import { Observable } from "rxjs";
+import { Timestamp } from "./google/protobuf/timestampGenerated";
 
 export const protobufPackage = "provisioner";
 
@@ -21,6 +22,14 @@ export enum AppSharingLevel {
   UNRECOGNIZED = -1,
 }
 
+export enum AppOpenIn {
+  /** @deprecated */
+  WINDOW = 0,
+  SLIM_WINDOW = 1,
+  TAB = 2,
+  UNRECOGNIZED = -1,
+}
+
 /** WorkspaceTransition is the desired outcome of a build */
 export enum WorkspaceTransition {
   START = 0,
@@ -29,8 +38,16 @@ export enum WorkspaceTransition {
   UNRECOGNIZED = -1,
 }
 
+export enum TimingState {
+  STARTED = 0,
+  COMPLETED = 1,
+  FAILED = 2,
+  UNRECOGNIZED = -1,
+}
+
 /** Empty indicates a successful request/response. */
-export interface Empty {}
+export interface Empty {
+}
 
 /** TemplateVariable represents a Terraform variable. */
 export interface TemplateVariable {
@@ -187,6 +204,8 @@ export interface App {
   sharingLevel: AppSharingLevel;
   external: boolean;
   order: number;
+  hidden: boolean;
+  openIn: AppOpenIn;
 }
 
 /** Healthcheck represents configuration for checking for app readiness. */
@@ -206,6 +225,7 @@ export interface Resource {
   icon: string;
   instanceType: string;
   dailyCost: number;
+  modulePath: string;
 }
 
 export interface Resource_Metadata {
@@ -213,6 +233,12 @@ export interface Resource_Metadata {
   value: string;
   sensitive: boolean;
   isNull: boolean;
+}
+
+export interface Module {
+  source: string;
+  version: string;
+  key: string;
 }
 
 /** Metadata is information about a workspace used in the execution of a build */
@@ -230,6 +256,11 @@ export interface Metadata {
   workspaceOwnerSessionToken: string;
   templateId: string;
   workspaceOwnerName: string;
+  workspaceOwnerGroups: string[];
+  workspaceOwnerSshPublicKey: string;
+  workspaceOwnerSshPrivateKey: string;
+  workspaceBuildId: string;
+  workspaceOwnerLoginType: string;
 }
 
 /** Config represents execution configuration shared by all subsequent requests in the Session */
@@ -242,13 +273,20 @@ export interface Config {
 }
 
 /** ParseRequest consumes source-code to produce inputs. */
-export interface ParseRequest {}
+export interface ParseRequest {
+}
 
 /** ParseComplete indicates a request to parse completed. */
 export interface ParseComplete {
   error: string;
   templateVariables: TemplateVariable[];
   readme: Uint8Array;
+  workspaceTags: { [key: string]: string };
+}
+
+export interface ParseComplete_WorkspaceTagsEntry {
+  key: string;
+  value: string;
 }
 
 /** PlanRequest asks the provisioner to plan what resources & parameters it will create */
@@ -265,6 +303,8 @@ export interface PlanComplete {
   resources: Resource[];
   parameters: RichParameter[];
   externalAuthProviders: ExternalAuthProviderResource[];
+  timings: Timing[];
+  modules: Module[];
 }
 
 /**
@@ -282,10 +322,22 @@ export interface ApplyComplete {
   resources: Resource[];
   parameters: RichParameter[];
   externalAuthProviders: ExternalAuthProviderResource[];
+  timings: Timing[];
+}
+
+export interface Timing {
+  start: Date | undefined;
+  end: Date | undefined;
+  action: string;
+  source: string;
+  resource: string;
+  stage: string;
+  state: TimingState;
 }
 
 /** CancelRequest requests that the previous request be canceled gracefully. */
-export interface CancelRequest {}
+export interface CancelRequest {
+}
 
 export interface Request {
   config?: Config | undefined;
@@ -309,10 +361,7 @@ export const Empty = {
 };
 
 export const TemplateVariable = {
-  encode(
-    message: TemplateVariable,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: TemplateVariable, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.name !== "") {
       writer.uint32(10).string(message.name);
     }
@@ -336,10 +385,7 @@ export const TemplateVariable = {
 };
 
 export const RichParameterOption = {
-  encode(
-    message: RichParameterOption,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: RichParameterOption, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.name !== "") {
       writer.uint32(10).string(message.name);
     }
@@ -357,10 +403,7 @@ export const RichParameterOption = {
 };
 
 export const RichParameter = {
-  encode(
-    message: RichParameter,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: RichParameter, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.name !== "") {
       writer.uint32(10).string(message.name);
     }
@@ -414,10 +457,7 @@ export const RichParameter = {
 };
 
 export const RichParameterValue = {
-  encode(
-    message: RichParameterValue,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: RichParameterValue, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.name !== "") {
       writer.uint32(10).string(message.name);
     }
@@ -429,10 +469,7 @@ export const RichParameterValue = {
 };
 
 export const VariableValue = {
-  encode(
-    message: VariableValue,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: VariableValue, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.name !== "") {
       writer.uint32(10).string(message.name);
     }
@@ -459,10 +496,7 @@ export const Log = {
 };
 
 export const InstanceIdentityAuth = {
-  encode(
-    message: InstanceIdentityAuth,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: InstanceIdentityAuth, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.instanceId !== "") {
       writer.uint32(10).string(message.instanceId);
     }
@@ -471,10 +505,7 @@ export const InstanceIdentityAuth = {
 };
 
 export const ExternalAuthProviderResource = {
-  encode(
-    message: ExternalAuthProviderResource,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: ExternalAuthProviderResource, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.id !== "") {
       writer.uint32(10).string(message.id);
     }
@@ -486,10 +517,7 @@ export const ExternalAuthProviderResource = {
 };
 
 export const ExternalAuthProvider = {
-  encode(
-    message: ExternalAuthProvider,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: ExternalAuthProvider, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.id !== "") {
       writer.uint32(10).string(message.id);
     }
@@ -509,10 +537,7 @@ export const Agent = {
       writer.uint32(18).string(message.name);
     }
     Object.entries(message.env).forEach(([key, value]) => {
-      Agent_EnvEntry.encode(
-        { key: key as any, value },
-        writer.uint32(26).fork(),
-      ).ldelim();
+      Agent_EnvEntry.encode({ key: key as any, value }, writer.uint32(26).fork()).ldelim();
     });
     if (message.operatingSystem !== "") {
       writer.uint32(42).string(message.operatingSystem);
@@ -545,10 +570,7 @@ export const Agent = {
       Agent_Metadata.encode(v!, writer.uint32(146).fork()).ldelim();
     }
     if (message.displayApps !== undefined) {
-      DisplayApps.encode(
-        message.displayApps,
-        writer.uint32(162).fork(),
-      ).ldelim();
+      DisplayApps.encode(message.displayApps, writer.uint32(162).fork()).ldelim();
     }
     for (const v of message.scripts) {
       Script.encode(v!, writer.uint32(170).fork()).ldelim();
@@ -564,10 +586,7 @@ export const Agent = {
 };
 
 export const Agent_Metadata = {
-  encode(
-    message: Agent_Metadata,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: Agent_Metadata, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.key !== "") {
       writer.uint32(10).string(message.key);
     }
@@ -591,10 +610,7 @@ export const Agent_Metadata = {
 };
 
 export const Agent_EnvEntry = {
-  encode(
-    message: Agent_EnvEntry,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: Agent_EnvEntry, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.key !== "") {
       writer.uint32(10).string(message.key);
     }
@@ -606,10 +622,7 @@ export const Agent_EnvEntry = {
 };
 
 export const DisplayApps = {
-  encode(
-    message: DisplayApps,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: DisplayApps, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.vscode === true) {
       writer.uint32(8).bool(message.vscode);
     }
@@ -642,10 +655,7 @@ export const Env = {
 };
 
 export const Script = {
-  encode(
-    message: Script,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: Script, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.displayName !== "") {
       writer.uint32(10).string(message.displayName);
     }
@@ -698,10 +708,7 @@ export const App = {
       writer.uint32(48).bool(message.subdomain);
     }
     if (message.healthcheck !== undefined) {
-      Healthcheck.encode(
-        message.healthcheck,
-        writer.uint32(58).fork(),
-      ).ldelim();
+      Healthcheck.encode(message.healthcheck, writer.uint32(58).fork()).ldelim();
     }
     if (message.sharingLevel !== 0) {
       writer.uint32(64).int32(message.sharingLevel);
@@ -712,15 +719,18 @@ export const App = {
     if (message.order !== 0) {
       writer.uint32(80).int64(message.order);
     }
+    if (message.hidden === true) {
+      writer.uint32(88).bool(message.hidden);
+    }
+    if (message.openIn !== 0) {
+      writer.uint32(96).int32(message.openIn);
+    }
     return writer;
   },
 };
 
 export const Healthcheck = {
-  encode(
-    message: Healthcheck,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: Healthcheck, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.url !== "") {
       writer.uint32(10).string(message.url);
     }
@@ -735,10 +745,7 @@ export const Healthcheck = {
 };
 
 export const Resource = {
-  encode(
-    message: Resource,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: Resource, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.name !== "") {
       writer.uint32(10).string(message.name);
     }
@@ -763,15 +770,15 @@ export const Resource = {
     if (message.dailyCost !== 0) {
       writer.uint32(64).int32(message.dailyCost);
     }
+    if (message.modulePath !== "") {
+      writer.uint32(74).string(message.modulePath);
+    }
     return writer;
   },
 };
 
 export const Resource_Metadata = {
-  encode(
-    message: Resource_Metadata,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: Resource_Metadata, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.key !== "") {
       writer.uint32(10).string(message.key);
     }
@@ -788,11 +795,23 @@ export const Resource_Metadata = {
   },
 };
 
+export const Module = {
+  encode(message: Module, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
+    if (message.source !== "") {
+      writer.uint32(10).string(message.source);
+    }
+    if (message.version !== "") {
+      writer.uint32(18).string(message.version);
+    }
+    if (message.key !== "") {
+      writer.uint32(26).string(message.key);
+    }
+    return writer;
+  },
+};
+
 export const Metadata = {
-  encode(
-    message: Metadata,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: Metadata, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.coderUrl !== "") {
       writer.uint32(10).string(message.coderUrl);
     }
@@ -832,15 +851,27 @@ export const Metadata = {
     if (message.workspaceOwnerName !== "") {
       writer.uint32(106).string(message.workspaceOwnerName);
     }
+    for (const v of message.workspaceOwnerGroups) {
+      writer.uint32(114).string(v!);
+    }
+    if (message.workspaceOwnerSshPublicKey !== "") {
+      writer.uint32(122).string(message.workspaceOwnerSshPublicKey);
+    }
+    if (message.workspaceOwnerSshPrivateKey !== "") {
+      writer.uint32(130).string(message.workspaceOwnerSshPrivateKey);
+    }
+    if (message.workspaceBuildId !== "") {
+      writer.uint32(138).string(message.workspaceBuildId);
+    }
+    if (message.workspaceOwnerLoginType !== "") {
+      writer.uint32(146).string(message.workspaceOwnerLoginType);
+    }
     return writer;
   },
 };
 
 export const Config = {
-  encode(
-    message: Config,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: Config, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.templateSourceArchive.length !== 0) {
       writer.uint32(10).bytes(message.templateSourceArchive);
     }
@@ -855,19 +886,13 @@ export const Config = {
 };
 
 export const ParseRequest = {
-  encode(
-    _: ParseRequest,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(_: ParseRequest, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     return writer;
   },
 };
 
 export const ParseComplete = {
-  encode(
-    message: ParseComplete,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: ParseComplete, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.error !== "") {
       writer.uint32(10).string(message.error);
     }
@@ -877,15 +902,27 @@ export const ParseComplete = {
     if (message.readme.length !== 0) {
       writer.uint32(26).bytes(message.readme);
     }
+    Object.entries(message.workspaceTags).forEach(([key, value]) => {
+      ParseComplete_WorkspaceTagsEntry.encode({ key: key as any, value }, writer.uint32(34).fork()).ldelim();
+    });
+    return writer;
+  },
+};
+
+export const ParseComplete_WorkspaceTagsEntry = {
+  encode(message: ParseComplete_WorkspaceTagsEntry, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== "") {
+      writer.uint32(18).string(message.value);
+    }
     return writer;
   },
 };
 
 export const PlanRequest = {
-  encode(
-    message: PlanRequest,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: PlanRequest, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.metadata !== undefined) {
       Metadata.encode(message.metadata, writer.uint32(10).fork()).ldelim();
     }
@@ -903,10 +940,7 @@ export const PlanRequest = {
 };
 
 export const PlanComplete = {
-  encode(
-    message: PlanComplete,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: PlanComplete, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.error !== "") {
       writer.uint32(10).string(message.error);
     }
@@ -917,20 +951,20 @@ export const PlanComplete = {
       RichParameter.encode(v!, writer.uint32(26).fork()).ldelim();
     }
     for (const v of message.externalAuthProviders) {
-      ExternalAuthProviderResource.encode(
-        v!,
-        writer.uint32(34).fork(),
-      ).ldelim();
+      ExternalAuthProviderResource.encode(v!, writer.uint32(34).fork()).ldelim();
+    }
+    for (const v of message.timings) {
+      Timing.encode(v!, writer.uint32(50).fork()).ldelim();
+    }
+    for (const v of message.modules) {
+      Module.encode(v!, writer.uint32(58).fork()).ldelim();
     }
     return writer;
   },
 };
 
 export const ApplyRequest = {
-  encode(
-    message: ApplyRequest,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: ApplyRequest, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.metadata !== undefined) {
       Metadata.encode(message.metadata, writer.uint32(10).fork()).ldelim();
     }
@@ -939,10 +973,7 @@ export const ApplyRequest = {
 };
 
 export const ApplyComplete = {
-  encode(
-    message: ApplyComplete,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: ApplyComplete, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.state.length !== 0) {
       writer.uint32(10).bytes(message.state);
     }
@@ -956,29 +987,50 @@ export const ApplyComplete = {
       RichParameter.encode(v!, writer.uint32(34).fork()).ldelim();
     }
     for (const v of message.externalAuthProviders) {
-      ExternalAuthProviderResource.encode(
-        v!,
-        writer.uint32(42).fork(),
-      ).ldelim();
+      ExternalAuthProviderResource.encode(v!, writer.uint32(42).fork()).ldelim();
+    }
+    for (const v of message.timings) {
+      Timing.encode(v!, writer.uint32(50).fork()).ldelim();
+    }
+    return writer;
+  },
+};
+
+export const Timing = {
+  encode(message: Timing, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
+    if (message.start !== undefined) {
+      Timestamp.encode(toTimestamp(message.start), writer.uint32(10).fork()).ldelim();
+    }
+    if (message.end !== undefined) {
+      Timestamp.encode(toTimestamp(message.end), writer.uint32(18).fork()).ldelim();
+    }
+    if (message.action !== "") {
+      writer.uint32(26).string(message.action);
+    }
+    if (message.source !== "") {
+      writer.uint32(34).string(message.source);
+    }
+    if (message.resource !== "") {
+      writer.uint32(42).string(message.resource);
+    }
+    if (message.stage !== "") {
+      writer.uint32(50).string(message.stage);
+    }
+    if (message.state !== 0) {
+      writer.uint32(56).int32(message.state);
     }
     return writer;
   },
 };
 
 export const CancelRequest = {
-  encode(
-    _: CancelRequest,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(_: CancelRequest, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     return writer;
   },
 };
 
 export const Request = {
-  encode(
-    message: Request,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: Request, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.config !== undefined) {
       Config.encode(message.config, writer.uint32(10).fork()).ldelim();
     }
@@ -999,10 +1051,7 @@ export const Request = {
 };
 
 export const Response = {
-  encode(
-    message: Response,
-    writer: _m0.Writer = _m0.Writer.create(),
-  ): _m0.Writer {
+  encode(message: Response, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.log !== undefined) {
       Log.encode(message.log, writer.uint32(10).fork()).ldelim();
     }
@@ -1033,4 +1082,10 @@ export interface Provisioner {
    * that was canceled.  If the provisioner has already completed the request, it may ignore the CancelRequest.
    */
   Session(request: Observable<Request>): Observable<Response>;
+}
+
+function toTimestamp(date: Date): Timestamp {
+  const seconds = date.getTime() / 1_000;
+  const nanos = (date.getTime() % 1_000) * 1_000_000;
+  return { seconds, nanos };
 }

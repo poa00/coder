@@ -16,20 +16,17 @@ WHERE
 		SELECT
 			id
 		FROM
-			provisioner_jobs AS nested
+			provisioner_jobs AS potential_job
 		WHERE
-			nested.started_at IS NULL
+			potential_job.started_at IS NULL
+			AND potential_job.organization_id = @organization_id
 			-- Ensure the caller has the correct provisioner.
-			AND nested.provisioner = ANY(@types :: provisioner_type [ ])
-			AND CASE
-				-- Special case for untagged provisioners: only match untagged jobs.
-				WHEN nested.tags :: jsonb = '{"scope": "organization", "owner": ""}' :: jsonb
-				THEN nested.tags :: jsonb = @tags :: jsonb
-				-- Ensure the caller satisfies all job tags.
-				ELSE nested.tags :: jsonb <@ @tags :: jsonb
-			END
+			AND potential_job.provisioner = ANY(@types :: provisioner_type [ ])
+			-- elsewhere, we use the tagset type, but here we use jsonb for backward compatibility
+			-- they are aliases and the code that calls this query already relies on a different type
+			AND provisioner_tagset_contains(@provisioner_tags :: jsonb, potential_job.tags :: jsonb)
 		ORDER BY
-			nested.created_at
+			potential_job.created_at
 		FOR UPDATE
 		SKIP LOCKED
 		LIMIT
@@ -53,23 +50,29 @@ WHERE
 	id = ANY(@ids :: uuid [ ]);
 
 -- name: GetProvisionerJobsByIDsWithQueuePosition :many
-WITH unstarted_jobs AS (
+WITH pending_jobs AS (
     SELECT
         id, created_at
     FROM
         provisioner_jobs
     WHERE
         started_at IS NULL
+    AND
+        canceled_at IS NULL
+    AND
+        completed_at IS NULL
+    AND
+        error IS NULL
 ),
 queue_position AS (
     SELECT
         id,
         ROW_NUMBER() OVER (ORDER BY created_at ASC) AS queue_position
     FROM
-        unstarted_jobs
+        pending_jobs
 ),
 queue_size AS (
-	SELECT COUNT(*) as count FROM unstarted_jobs
+	SELECT COUNT(*) AS count FROM pending_jobs
 )
 SELECT
 	sqlc.embed(pj),
@@ -83,6 +86,68 @@ LEFT JOIN
 	queue_size qs ON TRUE
 WHERE
 	pj.id = ANY(@ids :: uuid [ ]);
+
+-- name: GetProvisionerJobsByOrganizationAndStatusWithQueuePositionAndProvisioner :many
+WITH pending_jobs AS (
+    SELECT
+        id, created_at
+    FROM
+        provisioner_jobs
+    WHERE
+        started_at IS NULL
+    AND
+        canceled_at IS NULL
+    AND
+        completed_at IS NULL
+    AND
+        error IS NULL
+),
+queue_position AS (
+    SELECT
+        id,
+        ROW_NUMBER() OVER (ORDER BY created_at ASC) AS queue_position
+    FROM
+        pending_jobs
+),
+queue_size AS (
+	SELECT COUNT(*) AS count FROM pending_jobs
+)
+SELECT
+	sqlc.embed(pj),
+    COALESCE(qp.queue_position, 0) AS queue_position,
+    COALESCE(qs.count, 0) AS queue_size,
+	-- Use subquery to utilize ORDER BY in array_agg since it cannot be
+	-- combined with FILTER.
+	(
+		SELECT
+			-- Order for stable output.
+			array_agg(pd.id ORDER BY pd.created_at ASC)::uuid[]
+		FROM
+			provisioner_daemons pd
+		WHERE
+			-- See AcquireProvisionerJob.
+			pj.started_at IS NULL
+			AND pj.organization_id = pd.organization_id
+			AND pj.provisioner = ANY(pd.provisioners)
+			AND provisioner_tagset_contains(pd.tags, pj.tags)
+	) AS available_workers
+FROM
+	provisioner_jobs pj
+LEFT JOIN
+	queue_position qp ON qp.id = pj.id
+LEFT JOIN
+	queue_size qs ON TRUE
+WHERE
+	(sqlc.narg('organization_id')::uuid IS NULL OR pj.organization_id = @organization_id)
+	AND (COALESCE(array_length(@status::provisioner_job_status[], 1), 0) = 0 OR pj.job_status = ANY(@status::provisioner_job_status[]))
+GROUP BY
+	pj.id,
+	qp.queue_position,
+	qs.count
+ORDER BY
+	pj.created_at DESC
+LIMIT
+	sqlc.narg('limit')::int;
 
 -- name: GetProvisionerJobsCreatedAfter :many
 SELECT * FROM provisioner_jobs WHERE created_at > $1;
@@ -143,3 +208,20 @@ WHERE
 	updated_at < $1
 	AND started_at IS NOT NULL
 	AND completed_at IS NULL;
+
+-- name: InsertProvisionerJobTimings :many
+INSERT INTO provisioner_job_timings (job_id, started_at, ended_at, stage, source, action, resource)
+SELECT
+    @job_id::uuid AS provisioner_job_id,
+    unnest(@started_at::timestamptz[]),
+    unnest(@ended_at::timestamptz[]),
+    unnest(@stage::provisioner_job_timing_stage[]),
+    unnest(@source::text[]),
+    unnest(@action::text[]),
+    unnest(@resource::text[])
+RETURNING *;
+
+-- name: GetProvisionerJobTimingsByJobID :many
+SELECT * FROM provisioner_job_timings
+WHERE job_id = $1
+ORDER BY started_at ASC;

@@ -1,17 +1,15 @@
 package terraform
 
 import (
-	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform-config-inspect/tfconfig"
 	"github.com/mitchellh/go-wordwrap"
-	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/v2/coderd/tracing"
+	"github.com/coder/coder/v2/provisioner/terraform/tfparse"
 	"github.com/coder/coder/v2/provisionersdk"
 	"github.com/coder/coder/v2/provisionersdk/proto"
 )
@@ -23,61 +21,28 @@ func (s *server) Parse(sess *provisionersdk.Session, _ *proto.ParseRequest, _ <-
 	defer span.End()
 
 	// Load the module and print any parse errors.
-	module, diags := tfconfig.LoadModule(sess.WorkDirectory)
+	parser, diags := tfparse.New(sess.WorkDirectory, tfparse.WithLogger(s.logger.Named("tfparse")))
 	if diags.HasErrors() {
 		return provisionersdk.ParseErrorf("load module: %s", formatDiagnostics(sess.WorkDirectory, diags))
 	}
 
-	// Sort variables by (filename, line) to make the ordering consistent
-	variables := make([]*tfconfig.Variable, 0, len(module.Variables))
-	for _, v := range module.Variables {
-		variables = append(variables, v)
+	workspaceTags, _, err := parser.WorkspaceTags(ctx)
+	if err != nil {
+		return provisionersdk.ParseErrorf("can't load workspace tags: %v", err)
 	}
-	sort.Slice(variables, func(i, j int) bool {
-		return compareSourcePos(variables[i].Pos, variables[j].Pos)
-	})
 
-	var templateVariables []*proto.TemplateVariable
-
-	for _, v := range variables {
-		mv, err := convertTerraformVariable(v)
-		if err != nil {
-			return provisionersdk.ParseErrorf("can't convert the Terraform variable to a managed one: %s", err)
-		}
-		templateVariables = append(templateVariables, mv)
+	templateVariables, err := parser.TemplateVariables()
+	if err != nil {
+		return provisionersdk.ParseErrorf("can't load template variables: %v", err)
 	}
+
 	return &proto.ParseComplete{
 		TemplateVariables: templateVariables,
+		WorkspaceTags:     workspaceTags,
 	}
 }
 
-// Converts a Terraform variable to a template-wide variable, processed by Coder.
-func convertTerraformVariable(variable *tfconfig.Variable) (*proto.TemplateVariable, error) {
-	var defaultData string
-	if variable.Default != nil {
-		var valid bool
-		defaultData, valid = variable.Default.(string)
-		if !valid {
-			defaultDataRaw, err := json.Marshal(variable.Default)
-			if err != nil {
-				return nil, xerrors.Errorf("parse variable %q default: %w", variable.Name, err)
-			}
-			defaultData = string(defaultDataRaw)
-		}
-	}
-
-	return &proto.TemplateVariable{
-		Name:         variable.Name,
-		Description:  variable.Description,
-		Type:         variable.Type,
-		DefaultValue: defaultData,
-		// variable.Required is always false. Empty string is a valid default value, so it doesn't enforce required to be "true".
-		Required:  variable.Default == nil,
-		Sensitive: variable.Sensitive,
-	}, nil
-}
-
-// formatDiagnostics returns a nicely formatted string containing all of the
+// FormatDiagnostics returns a nicely formatted string containing all of the
 // error details within the tfconfig.Diagnostics. We need to use this because
 // the default format doesn't provide much useful information.
 func formatDiagnostics(baseDir string, diags tfconfig.Diagnostics) string {
@@ -119,11 +84,4 @@ func formatDiagnostics(baseDir string, diags tfconfig.Diagnostics) string {
 	}
 
 	return spacer + strings.TrimSpace(msgs.String())
-}
-
-func compareSourcePos(x, y tfconfig.SourcePos) bool {
-	if x.Filename != y.Filename {
-		return x.Filename < y.Filename
-	}
-	return x.Line < y.Line
 }

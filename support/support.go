@@ -10,17 +10,19 @@ import (
 	"net/http/httptest"
 	"strings"
 
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 	"tailscale.com/ipn/ipnstate"
-
-	"github.com/google/uuid"
+	"tailscale.com/net/netcheck"
 
 	"cdr.dev/slog"
 	"cdr.dev/slog/sloggers/sloghuman"
-	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/healthcheck/derphealth"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/agentsdk"
+	"github.com/coder/coder/v2/codersdk/healthsdk"
+	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/coder/v2/tailnet"
 )
 
@@ -33,19 +35,28 @@ type Bundle struct {
 	Workspace  Workspace  `json:"workspace"`
 	Agent      Agent      `json:"agent"`
 	Logs       []string   `json:"logs"`
+	CLILogs    []byte     `json:"cli_logs"`
 }
 
 type Deployment struct {
-	BuildInfo    *codersdk.BuildInfoResponse `json:"build"`
-	Config       *codersdk.DeploymentConfig  `json:"config"`
-	Experiments  codersdk.Experiments        `json:"experiments"`
-	HealthReport *codersdk.HealthcheckReport `json:"health_report"`
+	BuildInfo    *codersdk.BuildInfoResponse  `json:"build"`
+	Config       *codersdk.DeploymentConfig   `json:"config"`
+	Experiments  codersdk.Experiments         `json:"experiments"`
+	HealthReport *healthsdk.HealthcheckReport `json:"health_report"`
 }
 
 type Network struct {
-	CoordinatorDebug string                                 `json:"coordinator_debug"`
-	TailnetDebug     string                                 `json:"tailnet_debug"`
-	Netcheck         *codersdk.WorkspaceAgentConnectionInfo `json:"netcheck"`
+	ConnectionInfo   workspacesdk.AgentConnectionInfo
+	CoordinatorDebug string                     `json:"coordinator_debug"`
+	Netcheck         *derphealth.Report         `json:"netcheck"`
+	TailnetDebug     string                     `json:"tailnet_debug"`
+	Interfaces       healthsdk.InterfacesReport `json:"interfaces"`
+}
+
+type Netcheck struct {
+	Report *netcheck.Report `json:"report"`
+	Error  string           `json:"error"`
+	Logs   []string         `json:"logs"`
 }
 
 type Workspace struct {
@@ -59,6 +70,7 @@ type Workspace struct {
 
 type Agent struct {
 	Agent               *codersdk.WorkspaceAgent                       `json:"agent"`
+	ConnectionInfo      *workspacesdk.AgentConnectionInfo              `json:"connection_info"`
 	ListeningPorts      *codersdk.WorkspaceAgentListeningPortsResponse `json:"listening_ports"`
 	Logs                []byte                                         `json:"logs"`
 	ClientMagicsockHTML []byte                                         `json:"client_magicsock_html"`
@@ -109,7 +121,7 @@ func DeploymentInfo(ctx context.Context, client *codersdk.Client, log slog.Logge
 	})
 
 	eg.Go(func() error {
-		hr, err := client.DebugHealth(ctx)
+		hr, err := healthsdk.New(client).DebugHealth(ctx)
 		if err != nil {
 			return xerrors.Errorf("fetch health report: %w", err)
 		}
@@ -133,7 +145,7 @@ func DeploymentInfo(ctx context.Context, client *codersdk.Client, log slog.Logge
 	return d
 }
 
-func NetworkInfo(ctx context.Context, client *codersdk.Client, log slog.Logger, agentID uuid.UUID) Network {
+func NetworkInfo(ctx context.Context, client *codersdk.Client, log slog.Logger) Network {
 	var (
 		n  Network
 		eg errgroup.Group
@@ -168,15 +180,27 @@ func NetworkInfo(ctx context.Context, client *codersdk.Client, log slog.Logger, 
 	})
 
 	eg.Go(func() error {
-		if agentID == uuid.Nil {
-			log.Warn(ctx, "agent id required for agent connection info")
+		// Need connection info to get DERP map for netcheck
+		connInfo, err := workspacesdk.New(client).AgentConnectionInfoGeneric(ctx)
+		if err != nil {
+			log.Warn(ctx, "unable to fetch generic agent connection info")
 			return nil
 		}
-		connInfo, err := client.WorkspaceAgentConnectionInfo(ctx, agentID)
+		n.ConnectionInfo = connInfo
+		var rpt derphealth.Report
+		rpt.Run(ctx, &derphealth.ReportOptions{
+			DERPMap: connInfo.DERPMap,
+		})
+		n.Netcheck = &rpt
+		return nil
+	})
+
+	eg.Go(func() error {
+		rpt, err := healthsdk.RunInterfacesReport()
 		if err != nil {
-			return xerrors.Errorf("fetch agent conn info: %w", err)
+			return xerrors.Errorf("run interfaces report: %w", err)
 		}
-		n.Netcheck = &connInfo
+		n.Interfaces = rpt
 		return nil
 	})
 
@@ -330,10 +354,11 @@ func AgentInfo(ctx context.Context, client *codersdk.Client, log slog.Logger, ag
 }
 
 func connectedAgentInfo(ctx context.Context, client *codersdk.Client, log slog.Logger, agentID uuid.UUID, eg *errgroup.Group, a *Agent) (closer func()) {
-	conn, err := client.DialWorkspaceAgent(ctx, agentID, &codersdk.DialWorkspaceAgentOptions{
-		Logger:         log.Named("dial-agent"),
-		BlockEndpoints: false,
-	})
+	conn, err := workspacesdk.New(client).
+		DialAgent(ctx, agentID, &workspacesdk.DialAgentOptions{
+			Logger:         log.Named("dial-agent"),
+			BlockEndpoints: false,
+		})
 
 	closer = func() {}
 
@@ -406,6 +431,7 @@ func connectedAgentInfo(ctx context.Context, client *codersdk.Client, log slog.L
 		if err := json.NewDecoder(bytes.NewReader(manifestRes)).Decode(&a.Manifest); err != nil {
 			return xerrors.Errorf("decode agent manifest: %w", err)
 		}
+		sanitizeEnv(a.Manifest.EnvironmentVariables)
 
 		return nil
 	})
@@ -441,9 +467,9 @@ func Run(ctx context.Context, d *Deps) (*Bundle, error) {
 	authChecks := map[string]codersdk.AuthorizationCheck{
 		"Read DeploymentValues": {
 			Object: codersdk.AuthorizationObject{
-				ResourceType: codersdk.ResourceDeploymentValues,
+				ResourceType: codersdk.ResourceDeploymentConfig,
 			},
-			Action: string(rbac.ActionRead),
+			Action: codersdk.ActionRead,
 		},
 	}
 
@@ -477,7 +503,7 @@ func Run(ctx context.Context, d *Deps) (*Bundle, error) {
 		return nil
 	})
 	eg.Go(func() error {
-		ni := NetworkInfo(ctx, d.Client, d.Log, d.AgentID)
+		ni := NetworkInfo(ctx, d.Client, d.Log)
 		b.Network = ni
 		return nil
 	})

@@ -35,8 +35,9 @@ const vscodeDesktopName = "VS Code Desktop"
 
 func (r *RootCmd) openVSCode() *serpent.Command {
 	var (
-		generateToken bool
-		testOpenError bool
+		generateToken    bool
+		testOpenError    bool
+		appearanceConfig codersdk.AppearanceConfig
 	)
 
 	client := new(codersdk.Client)
@@ -47,6 +48,7 @@ func (r *RootCmd) openVSCode() *serpent.Command {
 		Middleware: serpent.Chain(
 			serpent.RequireRangeArgs(1, 2),
 			r.InitClient(client),
+			initAppearance(client, &appearanceConfig),
 		),
 		Handler: func(inv *serpent.Invocation) error {
 			ctx, cancel := context.WithCancel(inv.Context())
@@ -64,7 +66,7 @@ func (r *RootCmd) openVSCode() *serpent.Command {
 			// need to wait for the agent to start.
 			workspaceQuery := inv.Args[0]
 			autostart := true
-			workspace, workspaceAgent, err := getWorkspaceAndAgent(ctx, inv, client, autostart, codersdk.Me, workspaceQuery)
+			workspace, workspaceAgent, err := getWorkspaceAndAgent(ctx, inv, client, autostart, workspaceQuery)
 			if err != nil {
 				return xerrors.Errorf("get workspace and agent: %w", err)
 			}
@@ -79,6 +81,7 @@ func (r *RootCmd) openVSCode() *serpent.Command {
 					Fetch:     client.WorkspaceAgent,
 					FetchLogs: nil,
 					Wait:      false,
+					DocsURL:   appearanceConfig.DocsURL,
 				})
 				if err != nil {
 					if xerrors.Is(err, context.Canceled) {

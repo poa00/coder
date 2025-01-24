@@ -1,107 +1,93 @@
 import type { Meta, StoryObj } from "@storybook/react";
-import { DashboardContext } from "modules/dashboard/DashboardProvider";
 import {
-  MockCanceledWorkspace,
-  MockCancelingWorkspace,
-  MockDeletedWorkspace,
-  MockDeletingWorkspace,
-  MockFailedWorkspace,
-  MockPendingWorkspace,
-  MockStartingWorkspace,
-  MockStoppedWorkspace,
-  MockStoppingWorkspace,
-  MockWorkspace,
-  MockBuildInfo,
-  MockEntitlementsWithScheduling,
-  MockExperiments,
-  MockAppearanceConfig,
+	MockBuildInfo,
+	MockCanceledWorkspace,
+	MockCancelingWorkspace,
+	MockDeletedWorkspace,
+	MockDeletingWorkspace,
+	MockFailedWorkspace,
+	MockPendingWorkspace,
+	MockStartingWorkspace,
+	MockStoppedWorkspace,
+	MockStoppingWorkspace,
+	MockWorkspace,
 } from "testHelpers/entities";
+import { withDashboardProvider } from "testHelpers/storybook";
 import { WorkspaceStatusBadge } from "./WorkspaceStatusBadge";
 
-const MockedAppearance = {
-  config: MockAppearanceConfig,
-  isPreview: false,
-  setPreview: () => {},
-};
-
 const meta: Meta<typeof WorkspaceStatusBadge> = {
-  title: "modules/workspaces/WorkspaceStatusBadge",
-  component: WorkspaceStatusBadge,
-  decorators: [
-    (Story) => (
-      <DashboardContext.Provider
-        value={{
-          buildInfo: MockBuildInfo,
-          entitlements: MockEntitlementsWithScheduling,
-          experiments: MockExperiments,
-          appearance: MockedAppearance,
-        }}
-      >
-        <Story />
-      </DashboardContext.Provider>
-    ),
-  ],
+	title: "modules/workspaces/WorkspaceStatusBadge",
+	component: WorkspaceStatusBadge,
+	parameters: {
+		queries: [
+			{
+				key: ["buildInfo"],
+				data: MockBuildInfo,
+			},
+		],
+	},
+	decorators: [withDashboardProvider],
 };
 
 export default meta;
 type Story = StoryObj<typeof WorkspaceStatusBadge>;
 
 export const Running: Story = {
-  args: {
-    workspace: MockWorkspace,
-  },
+	args: {
+		workspace: MockWorkspace,
+	},
 };
 
 export const Starting: Story = {
-  args: {
-    workspace: MockStartingWorkspace,
-  },
+	args: {
+		workspace: MockStartingWorkspace,
+	},
 };
 
 export const Stopped: Story = {
-  args: {
-    workspace: MockStoppedWorkspace,
-  },
+	args: {
+		workspace: MockStoppedWorkspace,
+	},
 };
 
 export const Stopping: Story = {
-  args: {
-    workspace: MockStoppingWorkspace,
-  },
+	args: {
+		workspace: MockStoppingWorkspace,
+	},
 };
 
 export const Deleting: Story = {
-  args: {
-    workspace: MockDeletingWorkspace,
-  },
+	args: {
+		workspace: MockDeletingWorkspace,
+	},
 };
 
 export const Deleted: Story = {
-  args: {
-    workspace: MockDeletedWorkspace,
-  },
+	args: {
+		workspace: MockDeletedWorkspace,
+	},
 };
 
 export const Canceling: Story = {
-  args: {
-    workspace: MockCancelingWorkspace,
-  },
+	args: {
+		workspace: MockCancelingWorkspace,
+	},
 };
 
 export const Canceled: Story = {
-  args: {
-    workspace: MockCanceledWorkspace,
-  },
+	args: {
+		workspace: MockCanceledWorkspace,
+	},
 };
 
 export const Failed: Story = {
-  args: {
-    workspace: MockFailedWorkspace,
-  },
+	args: {
+		workspace: MockFailedWorkspace,
+	},
 };
 
 export const Pending: Story = {
-  args: {
-    workspace: MockPendingWorkspace,
-  },
+	args: {
+		workspace: MockPendingWorkspace,
+	},
 };

@@ -36,12 +36,13 @@ func (r *RootCmd) createUserStatusCommand(sdkStatus codersdk.UserStatus) *serpen
 	client := new(codersdk.Client)
 
 	var columns []string
+	allColumns := []string{"username", "email", "created at", "status"}
 	cmd := &serpent.Command{
 		Use:     fmt.Sprintf("%s <username|user_id>", verb),
 		Short:   short,
 		Aliases: aliases,
-		Long: formatExamples(
-			example{
+		Long: FormatExamples(
+			Example{
 				Command: fmt.Sprintf("coder users %s example_user", verb),
 			},
 		),
@@ -99,8 +100,8 @@ func (r *RootCmd) createUserStatusCommand(sdkStatus codersdk.UserStatus) *serpen
 			Flag:          "column",
 			FlagShorthand: "c",
 			Description:   "Specify a column to filter in the table.",
-			Default:       strings.Join([]string{"username", "email", "created_at", "status"}, ","),
-			Value:         serpent.StringArrayOf(&columns),
+			Default:       strings.Join(allColumns, ","),
+			Value:         serpent.EnumArrayOf(&columns, allColumns...),
 		},
 	}
 	return cmd

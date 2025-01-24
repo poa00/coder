@@ -19,6 +19,7 @@ import (
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
+
 	"github.com/coder/coder/v2/coderd/tracing"
 	"github.com/coder/coder/v2/coderd/util/ptr"
 	"github.com/coder/coder/v2/provisionerd/proto"
@@ -85,7 +86,8 @@ type Metrics struct {
 	// JobTimings also counts the total amount of jobs.
 	JobTimings *prometheus.HistogramVec
 	// WorkspaceBuilds counts workspace build successes and failures.
-	WorkspaceBuilds *prometheus.CounterVec
+	WorkspaceBuilds       *prometheus.CounterVec
+	WorkspaceBuildTimings *prometheus.HistogramVec
 }
 
 type JobUpdater interface {
@@ -188,6 +190,12 @@ func (r *Runner) Run() {
 				build.Metadata.WorkspaceTransition.String(),
 				status,
 			).Inc()
+			r.metrics.WorkspaceBuildTimings.WithLabelValues(
+				build.Metadata.TemplateName,
+				build.Metadata.TemplateVersion,
+				build.Metadata.WorkspaceTransition.String(),
+				status,
+			).Observe(time.Since(start).Seconds())
 		}
 		r.metrics.JobTimings.WithLabelValues(r.job.Provisioner, status).Observe(time.Since(start).Seconds())
 	}()
@@ -221,7 +229,7 @@ func (r *Runner) Run() {
 		err := r.sender.CompleteJob(ctx, r.completedJob)
 		if err != nil {
 			r.logger.Error(ctx, "sending CompletedJob failed", slog.Error(err))
-			err = r.sender.FailJob(ctx, r.failedJobf("internal provisionerserver error"))
+			err = r.sender.FailJob(ctx, r.failedJobf("internal provisionerserver error: %s", err))
 			if err != nil {
 				r.logger.Error(ctx, "sending FailJob failed (while CompletedJob)", slog.Error(err))
 			}
@@ -517,7 +525,7 @@ func (r *Runner) runTemplateImport(ctx context.Context) (*proto.CompletedJob, *p
 		Stage:     "Parsing template parameters",
 		CreatedAt: time.Now().UnixMilli(),
 	})
-	templateVariables, readme, err := r.runTemplateImportParse(ctx)
+	workspaceTags, templateVariables, readme, err := r.runTemplateImportParse(ctx) // TODO workspace_tags
 	if err != nil {
 		return nil, r.failedJobf("run parse: %s", err)
 	}
@@ -529,6 +537,7 @@ func (r *Runner) runTemplateImport(ctx context.Context) (*proto.CompletedJob, *p
 		TemplateVariables:  templateVariables,
 		UserVariableValues: r.job.GetTemplateImport().GetUserVariableValues(),
 		Readme:             readme,
+		WorkspaceTags:      workspaceTags,
 	})
 	if err != nil {
 		return nil, r.failedJobf("update job: %s", err)
@@ -579,6 +588,8 @@ func (r *Runner) runTemplateImport(ctx context.Context) (*proto.CompletedJob, *p
 				RichParameters:             startProvision.Parameters,
 				ExternalAuthProvidersNames: externalAuthProviderNames,
 				ExternalAuthProviders:      startProvision.ExternalAuthProviders,
+				StartModules:               startProvision.Modules,
+				StopModules:                stopProvision.Modules,
 			},
 		},
 	}, nil
@@ -586,23 +597,23 @@ func (r *Runner) runTemplateImport(ctx context.Context) (*proto.CompletedJob, *p
 
 // Parses template variables and README from source.
 func (r *Runner) runTemplateImportParse(ctx context.Context) (
-	vars []*sdkproto.TemplateVariable, readme []byte, err error,
+	workspaceTags map[string]string, vars []*sdkproto.TemplateVariable, readme []byte, err error,
 ) {
 	ctx, span := r.startTrace(ctx, tracing.FuncName())
 	defer span.End()
 
 	err = r.session.Send(&sdkproto.Request{Type: &sdkproto.Request_Parse{Parse: &sdkproto.ParseRequest{}}})
 	if err != nil {
-		return nil, nil, xerrors.Errorf("parse source: %w", err)
+		return nil, nil, nil, xerrors.Errorf("parse source: %w", err)
 	}
 	for {
 		msg, err := r.session.Recv()
 		if err != nil {
-			return nil, nil, xerrors.Errorf("recv parse source: %w", err)
+			return nil, nil, nil, xerrors.Errorf("recv parse source: %w", err)
 		}
 		switch msgType := msg.Type.(type) {
 		case *sdkproto.Response_Log:
-			r.logger.Debug(context.Background(), "parse job logged",
+			r.logProvisionerJobLog(context.Background(), msgType.Log.Level, "parse job logged",
 				slog.F("level", msgType.Log.Level),
 				slog.F("output", msgType.Log.Output),
 			)
@@ -617,17 +628,18 @@ func (r *Runner) runTemplateImportParse(ctx context.Context) (
 		case *sdkproto.Response_Parse:
 			pc := msgType.Parse
 			r.logger.Debug(context.Background(), "parse complete",
+				slog.F("workspace_tags", pc.WorkspaceTags),
 				slog.F("template_variables", pc.TemplateVariables),
 				slog.F("readme_len", len(pc.Readme)),
 				slog.F("error", pc.Error),
 			)
 			if pc.Error != "" {
-				return nil, nil, xerrors.Errorf("parse error: %s", pc.Error)
+				return nil, nil, nil, xerrors.Errorf("parse error: %s", pc.Error)
 			}
 
-			return msgType.Parse.TemplateVariables, msgType.Parse.Readme, nil
+			return msgType.Parse.WorkspaceTags, msgType.Parse.TemplateVariables, msgType.Parse.Readme, nil
 		default:
-			return nil, nil, xerrors.Errorf("invalid message type %q received from provisioner",
+			return nil, nil, nil, xerrors.Errorf("invalid message type %q received from provisioner",
 				reflect.TypeOf(msg.Type).String())
 		}
 	}
@@ -637,6 +649,7 @@ type templateImportProvision struct {
 	Resources             []*sdkproto.Resource
 	Parameters            []*sdkproto.RichParameter
 	ExternalAuthProviders []*sdkproto.ExternalAuthProviderResource
+	Modules               []*sdkproto.Module
 }
 
 // Performs a dry-run provision when importing a template.
@@ -698,7 +711,7 @@ func (r *Runner) runTemplateImportProvisionWithRichParameters(
 		}
 		switch msgType := msg.Type.(type) {
 		case *sdkproto.Response_Log:
-			r.logger.Debug(context.Background(), "template import provision job logged",
+			r.logProvisionerJobLog(context.Background(), msgType.Log.Level, "template import provision job logged",
 				slog.F("level", msgType.Log.Level),
 				slog.F("output", msgType.Log.Output),
 			)
@@ -721,13 +734,14 @@ func (r *Runner) runTemplateImportProvisionWithRichParameters(
 
 			r.logger.Info(context.Background(), "parse dry-run provision successful",
 				slog.F("resource_count", len(c.Resources)),
-				slog.F("resources", c.Resources),
+				slog.F("resources", resourceNames(c.Resources)),
 			)
 
 			return &templateImportProvision{
 				Resources:             c.Resources,
 				Parameters:            c.Parameters,
 				ExternalAuthProviders: c.ExternalAuthProviders,
+				Modules:               c.Modules,
 			}, nil
 		default:
 			return nil, xerrors.Errorf("invalid message type %q received from provisioner",
@@ -790,6 +804,7 @@ func (r *Runner) runTemplateDryRun(ctx context.Context) (*proto.CompletedJob, *p
 		Type: &proto.CompletedJob_TemplateDryRun_{
 			TemplateDryRun: &proto.CompletedJob_TemplateDryRun{
 				Resources: provision.Resources,
+				Modules:   provision.Modules,
 			},
 		},
 	}, nil
@@ -851,7 +866,7 @@ func (r *Runner) buildWorkspace(ctx context.Context, stage string, req *sdkproto
 func (r *Runner) commitQuota(ctx context.Context, resources []*sdkproto.Resource) *proto.FailedJob {
 	cost := sumDailyCost(resources)
 	r.logger.Debug(ctx, "committing quota",
-		slog.F("resources", resources),
+		slog.F("resources", resourceNames(resources)),
 		slog.F("cost", cost),
 	)
 	if cost == 0 {
@@ -962,7 +977,7 @@ func (r *Runner) runWorkspaceBuild(ctx context.Context) (*proto.CompletedJob, *p
 
 	r.logger.Info(context.Background(), "plan request successful",
 		slog.F("resource_count", len(planComplete.Resources)),
-		slog.F("resources", planComplete.Resources),
+		slog.F("resources", resourceNames(planComplete.Resources)),
 	)
 	r.flushQueuedLogs(ctx)
 	if commitQuota {
@@ -994,6 +1009,10 @@ func (r *Runner) runWorkspaceBuild(ctx context.Context) (*proto.CompletedJob, *p
 	if applyComplete == nil {
 		return nil, r.failedWorkspaceBuildf("invalid message type %T received from provisioner", resp.Type)
 	}
+
+	// Prepend the plan timings (since they occurred first).
+	applyComplete.Timings = append(planComplete.Timings, applyComplete.Timings...)
+
 	if applyComplete.Error != "" {
 		r.logger.Warn(context.Background(), "apply failed; updating state",
 			slog.F("error", applyComplete.Error),
@@ -1005,7 +1024,8 @@ func (r *Runner) runWorkspaceBuild(ctx context.Context) (*proto.CompletedJob, *p
 			Error: applyComplete.Error,
 			Type: &proto.FailedJob_WorkspaceBuild_{
 				WorkspaceBuild: &proto.FailedJob_WorkspaceBuild{
-					State: applyComplete.State,
+					State:   applyComplete.State,
+					Timings: applyComplete.Timings,
 				},
 			},
 		}
@@ -1013,7 +1033,7 @@ func (r *Runner) runWorkspaceBuild(ctx context.Context) (*proto.CompletedJob, *p
 
 	r.logger.Info(context.Background(), "apply successful",
 		slog.F("resource_count", len(applyComplete.Resources)),
-		slog.F("resources", applyComplete.Resources),
+		slog.F("resources", resourceNames(applyComplete.Resources)),
 		slog.F("state_len", len(applyComplete.State)),
 	)
 	r.flushQueuedLogs(ctx)
@@ -1024,9 +1044,27 @@ func (r *Runner) runWorkspaceBuild(ctx context.Context) (*proto.CompletedJob, *p
 			WorkspaceBuild: &proto.CompletedJob_WorkspaceBuild{
 				State:     applyComplete.State,
 				Resources: applyComplete.Resources,
+				Timings:   applyComplete.Timings,
+				// Modules are created on disk by `terraform init`, and that is only
+				// called by `plan`. `apply` does not modify them, so we can use the
+				// modules from the plan response.
+				Modules: planComplete.Modules,
 			},
 		},
 	}, nil
+}
+
+func resourceNames(rs []*sdkproto.Resource) []string {
+	var sb strings.Builder
+	names := make([]string, 0, len(rs))
+	for _, r := range rs {
+		_, _ = sb.WriteString(r.Type)
+		_, _ = sb.WriteString(".")
+		_, _ = sb.WriteString(r.Name)
+		names = append(names, sb.String())
+		sb.Reset()
+	}
+	return names
 }
 
 func (r *Runner) failedWorkspaceBuildf(format string, args ...interface{}) *proto.FailedJob {

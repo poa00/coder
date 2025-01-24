@@ -17,8 +17,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent"
 	agentproto "github.com/coder/coder/v2/agent/proto"
 	"github.com/coder/coder/v2/coderd/coderdtest"
@@ -116,6 +114,7 @@ type Details struct {
 		Authenticated App
 		Public        App
 		Port          App
+		PortHTTPS     App
 	}
 }
 
@@ -246,6 +245,12 @@ func setupProxyTestWithFactory(t *testing.T, factory DeploymentFactory, opts *De
 		WorkspaceName: workspace.Name,
 		AgentName:     agnt.Name,
 		AppSlugOrPort: strconv.Itoa(int(opts.port)),
+	}
+	details.Apps.PortHTTPS = App{
+		Username:      me.Username,
+		WorkspaceName: workspace.Name,
+		AgentName:     agnt.Name,
+		AppSlugOrPort: strconv.Itoa(int(opts.port)) + "s",
 	}
 
 	return details
@@ -381,7 +386,7 @@ func createWorkspaceWithApps(t *testing.T, client *codersdk.Client, orgID uuid.U
 	})
 	template := coderdtest.CreateTemplate(t, client, orgID, version.ID)
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, orgID, template.ID, workspaceMutators...)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID, workspaceMutators...)
 	workspaceBuild := coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 	// Verify app subdomains
@@ -434,7 +439,7 @@ func createWorkspaceWithApps(t *testing.T, client *codersdk.Client, orgID uuid.U
 	}
 	agentCloser := agent.New(agent.Options{
 		Client: agentClient,
-		Logger: slogtest.Make(t, nil).Named("agent").Leveled(slog.LevelDebug),
+		Logger: testutil.Logger(t).Named("agent"),
 	})
 	t.Cleanup(func() {
 		_ = agentCloser.Close()

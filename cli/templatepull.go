@@ -7,11 +7,11 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/codeclysm/extract/v3"
 	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/v2/cli/cliui"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/provisionersdk"
 	"github.com/coder/serpent"
 )
 
@@ -20,6 +20,7 @@ func (r *RootCmd) templatePull() *serpent.Command {
 		tarMode     bool
 		zipMode     bool
 		versionName string
+		orgContext  = NewOrganizationContext()
 	)
 
 	client := new(codersdk.Client)
@@ -45,7 +46,7 @@ func (r *RootCmd) templatePull() *serpent.Command {
 				return xerrors.Errorf("either tar or zip can be selected")
 			}
 
-			organization, err := CurrentOrganization(r, inv, client)
+			organization, err := orgContext.Selected(inv, client)
 			if err != nil {
 				return xerrors.Errorf("get current organization: %w", err)
 			}
@@ -161,7 +162,7 @@ func (r *RootCmd) templatePull() *serpent.Command {
 			}
 
 			_, _ = fmt.Fprintf(inv.Stderr, "Extracting template to %q\n", dest)
-			err = extract.Tar(ctx, bytes.NewReader(raw), dest, nil)
+			err = provisionersdk.Untar(dest, bytes.NewReader(raw))
 			return err
 		},
 	}
@@ -187,6 +188,7 @@ func (r *RootCmd) templatePull() *serpent.Command {
 		},
 		cliui.SkipPromptOption(),
 	}
+	orgContext.AttachOptions(cmd)
 
 	return cmd
 }

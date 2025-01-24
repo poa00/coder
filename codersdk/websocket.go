@@ -4,7 +4,7 @@ import (
 	"context"
 	"net"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // wsNetConn wraps net.Conn created by websocket.NetConn(). Cancel func
@@ -32,7 +32,7 @@ func (c *wsNetConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *wsNetConn) Close() error {
-	defer c.cancel()
+	c.cancel()
 	return c.Conn.Close()
 }
 

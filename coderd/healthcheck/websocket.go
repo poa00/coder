@@ -10,13 +10,13 @@ import (
 	"time"
 
 	"golang.org/x/xerrors"
-	"nhooyr.io/websocket"
 
 	"github.com/coder/coder/v2/coderd/healthcheck/health"
-	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/codersdk/healthsdk"
+	"github.com/coder/websocket"
 )
 
-type WebsocketReport codersdk.WebsocketReport
+type WebsocketReport healthsdk.WebsocketReport
 
 type WebsocketReportOptions struct {
 	APIKey     string
@@ -31,7 +31,7 @@ func (r *WebsocketReport) Run(ctx context.Context, opts *WebsocketReportOptions)
 	defer cancel()
 
 	r.Severity = health.SeverityOK
-	r.Warnings = []string{}
+	r.Warnings = []health.Message{}
 	r.Dismissed = opts.Dismissed
 
 	u, err := opts.AccessURL.Parse("/api/v2/debug/ws")

@@ -133,6 +133,70 @@ func TestCreate(t *testing.T) {
 		}
 	})
 
+	t.Run("CreateWithSpecificTemplateVersion", func(t *testing.T) {
+		t.Parallel()
+		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
+		owner := coderdtest.CreateFirstUser(t, client)
+		member, _ := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
+		version := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, completeWithAgent())
+		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
+
+		// Create a new version
+		version2 := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, completeWithAgent(), func(ctvr *codersdk.CreateTemplateVersionRequest) {
+			ctvr.TemplateID = template.ID
+		})
+		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version2.ID)
+
+		args := []string{
+			"create",
+			"my-workspace",
+			"--template", template.Name,
+			"--template-version", version2.Name,
+			"--start-at", "9:30AM Mon-Fri US/Central",
+			"--stop-after", "8h",
+			"--automatic-updates", "always",
+		}
+		inv, root := clitest.New(t, args...)
+		clitest.SetupConfig(t, member, root)
+		doneChan := make(chan struct{})
+		pty := ptytest.New(t).Attach(inv)
+		go func() {
+			defer close(doneChan)
+			err := inv.Run()
+			assert.NoError(t, err)
+		}()
+		matches := []struct {
+			match string
+			write string
+		}{
+			{match: "compute.main"},
+			{match: "smith (linux, i386)"},
+			{match: "Confirm create", write: "yes"},
+		}
+		for _, m := range matches {
+			pty.ExpectMatch(m.match)
+			if len(m.write) > 0 {
+				pty.WriteLine(m.write)
+			}
+		}
+		<-doneChan
+
+		ws, err := member.WorkspaceByOwnerAndName(context.Background(), codersdk.Me, "my-workspace", codersdk.WorkspaceOptions{})
+		if assert.NoError(t, err, "expected workspace to be created") {
+			assert.Equal(t, ws.TemplateName, template.Name)
+			// Check if the workspace is using the new template version
+			assert.Equal(t, ws.LatestBuild.TemplateVersionID, version2.ID, "expected workspace to use the specified template version")
+			if assert.NotNil(t, ws.AutostartSchedule) {
+				assert.Equal(t, *ws.AutostartSchedule, "CRON_TZ=US/Central 30 9 * * Mon-Fri")
+			}
+			if assert.NotNil(t, ws.TTLMillis) {
+				assert.Equal(t, *ws.TTLMillis, 8*time.Hour.Milliseconds())
+			}
+			assert.Equal(t, codersdk.AutomaticUpdatesAlways, ws.AutomaticUpdates)
+		}
+	})
+
 	t.Run("InheritStopAfterFromTemplate", func(t *testing.T) {
 		t.Parallel()
 		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
@@ -313,6 +377,68 @@ func TestCreateWithRichParameters(t *testing.T) {
 			}
 		}
 		<-doneChan
+	})
+
+	t.Run("ParametersDefaults", func(t *testing.T) {
+		t.Parallel()
+
+		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
+		owner := coderdtest.CreateFirstUser(t, client)
+		member, _ := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
+		version := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, echoResponses)
+		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+
+		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
+
+		inv, root := clitest.New(t, "create", "my-workspace", "--template", template.Name,
+			"--parameter-default", fmt.Sprintf("%s=%s", firstParameterName, firstParameterValue),
+			"--parameter-default", fmt.Sprintf("%s=%s", secondParameterName, secondParameterValue),
+			"--parameter-default", fmt.Sprintf("%s=%s", immutableParameterName, immutableParameterValue))
+		clitest.SetupConfig(t, member, root)
+		doneChan := make(chan struct{})
+		pty := ptytest.New(t).Attach(inv)
+		go func() {
+			defer close(doneChan)
+			err := inv.Run()
+			assert.NoError(t, err)
+		}()
+
+		matches := []string{
+			firstParameterDescription, firstParameterValue,
+			secondParameterDescription, secondParameterValue,
+			immutableParameterDescription, immutableParameterValue,
+		}
+		for i := 0; i < len(matches); i += 2 {
+			match := matches[i]
+			defaultValue := matches[i+1]
+
+			pty.ExpectMatch(match)
+			pty.ExpectMatch(`Enter a value (default: "` + defaultValue + `")`)
+			pty.WriteLine("")
+		}
+		pty.ExpectMatch("Confirm create?")
+		pty.WriteLine("yes")
+		<-doneChan
+
+		// Verify that the expected default values were used.
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
+		defer cancel()
+
+		workspaces, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
+			Name: "my-workspace",
+		})
+		require.NoError(t, err, "can't list available workspaces")
+		require.Len(t, workspaces.Workspaces, 1)
+
+		workspaceLatestBuild := workspaces.Workspaces[0].LatestBuild
+		require.Equal(t, version.ID, workspaceLatestBuild.TemplateVersionID)
+
+		buildParameters, err := client.WorkspaceBuildParameters(ctx, workspaceLatestBuild.ID)
+		require.NoError(t, err)
+		require.Len(t, buildParameters, 3)
+		require.Contains(t, buildParameters, codersdk.WorkspaceBuildParameter{Name: firstParameterName, Value: firstParameterValue})
+		require.Contains(t, buildParameters, codersdk.WorkspaceBuildParameter{Name: secondParameterName, Value: secondParameterValue})
+		require.Contains(t, buildParameters, codersdk.WorkspaceBuildParameter{Name: immutableParameterName, Value: immutableParameterValue})
 	})
 
 	t.Run("RichParametersFile", func(t *testing.T) {
@@ -738,24 +864,34 @@ func TestCreateValidateRichParameters(t *testing.T) {
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
 
-		inv, root := clitest.New(t, "create", "my-workspace", "--template", template.Name)
-		clitest.SetupConfig(t, member, root)
-		pty := ptytest.New(t).Attach(inv)
-		clitest.Start(t, inv)
+		t.Run("Prompt", func(t *testing.T) {
+			inv, root := clitest.New(t, "create", "my-workspace-1", "--template", template.Name)
+			clitest.SetupConfig(t, member, root)
+			pty := ptytest.New(t).Attach(inv)
+			clitest.Start(t, inv)
 
-		matches := []string{
-			listOfStringsParameterName, "",
-			"aaa, bbb, ccc", "",
-			"Confirm create?", "yes",
-		}
-		for i := 0; i < len(matches); i += 2 {
-			match := matches[i]
-			value := matches[i+1]
-			pty.ExpectMatch(match)
-			if value != "" {
-				pty.WriteLine(value)
-			}
-		}
+			pty.ExpectMatch(listOfStringsParameterName)
+			pty.ExpectMatch("aaa, bbb, ccc")
+			pty.ExpectMatch("Confirm create?")
+			pty.WriteLine("yes")
+		})
+
+		t.Run("Default", func(t *testing.T) {
+			t.Parallel()
+			inv, root := clitest.New(t, "create", "my-workspace-2", "--template", template.Name, "--yes")
+			clitest.SetupConfig(t, member, root)
+			clitest.Run(t, inv)
+		})
+
+		t.Run("CLIOverride/DoubleQuote", func(t *testing.T) {
+			t.Parallel()
+
+			// Note: see https://go.dev/play/p/vhTUTZsVrEb for how to escape this properly
+			parameterArg := fmt.Sprintf(`"%s=[""ddd=foo"",""eee=bar"",""fff=baz""]"`, listOfStringsParameterName)
+			inv, root := clitest.New(t, "create", "my-workspace-3", "--template", template.Name, "--parameter", parameterArg, "--yes")
+			clitest.SetupConfig(t, member, root)
+			clitest.Run(t, inv)
+		})
 	})
 
 	t.Run("ValidateListOfStrings_YAMLFile", func(t *testing.T) {

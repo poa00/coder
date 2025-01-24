@@ -158,13 +158,19 @@ func ProtoFromScripts(scripts []codersdk.WorkspaceAgentScript) []*proto.Workspac
 }
 
 func AgentScriptFromProto(protoScript *proto.WorkspaceAgentScript) (codersdk.WorkspaceAgentScript, error) {
-	id, err := uuid.FromBytes(protoScript.LogSourceId)
+	id, err := uuid.FromBytes(protoScript.Id)
 	if err != nil {
 		return codersdk.WorkspaceAgentScript{}, xerrors.Errorf("parse id: %w", err)
 	}
 
+	logSourceID, err := uuid.FromBytes(protoScript.LogSourceId)
+	if err != nil {
+		return codersdk.WorkspaceAgentScript{}, xerrors.Errorf("parse log source id: %w", err)
+	}
+
 	return codersdk.WorkspaceAgentScript{
-		LogSourceID:      id,
+		ID:               id,
+		LogSourceID:      logSourceID,
 		LogPath:          protoScript.LogPath,
 		Script:           protoScript.Script,
 		Cron:             protoScript.Cron,
@@ -172,11 +178,13 @@ func AgentScriptFromProto(protoScript *proto.WorkspaceAgentScript) (codersdk.Wor
 		RunOnStop:        protoScript.RunOnStop,
 		StartBlocksLogin: protoScript.StartBlocksLogin,
 		Timeout:          protoScript.Timeout.AsDuration(),
+		DisplayName:      protoScript.DisplayName,
 	}, nil
 }
 
 func ProtoFromScript(s codersdk.WorkspaceAgentScript) *proto.WorkspaceAgentScript {
 	return &proto.WorkspaceAgentScript{
+		Id:               s.ID[:],
 		LogSourceId:      s.LogSourceID[:],
 		LogPath:          s.LogPath,
 		Script:           s.Script,
@@ -185,6 +193,7 @@ func ProtoFromScript(s codersdk.WorkspaceAgentScript) *proto.WorkspaceAgentScrip
 		RunOnStop:        s.RunOnStop,
 		StartBlocksLogin: s.StartBlocksLogin,
 		Timeout:          durationpb.New(s.Timeout),
+		DisplayName:      s.DisplayName,
 	}
 }
 
@@ -245,6 +254,7 @@ func AppFromProto(protoApp *proto.WorkspaceApp) (codersdk.WorkspaceApp, error) {
 			Threshold: protoApp.Healthcheck.Threshold,
 		},
 		Health: health,
+		Hidden: protoApp.Hidden,
 	}, nil
 }
 
@@ -274,19 +284,36 @@ func ProtoFromApp(a codersdk.WorkspaceApp) (*proto.WorkspaceApp, error) {
 			Threshold: a.Healthcheck.Threshold,
 		},
 		Health: proto.WorkspaceApp_Health(health),
+		Hidden: a.Hidden,
 	}, nil
 }
 
-func ServiceBannerFromProto(sbp *proto.ServiceBanner) codersdk.ServiceBannerConfig {
-	return codersdk.ServiceBannerConfig{
+func ServiceBannerFromProto(sbp *proto.ServiceBanner) codersdk.BannerConfig {
+	return codersdk.BannerConfig{
 		Enabled:         sbp.GetEnabled(),
 		Message:         sbp.GetMessage(),
 		BackgroundColor: sbp.GetBackgroundColor(),
 	}
 }
 
-func ProtoFromServiceBanner(sb codersdk.ServiceBannerConfig) *proto.ServiceBanner {
+func ProtoFromServiceBanner(sb codersdk.BannerConfig) *proto.ServiceBanner {
 	return &proto.ServiceBanner{
+		Enabled:         sb.Enabled,
+		Message:         sb.Message,
+		BackgroundColor: sb.BackgroundColor,
+	}
+}
+
+func BannerConfigFromProto(sbp *proto.BannerConfig) codersdk.BannerConfig {
+	return codersdk.BannerConfig{
+		Enabled:         sbp.GetEnabled(),
+		Message:         sbp.GetMessage(),
+		BackgroundColor: sbp.GetBackgroundColor(),
+	}
+}
+
+func ProtoFromBannerConfig(sb codersdk.BannerConfig) *proto.BannerConfig {
+	return &proto.BannerConfig{
 		Enabled:         sb.Enabled,
 		Message:         sb.Message,
 		BackgroundColor: sb.BackgroundColor,
@@ -332,7 +359,7 @@ func ProtoFromLog(log Log) (*proto.Log, error) {
 	}
 	return &proto.Log{
 		CreatedAt: timestamppb.New(log.CreatedAt),
-		Output:    log.Output,
+		Output:    strings.ToValidUTF8(log.Output, "❌"),
 		Level:     proto.Log_Level(lvl),
 	}, nil
 }
@@ -354,4 +381,12 @@ func LifecycleStateFromProto(s proto.Lifecycle_State) (codersdk.WorkspaceAgentLi
 		return "", xerrors.Errorf("unknown lifecycle state: %d", s)
 	}
 	return codersdk.WorkspaceAgentLifecycle(strings.ToLower(caps)), nil
+}
+
+func ProtoFromLifecycleState(s codersdk.WorkspaceAgentLifecycle) (proto.Lifecycle_State, error) {
+	caps, ok := proto.Lifecycle_State_value[strings.ToUpper(string(s))]
+	if !ok {
+		return 0, xerrors.Errorf("unknown lifecycle state: %s", s)
+	}
+	return proto.Lifecycle_State(caps), nil
 }

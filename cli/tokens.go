@@ -17,16 +17,16 @@ func (r *RootCmd) tokens() *serpent.Command {
 	cmd := &serpent.Command{
 		Use:   "tokens",
 		Short: "Manage personal access tokens",
-		Long: "Tokens are used to authenticate automated clients to Coder.\n" + formatExamples(
-			example{
+		Long: "Tokens are used to authenticate automated clients to Coder.\n" + FormatExamples(
+			Example{
 				Description: "Create a token for automation",
 				Command:     "coder tokens create",
 			},
-			example{
+			Example{
 				Description: "List your tokens",
 				Command:     "coder tokens ls",
 			},
-			example{
+			Example{
 				Description: "Remove a token by ID",
 				Command:     "coder tokens rm WuoWs4ZsMX",
 			},
@@ -46,8 +46,9 @@ func (r *RootCmd) tokens() *serpent.Command {
 
 func (r *RootCmd) createToken() *serpent.Command {
 	var (
-		tokenLifetime time.Duration
+		tokenLifetime string
 		name          string
+		user          string
 	)
 	client := new(codersdk.Client)
 	cmd := &serpent.Command{
@@ -58,8 +59,34 @@ func (r *RootCmd) createToken() *serpent.Command {
 			r.InitClient(client),
 		),
 		Handler: func(inv *serpent.Invocation) error {
-			res, err := client.CreateToken(inv.Context(), codersdk.Me, codersdk.CreateTokenRequest{
-				Lifetime:  tokenLifetime,
+			userID := codersdk.Me
+			if user != "" {
+				userID = user
+			}
+
+			var parsedLifetime time.Duration
+			var err error
+
+			tokenConfig, err := client.GetTokenConfig(inv.Context(), userID)
+			if err != nil {
+				return xerrors.Errorf("get token config: %w", err)
+			}
+
+			if tokenLifetime == "" {
+				parsedLifetime = tokenConfig.MaxTokenLifetime
+			} else {
+				parsedLifetime, err = extendedParseDuration(tokenLifetime)
+				if err != nil {
+					return xerrors.Errorf("parse lifetime: %w", err)
+				}
+
+				if parsedLifetime > tokenConfig.MaxTokenLifetime {
+					return xerrors.Errorf("lifetime (%s) is greater than the maximum allowed lifetime (%s)", parsedLifetime, tokenConfig.MaxTokenLifetime)
+				}
+			}
+
+			res, err := client.CreateToken(inv.Context(), userID, codersdk.CreateTokenRequest{
+				Lifetime:  parsedLifetime,
 				TokenName: name,
 			})
 			if err != nil {
@@ -77,8 +104,7 @@ func (r *RootCmd) createToken() *serpent.Command {
 			Flag:        "lifetime",
 			Env:         "CODER_TOKEN_LIFETIME",
 			Description: "Specify a duration for the lifetime of the token.",
-			Default:     (time.Hour * 24 * 30).String(),
-			Value:       serpent.DurationOf(&tokenLifetime),
+			Value:       serpent.StringOf(&tokenLifetime),
 		},
 		{
 			Flag:          "name",
@@ -86,6 +112,13 @@ func (r *RootCmd) createToken() *serpent.Command {
 			Env:           "CODER_TOKEN_NAME",
 			Description:   "Specify a human-readable name.",
 			Value:         serpent.StringOf(&name),
+		},
+		{
+			Flag:          "user",
+			FlagShorthand: "u",
+			Env:           "CODER_TOKEN_USER",
+			Description:   "Specify the user to create the token for (Only works if logged in user is admin).",
+			Value:         serpent.StringOf(&user),
 		},
 	}
 

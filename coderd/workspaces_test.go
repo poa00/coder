@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent/agenttest"
 	"github.com/coder/coder/v2/coderd/audit"
 	"github.com/coder/coder/v2/coderd/coderdtest"
@@ -29,8 +28,11 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbgen"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
-	"github.com/coder/coder/v2/coderd/parameter"
+	"github.com/coder/coder/v2/coderd/notifications"
+	"github.com/coder/coder/v2/coderd/notifications/notificationstest"
 	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/policy"
+	"github.com/coder/coder/v2/coderd/render"
 	"github.com/coder/coder/v2/coderd/schedule"
 	"github.com/coder/coder/v2/coderd/schedule/cron"
 	"github.com/coder/coder/v2/coderd/util/ptr"
@@ -52,17 +54,21 @@ func TestWorkspace(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
 
 		authz.Reset() // Reset all previous checks done in setup.
 		ws, err := client.Workspace(ctx, workspace.ID)
-		authz.AssertChecked(t, rbac.ActionRead, ws)
+		authz.AssertChecked(t, policy.ActionRead, ws)
 		require.NoError(t, err)
 		require.Equal(t, user.UserID, ws.LatestBuild.InitiatorID)
 		require.Equal(t, codersdk.BuildReasonInitiator, ws.LatestBuild.Reason)
+
+		org, err := client.Organization(ctx, ws.OrganizationID)
+		require.NoError(t, err)
+		require.Equal(t, ws.OrganizationName, org.Name)
 	})
 
 	t.Run("Deleted", func(t *testing.T) {
@@ -72,7 +78,7 @@ func TestWorkspace(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -110,8 +116,8 @@ func TestWorkspace(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		ws1 := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
-		ws2 := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		ws1 := coderdtest.CreateWorkspace(t, client, template.ID)
+		ws2 := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, ws1.LatestBuild.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, ws2.LatestBuild.ID)
 
@@ -149,7 +155,7 @@ func TestWorkspace(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		ws1 := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		ws1 := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, ws1.LatestBuild.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitMedium)
@@ -181,7 +187,7 @@ func TestWorkspace(t *testing.T) {
 		require.NotEmpty(t, template.DisplayName)
 		require.NotEmpty(t, template.Icon)
 		require.False(t, template.AllowUserCancelWorkspaceJobs)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
@@ -222,7 +228,7 @@ func TestWorkspace(t *testing.T) {
 			})
 			coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 			template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-			workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+			workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 			coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -263,7 +269,7 @@ func TestWorkspace(t *testing.T) {
 			})
 			coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 			template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-			workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+			workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 			coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -312,7 +318,7 @@ func TestWorkspace(t *testing.T) {
 			})
 			coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 			template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-			workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+			workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 			coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -385,7 +391,7 @@ func TestResolveAutostart(t *testing.T) {
 	defer cancel()
 
 	client, member := coderdtest.CreateAnotherUser(t, ownerClient, owner.OrganizationID)
-	resp := dbfake.WorkspaceBuild(t, db, database.Workspace{
+	resp := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
 		OwnerID:          member.ID,
 		OrganizationID:   owner.OrganizationID,
 		AutomaticUpdates: database.AutomaticUpdatesAlways,
@@ -439,71 +445,32 @@ func TestResolveAutostart(t *testing.T) {
 	require.False(t, resolveResp.ParameterMismatch)
 }
 
-func TestAdminViewAllWorkspaces(t *testing.T) {
-	t.Parallel()
-	client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
-	user := coderdtest.CreateFirstUser(t, client)
-	version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
-	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
-	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
-	defer cancel()
-
-	_, err := client.Workspace(ctx, workspace.ID)
-	require.NoError(t, err)
-
-	otherOrg, err := client.CreateOrganization(ctx, codersdk.CreateOrganizationRequest{
-		Name: "default-test",
-	})
-	require.NoError(t, err, "create other org")
-
-	// This other user is not in the first user's org. Since other is an admin, they can
-	// still see the "first" user's workspace.
-	otherOwner, _ := coderdtest.CreateAnotherUser(t, client, otherOrg.ID, rbac.RoleOwner())
-	otherWorkspaces, err := otherOwner.Workspaces(ctx, codersdk.WorkspaceFilter{})
-	require.NoError(t, err, "(other) fetch workspaces")
-
-	firstWorkspaces, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{})
-	require.NoError(t, err, "(first) fetch workspaces")
-
-	require.ElementsMatch(t, otherWorkspaces.Workspaces, firstWorkspaces.Workspaces)
-	require.Equal(t, len(firstWorkspaces.Workspaces), 1, "should be 1 workspace present")
-
-	memberView, _ := coderdtest.CreateAnotherUser(t, client, otherOrg.ID)
-	memberViewWorkspaces, err := memberView.Workspaces(ctx, codersdk.WorkspaceFilter{})
-	require.NoError(t, err, "(member) fetch workspaces")
-	require.Equal(t, 0, len(memberViewWorkspaces.Workspaces), "member in other org should see 0 workspaces")
-}
-
 func TestWorkspacesSortOrder(t *testing.T) {
 	t.Parallel()
 
 	client, db := coderdtest.NewWithDatabase(t, nil)
 	firstUser := coderdtest.CreateFirstUser(t, client)
-	secondUserClient, secondUser := coderdtest.CreateAnotherUserMutators(t, client, firstUser.OrganizationID, []string{"owner"}, func(r *codersdk.CreateUserRequest) {
+	secondUserClient, secondUser := coderdtest.CreateAnotherUserMutators(t, client, firstUser.OrganizationID, []rbac.RoleIdentifier{rbac.RoleOwner()}, func(r *codersdk.CreateUserRequestWithOrgs) {
 		r.Username = "zzz"
 	})
 
 	// c-workspace should be running
-	wsbC := dbfake.WorkspaceBuild(t, db, database.Workspace{Name: "c-workspace", OwnerID: firstUser.UserID, OrganizationID: firstUser.OrganizationID}).Do()
+	wsbC := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{Name: "c-workspace", OwnerID: firstUser.UserID, OrganizationID: firstUser.OrganizationID}).Do()
 
 	// b-workspace should be stopped
-	wsbB := dbfake.WorkspaceBuild(t, db, database.Workspace{Name: "b-workspace", OwnerID: firstUser.UserID, OrganizationID: firstUser.OrganizationID}).Seed(database.WorkspaceBuild{Transition: database.WorkspaceTransitionStop}).Do()
+	wsbB := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{Name: "b-workspace", OwnerID: firstUser.UserID, OrganizationID: firstUser.OrganizationID}).Seed(database.WorkspaceBuild{Transition: database.WorkspaceTransitionStop}).Do()
 
 	// a-workspace should be running
-	wsbA := dbfake.WorkspaceBuild(t, db, database.Workspace{Name: "a-workspace", OwnerID: firstUser.UserID, OrganizationID: firstUser.OrganizationID}).Do()
+	wsbA := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{Name: "a-workspace", OwnerID: firstUser.UserID, OrganizationID: firstUser.OrganizationID}).Do()
 
 	// d-workspace should be stopped
-	wsbD := dbfake.WorkspaceBuild(t, db, database.Workspace{Name: "d-workspace", OwnerID: secondUser.ID, OrganizationID: firstUser.OrganizationID}).Seed(database.WorkspaceBuild{Transition: database.WorkspaceTransitionStop}).Do()
+	wsbD := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{Name: "d-workspace", OwnerID: secondUser.ID, OrganizationID: firstUser.OrganizationID}).Seed(database.WorkspaceBuild{Transition: database.WorkspaceTransitionStop}).Do()
 
 	// e-workspace should also be stopped
-	wsbE := dbfake.WorkspaceBuild(t, db, database.Workspace{Name: "e-workspace", OwnerID: secondUser.ID, OrganizationID: firstUser.OrganizationID}).Seed(database.WorkspaceBuild{Transition: database.WorkspaceTransitionStop}).Do()
+	wsbE := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{Name: "e-workspace", OwnerID: secondUser.ID, OrganizationID: firstUser.OrganizationID}).Seed(database.WorkspaceBuild{Transition: database.WorkspaceTransitionStop}).Do()
 
 	// f-workspace is also stopped, but is marked as favorite
-	wsbF := dbfake.WorkspaceBuild(t, db, database.Workspace{Name: "f-workspace", OwnerID: firstUser.UserID, OrganizationID: firstUser.OrganizationID}).Seed(database.WorkspaceBuild{Transition: database.WorkspaceTransitionStop}).Do()
+	wsbF := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{Name: "f-workspace", OwnerID: firstUser.UserID, OrganizationID: firstUser.OrganizationID}).Seed(database.WorkspaceBuild{Transition: database.WorkspaceTransitionStop}).Do()
 
 	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 	defer cancel()
@@ -582,32 +549,6 @@ func TestPostWorkspacesByOrganization(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, apiErr.StatusCode())
 	})
 
-	t.Run("NoTemplateAccess", func(t *testing.T) {
-		t.Parallel()
-		client := coderdtest.New(t, nil)
-		first := coderdtest.CreateFirstUser(t, client)
-		other, _ := coderdtest.CreateAnotherUser(t, client, first.OrganizationID, rbac.RoleMember(), rbac.RoleOwner())
-
-		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
-		defer cancel()
-
-		org, err := other.CreateOrganization(ctx, codersdk.CreateOrganizationRequest{
-			Name: "another",
-		})
-		require.NoError(t, err)
-		version := coderdtest.CreateTemplateVersion(t, other, org.ID, nil)
-		template := coderdtest.CreateTemplate(t, other, org.ID, version.ID)
-
-		_, err = client.CreateWorkspace(ctx, first.OrganizationID, codersdk.Me, codersdk.CreateWorkspaceRequest{
-			TemplateID: template.ID,
-			Name:       "workspace",
-		})
-		require.Error(t, err)
-		var apiErr *codersdk.Error
-		require.ErrorAs(t, err, &apiErr)
-		require.Equal(t, http.StatusForbidden, apiErr.StatusCode())
-	})
-
 	t.Run("AlreadyExists", func(t *testing.T) {
 		t.Parallel()
 		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
@@ -615,7 +556,7 @@ func TestPostWorkspacesByOrganization(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
@@ -630,6 +571,76 @@ func TestPostWorkspacesByOrganization(t *testing.T) {
 		require.Equal(t, http.StatusConflict, apiErr.StatusCode())
 	})
 
+	t.Run("CreateSendsNotification", func(t *testing.T) {
+		t.Parallel()
+
+		enqueuer := notificationstest.FakeEnqueuer{}
+		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true, NotificationsEnqueuer: &enqueuer})
+		user := coderdtest.CreateFirstUser(t, client)
+		templateAdminClient, templateAdmin := coderdtest.CreateAnotherUser(t, client, user.OrganizationID, rbac.RoleTemplateAdmin())
+		memberClient, memberUser := coderdtest.CreateAnotherUser(t, client, user.OrganizationID)
+
+		version := coderdtest.CreateTemplateVersion(t, templateAdminClient, user.OrganizationID, nil)
+		template := coderdtest.CreateTemplate(t, templateAdminClient, user.OrganizationID, version.ID)
+		coderdtest.AwaitTemplateVersionJobCompleted(t, templateAdminClient, version.ID)
+
+		workspace := coderdtest.CreateWorkspace(t, memberClient, template.ID)
+		coderdtest.AwaitWorkspaceBuildJobCompleted(t, memberClient, workspace.LatestBuild.ID)
+
+		sent := enqueuer.Sent(notificationstest.WithTemplateID(notifications.TemplateWorkspaceCreated))
+		require.Len(t, sent, 2)
+
+		receivers := make([]uuid.UUID, len(sent))
+		for idx, notif := range sent {
+			receivers[idx] = notif.UserID
+		}
+
+		// Check the notification was sent to the first user and template admin
+		require.Contains(t, receivers, templateAdmin.ID)
+		require.Contains(t, receivers, user.UserID)
+		require.NotContains(t, receivers, memberUser.ID)
+
+		require.Contains(t, sent[0].Targets, template.ID)
+		require.Contains(t, sent[0].Targets, workspace.ID)
+		require.Contains(t, sent[0].Targets, workspace.OrganizationID)
+		require.Contains(t, sent[0].Targets, workspace.OwnerID)
+
+		require.Contains(t, sent[1].Targets, template.ID)
+		require.Contains(t, sent[1].Targets, workspace.ID)
+		require.Contains(t, sent[1].Targets, workspace.OrganizationID)
+		require.Contains(t, sent[1].Targets, workspace.OwnerID)
+	})
+
+	t.Run("CreateSendsNotificationToCorrectUser", func(t *testing.T) {
+		t.Parallel()
+
+		enqueuer := notificationstest.FakeEnqueuer{}
+		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true, NotificationsEnqueuer: &enqueuer})
+		user := coderdtest.CreateFirstUser(t, client)
+		templateAdminClient, _ := coderdtest.CreateAnotherUser(t, client, user.OrganizationID, rbac.RoleTemplateAdmin(), rbac.RoleOwner())
+		_, memberUser := coderdtest.CreateAnotherUser(t, client, user.OrganizationID)
+
+		version := coderdtest.CreateTemplateVersion(t, templateAdminClient, user.OrganizationID, nil)
+		template := coderdtest.CreateTemplate(t, templateAdminClient, user.OrganizationID, version.ID)
+		coderdtest.AwaitTemplateVersionJobCompleted(t, templateAdminClient, version.ID)
+
+		ctx := testutil.Context(t, testutil.WaitShort)
+		workspace, err := templateAdminClient.CreateUserWorkspace(ctx, memberUser.Username, codersdk.CreateWorkspaceRequest{
+			TemplateID: template.ID,
+			Name:       coderdtest.RandomUsername(t),
+		})
+		require.NoError(t, err)
+		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
+
+		sent := enqueuer.Sent(notificationstest.WithTemplateID(notifications.TemplateWorkspaceCreated))
+		require.Len(t, sent, 1)
+		require.Equal(t, user.UserID, sent[0].UserID)
+		require.Contains(t, sent[0].Targets, template.ID)
+		require.Contains(t, sent[0].Targets, workspace.ID)
+		require.Contains(t, sent[0].Targets, workspace.OrganizationID)
+		require.Contains(t, sent[0].Targets, workspace.OwnerID)
+	})
+
 	t.Run("CreateWithAuditLogs", func(t *testing.T) {
 		t.Parallel()
 		auditor := audit.NewMock()
@@ -638,7 +649,7 @@ func TestPostWorkspacesByOrganization(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 		assert.True(t, auditor.Contains(t, database.AuditLog{
 			ResourceType:   database.ResourceTypeWorkspace,
@@ -657,10 +668,10 @@ func TestPostWorkspacesByOrganization(t *testing.T) {
 		versionTest := coderdtest.UpdateTemplateVersion(t, client, user.OrganizationID, nil, template.ID)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, versionDefault.ID)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, versionTest.ID)
-		defaultWorkspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, uuid.Nil,
+		defaultWorkspace := coderdtest.CreateWorkspace(t, client, uuid.Nil,
 			func(c *codersdk.CreateWorkspaceRequest) { c.TemplateVersionID = versionDefault.ID },
 		)
-		testWorkspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, uuid.Nil,
+		testWorkspace := coderdtest.CreateWorkspace(t, client, uuid.Nil,
 			func(c *codersdk.CreateWorkspaceRequest) { c.TemplateVersionID = versionTest.ID },
 		)
 		defaultWorkspaceBuild := coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, defaultWorkspace.LatestBuild.ID)
@@ -736,7 +747,7 @@ func TestPostWorkspacesByOrganization(t *testing.T) {
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 
 		// When: we create a workspace with autostop not enabled
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 			cwr.TTLMillis = ptr.Ref(int64(0))
 		})
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
@@ -755,14 +766,14 @@ func TestPostWorkspacesByOrganization(t *testing.T) {
 			ctr.DefaultTTLMillis = ptr.Ref(templateTTL)
 		})
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 			cwr.TTLMillis = nil // ensure that no default TTL is set
 		})
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		// TTL should be set by the template
-		require.Equal(t, template.DefaultTTLMillis, templateTTL)
-		require.Equal(t, template.DefaultTTLMillis, *workspace.TTLMillis)
+		require.Equal(t, templateTTL, template.DefaultTTLMillis)
+		require.Equal(t, templateTTL, *workspace.TTLMillis)
 	})
 
 	t.Run("InvalidTTL", func(t *testing.T) {
@@ -789,7 +800,7 @@ func TestPostWorkspacesByOrganization(t *testing.T) {
 			require.ErrorAs(t, err, &apiErr)
 			require.Equal(t, http.StatusBadRequest, apiErr.StatusCode())
 			require.Len(t, apiErr.Validations, 1)
-			require.Equal(t, apiErr.Validations[0].Field, "ttl_ms")
+			require.Equal(t, "ttl_ms", apiErr.Validations[0].Field)
 			require.Equal(t, "time until shutdown must be at least one minute", apiErr.Validations[0].Detail)
 		})
 	})
@@ -825,6 +836,94 @@ func TestPostWorkspacesByOrganization(t *testing.T) {
 		require.NoError(t, err)
 		require.EqualValues(t, exp, *ws.TTLMillis)
 	})
+
+	t.Run("NoProvisionersAvailable", func(t *testing.T) {
+		t.Parallel()
+		if !dbtestutil.WillUsePostgres() {
+			t.Skip("this test requires postgres")
+		}
+		// Given: a coderd instance with a provisioner daemon
+		store, ps, db := dbtestutil.NewDBWithSQLDB(t)
+		client, closeDaemon := coderdtest.NewWithProvisionerCloser(t, &coderdtest.Options{
+			Database:                 store,
+			Pubsub:                   ps,
+			IncludeProvisionerDaemon: true,
+		})
+		defer closeDaemon.Close()
+
+		// Given: a user, template, and workspace
+		user := coderdtest.CreateFirstUser(t, client)
+		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
+		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
+
+		// Given: all the provisioner daemons disappear
+		ctx := testutil.Context(t, testutil.WaitLong)
+		_, err := db.ExecContext(ctx, `DELETE FROM provisioner_daemons;`)
+		require.NoError(t, err)
+
+		// When: a new workspace is created
+		ws, err := client.CreateUserWorkspace(ctx, codersdk.Me, codersdk.CreateWorkspaceRequest{
+			TemplateID: template.ID,
+			Name:       "testing",
+		})
+		// Then: the request succeeds
+		require.NoError(t, err)
+		// Then: the workspace build is pending
+		require.Equal(t, codersdk.ProvisionerJobPending, ws.LatestBuild.Job.Status)
+		// Then: the workspace build has no matched provisioners
+		if assert.NotNil(t, ws.LatestBuild.MatchedProvisioners) {
+			assert.Zero(t, ws.LatestBuild.MatchedProvisioners.Count)
+			assert.Zero(t, ws.LatestBuild.MatchedProvisioners.Available)
+			assert.Zero(t, ws.LatestBuild.MatchedProvisioners.MostRecentlySeen.Time)
+			assert.False(t, ws.LatestBuild.MatchedProvisioners.MostRecentlySeen.Valid)
+		}
+	})
+
+	t.Run("AllProvisionersStale", func(t *testing.T) {
+		t.Parallel()
+		if !dbtestutil.WillUsePostgres() {
+			t.Skip("this test requires postgres")
+		}
+
+		// Given: a coderd instance with a provisioner daemon
+		store, ps, db := dbtestutil.NewDBWithSQLDB(t)
+		client, closeDaemon := coderdtest.NewWithProvisionerCloser(t, &coderdtest.Options{
+			Database:                 store,
+			Pubsub:                   ps,
+			IncludeProvisionerDaemon: true,
+		})
+		defer closeDaemon.Close()
+
+		// Given: a user, template, and workspace
+		user := coderdtest.CreateFirstUser(t, client)
+		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
+		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
+
+		// Given: all the provisioner daemons have not been seen for a while
+		ctx := testutil.Context(t, testutil.WaitLong)
+		newLastSeenAt := dbtime.Now().Add(-time.Hour)
+		_, err := db.ExecContext(ctx, `UPDATE provisioner_daemons SET last_seen_at = $1;`, newLastSeenAt)
+		require.NoError(t, err)
+
+		// When: a new workspace is created
+		ws, err := client.CreateUserWorkspace(ctx, codersdk.Me, codersdk.CreateWorkspaceRequest{
+			TemplateID: template.ID,
+			Name:       "testing",
+		})
+		// Then: the request succeeds
+		require.NoError(t, err)
+		// Then: the workspace build is pending
+		require.Equal(t, codersdk.ProvisionerJobPending, ws.LatestBuild.Job.Status)
+		// Then: we can see that there are some provisioners that are stale
+		if assert.NotNil(t, ws.LatestBuild.MatchedProvisioners) {
+			assert.Equal(t, 1, ws.LatestBuild.MatchedProvisioners.Count)
+			assert.Zero(t, ws.LatestBuild.MatchedProvisioners.Available)
+			assert.Equal(t, newLastSeenAt.UTC(), ws.LatestBuild.MatchedProvisioners.MostRecentlySeen.Time.UTC())
+			assert.True(t, ws.LatestBuild.MatchedProvisioners.MostRecentlySeen.Valid)
+		}
+	})
 }
 
 func TestWorkspaceByOwnerAndName(t *testing.T) {
@@ -848,7 +947,7 @@ func TestWorkspaceByOwnerAndName(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
@@ -863,7 +962,7 @@ func TestWorkspaceByOwnerAndName(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -963,7 +1062,7 @@ func TestWorkspaceFilterAllStatus(t *testing.T) {
 		CreatedBy:       owner.UserID,
 	})
 
-	makeWorkspace := func(workspace database.Workspace, job database.ProvisionerJob, transition database.WorkspaceTransition) (database.Workspace, database.WorkspaceBuild, database.ProvisionerJob) {
+	makeWorkspace := func(workspace database.WorkspaceTable, job database.ProvisionerJob, transition database.WorkspaceTransition) (database.WorkspaceTable, database.WorkspaceBuild, database.ProvisionerJob) {
 		db := db
 
 		workspace.OwnerID = owner.UserID
@@ -998,21 +1097,21 @@ func TestWorkspaceFilterAllStatus(t *testing.T) {
 	}
 
 	// pending
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusPending),
 	}, database.ProvisionerJob{
 		StartedAt: sql.NullTime{Valid: false},
 	}, database.WorkspaceTransitionStart)
 
 	// starting
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusStarting),
 	}, database.ProvisionerJob{
 		StartedAt: sql.NullTime{Time: time.Now().Add(time.Second * -2), Valid: true},
 	}, database.WorkspaceTransitionStart)
 
 	// running
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusRunning),
 	}, database.ProvisionerJob{
 		CompletedAt: sql.NullTime{Time: time.Now(), Valid: true},
@@ -1020,14 +1119,14 @@ func TestWorkspaceFilterAllStatus(t *testing.T) {
 	}, database.WorkspaceTransitionStart)
 
 	// stopping
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusStopping),
 	}, database.ProvisionerJob{
 		StartedAt: sql.NullTime{Time: time.Now().Add(time.Second * -2), Valid: true},
 	}, database.WorkspaceTransitionStop)
 
 	// stopped
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusStopped),
 	}, database.ProvisionerJob{
 		StartedAt:   sql.NullTime{Time: time.Now().Add(time.Second * -2), Valid: true},
@@ -1035,7 +1134,7 @@ func TestWorkspaceFilterAllStatus(t *testing.T) {
 	}, database.WorkspaceTransitionStop)
 
 	// failed -- delete
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusFailed) + "-deleted",
 	}, database.ProvisionerJob{
 		StartedAt:   sql.NullTime{Time: time.Now().Add(time.Second * -2), Valid: true},
@@ -1044,7 +1143,7 @@ func TestWorkspaceFilterAllStatus(t *testing.T) {
 	}, database.WorkspaceTransitionDelete)
 
 	// failed -- stop
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusFailed) + "-stopped",
 	}, database.ProvisionerJob{
 		StartedAt:   sql.NullTime{Time: time.Now().Add(time.Second * -2), Valid: true},
@@ -1053,7 +1152,7 @@ func TestWorkspaceFilterAllStatus(t *testing.T) {
 	}, database.WorkspaceTransitionStop)
 
 	// canceling
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusCanceling),
 	}, database.ProvisionerJob{
 		StartedAt:  sql.NullTime{Time: time.Now().Add(time.Second * -2), Valid: true},
@@ -1061,7 +1160,7 @@ func TestWorkspaceFilterAllStatus(t *testing.T) {
 	}, database.WorkspaceTransitionStart)
 
 	// canceled
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusCanceled),
 	}, database.ProvisionerJob{
 		StartedAt:   sql.NullTime{Time: time.Now().Add(time.Second * -2), Valid: true},
@@ -1070,14 +1169,14 @@ func TestWorkspaceFilterAllStatus(t *testing.T) {
 	}, database.WorkspaceTransitionStart)
 
 	// deleting
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusDeleting),
 	}, database.ProvisionerJob{
 		StartedAt: sql.NullTime{Time: time.Now().Add(time.Second * -2), Valid: true},
 	}, database.WorkspaceTransitionDelete)
 
 	// deleted
-	makeWorkspace(database.Workspace{
+	makeWorkspace(database.WorkspaceTable{
 		Name: string(database.WorkspaceStatusDeleted),
 	}, database.ProvisionerJob{
 		StartedAt:   sql.NullTime{Time: time.Now().Add(time.Second * -2), Valid: true},
@@ -1189,7 +1288,7 @@ func TestWorkspaceFilter(t *testing.T) {
 		}
 
 		availTemplates = append(availTemplates, template)
-		workspace := coderdtest.CreateWorkspace(t, user.Client, template.OrganizationID, template.ID, func(request *codersdk.CreateWorkspaceRequest) {
+		workspace := coderdtest.CreateWorkspace(t, user.Client, template.ID, func(request *codersdk.CreateWorkspaceRequest) {
 			if count%3 == 0 {
 				request.Name = strings.ToUpper(request.Name)
 			}
@@ -1203,7 +1302,7 @@ func TestWorkspaceFilter(t *testing.T) {
 		// Make a workspace with a random template
 		idx, _ := cryptorand.Intn(len(availTemplates))
 		randTemplate := availTemplates[idx]
-		randWorkspace := coderdtest.CreateWorkspace(t, user.Client, randTemplate.OrganizationID, randTemplate.ID)
+		randWorkspace := coderdtest.CreateWorkspace(t, user.Client, randTemplate.ID)
 		allWorkspaces = append(allWorkspaces, madeWorkspace{
 			Workspace: randWorkspace,
 			Template:  randTemplate,
@@ -1322,6 +1421,20 @@ func TestWorkspaceFilter(t *testing.T) {
 func TestWorkspaceFilterManual(t *testing.T) {
 	t.Parallel()
 
+	expectIDs := func(t *testing.T, exp []codersdk.Workspace, got []codersdk.Workspace) {
+		t.Helper()
+		expIDs := make([]uuid.UUID, 0, len(exp))
+		for _, e := range exp {
+			expIDs = append(expIDs, e.ID)
+		}
+
+		gotIDs := make([]uuid.UUID, 0, len(got))
+		for _, g := range got {
+			gotIDs = append(gotIDs, g.ID)
+		}
+		require.ElementsMatchf(t, expIDs, gotIDs, "expected IDs")
+	}
+
 	t.Run("Name", func(t *testing.T) {
 		t.Parallel()
 		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
@@ -1329,7 +1442,7 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
@@ -1357,6 +1470,39 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, res.Workspaces, 0)
 	})
+	t.Run("Owner", func(t *testing.T) {
+		t.Parallel()
+		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
+		user := coderdtest.CreateFirstUser(t, client)
+		otherUser, _ := coderdtest.CreateAnotherUser(t, client, user.OrganizationID, rbac.RoleOwner())
+		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
+		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
+
+		// Add a non-matching workspace
+		coderdtest.CreateWorkspace(t, otherUser, template.ID)
+
+		workspaces := []codersdk.Workspace{
+			coderdtest.CreateWorkspace(t, client, template.ID),
+			coderdtest.CreateWorkspace(t, client, template.ID),
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+		defer cancel()
+
+		sdkUser, err := client.User(ctx, codersdk.Me)
+		require.NoError(t, err)
+
+		// match owner name
+		res, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
+			FilterQuery: fmt.Sprintf("owner:%s", sdkUser.Username),
+		})
+		require.NoError(t, err)
+		require.Len(t, res.Workspaces, len(workspaces))
+		for _, found := range res.Workspaces {
+			require.Equal(t, found.OwnerName, sdkUser.Username)
+		}
+	})
 	t.Run("IDs", func(t *testing.T) {
 		t.Parallel()
 		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
@@ -1364,8 +1510,8 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		alpha := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
-		bravo := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		alpha := coderdtest.CreateWorkspace(t, client, template.ID)
+		bravo := coderdtest.CreateWorkspace(t, client, template.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
@@ -1400,8 +1546,8 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version2.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 		template2 := coderdtest.CreateTemplate(t, client, user.OrganizationID, version2.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
-		_ = coderdtest.CreateWorkspace(t, client, user.OrganizationID, template2.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
+		_ = coderdtest.CreateWorkspace(t, client, template2.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
@@ -1427,8 +1573,8 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace1 := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
-		workspace2 := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace1 := coderdtest.CreateWorkspace(t, client, template.ID)
+		workspace2 := coderdtest.CreateWorkspace(t, client, template.ID)
 
 		// wait for workspaces to be "running"
 		_ = coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace1.LatestBuild.ID)
@@ -1475,11 +1621,14 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version2.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 		template2 := coderdtest.CreateTemplate(t, client, user.OrganizationID, version2.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
-		_ = coderdtest.CreateWorkspace(t, client, user.OrganizationID, template2.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
+		_ = coderdtest.CreateWorkspace(t, client, template2.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
+
+		org, err := client.Organization(ctx, user.OrganizationID)
+		require.NoError(t, err)
 
 		// single workspace
 		res, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
@@ -1488,6 +1637,7 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, res.Workspaces, 1)
 		require.Equal(t, workspace.ID, res.Workspaces[0].ID)
+		require.Equal(t, workspace.OrganizationName, org.Name)
 	})
 	t.Run("FilterQueryHasAgentConnecting", func(t *testing.T) {
 		t.Parallel()
@@ -1504,7 +1654,7 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		})
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -1532,7 +1682,7 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		})
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		_ = agenttest.New(t, client.URL, authToken)
@@ -1579,7 +1729,7 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		})
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitMedium)
@@ -1593,7 +1743,6 @@ func TestWorkspaceFilterManual(t *testing.T) {
 			return workspaces.Count == 1
 		}, testutil.IntervalMedium, "agent status timeout")
 	})
-
 	t.Run("Dormant", func(t *testing.T) {
 		// this test has a licensed counterpart in enterprise/coderd/workspaces_test.go: FilterQueryHasDeletingByAndLicensed
 		t.Parallel()
@@ -1608,14 +1757,14 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
 
-		dormantWorkspace := dbfake.WorkspaceBuild(t, db, database.Workspace{
+		dormantWorkspace := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
 			TemplateID:     template.ID,
 			OwnerID:        user.UserID,
 			OrganizationID: user.OrganizationID,
 		}).Do().Workspace
 
 		// Create another workspace to validate that we do not return active workspaces.
-		_ = dbfake.WorkspaceBuild(t, db, database.Workspace{
+		_ = dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
 			TemplateID:     template.ID,
 			OwnerID:        user.UserID,
 			OrganizationID: user.OrganizationID,
@@ -1640,7 +1789,6 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		require.Equal(t, dormantWorkspace.ID, res.Workspaces[0].ID)
 		require.NotNil(t, res.Workspaces[0].DormantAt)
 	})
-
 	t.Run("LastUsed", func(t *testing.T) {
 		t.Parallel()
 
@@ -1662,10 +1810,10 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		defer cancel()
 
 		now := dbtime.Now()
-		before := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		before := coderdtest.CreateWorkspace(t, client, template.ID)
 		_ = coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, before.LatestBuild.ID)
 
-		after := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		after := coderdtest.CreateWorkspace(t, client, template.ID)
 		_ = coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, after.LatestBuild.ID)
 
 		//nolint:gocritic // Unit testing context
@@ -1704,7 +1852,7 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
@@ -1747,6 +1895,172 @@ func TestWorkspaceFilterManual(t *testing.T) {
 		require.Len(t, res.Workspaces, 1)
 		require.Equal(t, workspace.ID, res.Workspaces[0].ID)
 	})
+	t.Run("Params", func(t *testing.T) {
+		t.Parallel()
+
+		const (
+			paramOneName   = "one"
+			paramTwoName   = "two"
+			paramThreeName = "three"
+			paramOptional  = "optional"
+		)
+
+		makeParameters := func(extra ...*proto.RichParameter) *echo.Responses {
+			return &echo.Responses{
+				Parse: echo.ParseComplete,
+				ProvisionPlan: []*proto.Response{
+					{
+						Type: &proto.Response_Plan{
+							Plan: &proto.PlanComplete{
+								Parameters: append([]*proto.RichParameter{
+									{Name: paramOneName, Description: "", Mutable: true, Type: "string"},
+									{Name: paramTwoName, DisplayName: "", Description: "", Mutable: true, Type: "string"},
+									{Name: paramThreeName, Description: "", Mutable: true, Type: "string"},
+								}, extra...),
+							},
+						},
+					},
+				},
+				ProvisionApply: echo.ApplyComplete,
+			}
+		}
+
+		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
+		user := coderdtest.CreateFirstUser(t, client)
+		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, makeParameters(&proto.RichParameter{Name: paramOptional, Description: "", Mutable: true, Type: "string"}))
+		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
+		noOptionalVersion := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, makeParameters(), func(request *codersdk.CreateTemplateVersionRequest) {
+			request.TemplateID = template.ID
+		})
+		coderdtest.AwaitTemplateVersionJobCompleted(t, client, noOptionalVersion.ID)
+
+		// foo :: one=foo, two=bar, one=baz, optional=optional
+		foo := coderdtest.CreateWorkspace(t, client, uuid.Nil, func(request *codersdk.CreateWorkspaceRequest) {
+			request.TemplateVersionID = version.ID
+			request.RichParameterValues = []codersdk.WorkspaceBuildParameter{
+				{
+					Name:  paramOneName,
+					Value: "foo",
+				},
+				{
+					Name:  paramTwoName,
+					Value: "bar",
+				},
+				{
+					Name:  paramThreeName,
+					Value: "baz",
+				},
+				{
+					Name:  paramOptional,
+					Value: "optional",
+				},
+			}
+		})
+
+		// bar :: one=foo, two=bar, three=baz, optional=optional
+		bar := coderdtest.CreateWorkspace(t, client, uuid.Nil, func(request *codersdk.CreateWorkspaceRequest) {
+			request.TemplateVersionID = version.ID
+			request.RichParameterValues = []codersdk.WorkspaceBuildParameter{
+				{
+					Name:  paramOneName,
+					Value: "bar",
+				},
+				{
+					Name:  paramTwoName,
+					Value: "bar",
+				},
+				{
+					Name:  paramThreeName,
+					Value: "baz",
+				},
+				{
+					Name:  paramOptional,
+					Value: "optional",
+				},
+			}
+		})
+
+		// baz :: one=baz, two=baz, three=baz
+		baz := coderdtest.CreateWorkspace(t, client, uuid.Nil, func(request *codersdk.CreateWorkspaceRequest) {
+			request.TemplateVersionID = noOptionalVersion.ID
+			request.RichParameterValues = []codersdk.WorkspaceBuildParameter{
+				{
+					Name:  paramOneName,
+					Value: "unique",
+				},
+				{
+					Name:  paramTwoName,
+					Value: "baz",
+				},
+				{
+					Name:  paramThreeName,
+					Value: "baz",
+				},
+			}
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+		defer cancel()
+
+		//nolint:tparallel,paralleltest
+		t.Run("has_param", func(t *testing.T) {
+			// Checks the existence of a param value
+			// all match
+			all, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
+				FilterQuery: fmt.Sprintf("param:%s", paramOneName),
+			})
+			require.NoError(t, err)
+			expectIDs(t, []codersdk.Workspace{foo, bar, baz}, all.Workspaces)
+
+			// Some match
+			optional, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
+				FilterQuery: fmt.Sprintf("param:%s", paramOptional),
+			})
+			require.NoError(t, err)
+			expectIDs(t, []codersdk.Workspace{foo, bar}, optional.Workspaces)
+
+			// None match
+			none, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
+				FilterQuery: "param:not-a-param",
+			})
+			require.NoError(t, err)
+			require.Len(t, none.Workspaces, 0)
+		})
+
+		//nolint:tparallel,paralleltest
+		t.Run("exact_param", func(t *testing.T) {
+			// All match
+			all, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
+				FilterQuery: fmt.Sprintf("param:%s=%s", paramThreeName, "baz"),
+			})
+			require.NoError(t, err)
+			expectIDs(t, []codersdk.Workspace{foo, bar, baz}, all.Workspaces)
+
+			// Two match
+			two, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
+				FilterQuery: fmt.Sprintf("param:%s=%s", paramTwoName, "bar"),
+			})
+			require.NoError(t, err)
+			expectIDs(t, []codersdk.Workspace{foo, bar}, two.Workspaces)
+
+			// Only 1 matches
+			one, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
+				FilterQuery: fmt.Sprintf("param:%s=%s", paramOneName, "foo"),
+			})
+			require.NoError(t, err)
+			expectIDs(t, []codersdk.Workspace{foo}, one.Workspaces)
+		})
+
+		//nolint:tparallel,paralleltest
+		t.Run("exact_param_and_has", func(t *testing.T) {
+			all, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
+				FilterQuery: fmt.Sprintf("param:not=athing param:%s=%s param:%s=%s", paramOptional, "optional", paramOneName, "unique"),
+			})
+			require.NoError(t, err)
+			expectIDs(t, []codersdk.Workspace{foo, bar, baz}, all.Workspaces)
+		})
+	})
 }
 
 func TestOffsetLimit(t *testing.T) {
@@ -1758,9 +2072,9 @@ func TestOffsetLimit(t *testing.T) {
 	version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-	_ = coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
-	_ = coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
-	_ = coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	_ = coderdtest.CreateWorkspace(t, client, template.ID)
+	_ = coderdtest.CreateWorkspace(t, client, template.ID)
+	_ = coderdtest.CreateWorkspace(t, client, template.ID)
 
 	// Case 1: empty finds all workspaces
 	ws, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{})
@@ -1876,7 +2190,7 @@ func TestWorkspaceUpdateAutostart(t *testing.T) {
 				version   = coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 				_         = coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 				project   = coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-				workspace = coderdtest.CreateWorkspace(t, client, user.OrganizationID, project.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+				workspace = coderdtest.CreateWorkspace(t, client, project.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 					cwr.AutostartSchedule = nil
 					cwr.TTLMillis = nil
 				})
@@ -1955,7 +2269,7 @@ func TestWorkspaceUpdateAutostart(t *testing.T) {
 			version   = coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 			_         = coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 			project   = coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-			workspace = coderdtest.CreateWorkspace(t, client, user.OrganizationID, project.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+			workspace = coderdtest.CreateWorkspace(t, client, project.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 				cwr.AutostartSchedule = nil
 				cwr.TTLMillis = nil
 			})
@@ -2061,7 +2375,7 @@ func TestWorkspaceUpdateTTL(t *testing.T) {
 				version   = coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 				_         = coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 				project   = coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID, mutators...)
-				workspace = coderdtest.CreateWorkspace(t, client, user.OrganizationID, project.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+				workspace = coderdtest.CreateWorkspace(t, client, project.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 					cwr.AutostartSchedule = nil
 					cwr.TTLMillis = nil
 				})
@@ -2097,6 +2411,93 @@ func TestWorkspaceUpdateTTL(t *testing.T) {
 		})
 	}
 
+	t.Run("ModifyAutostopWithRunningWorkspace", func(t *testing.T) {
+		t.Parallel()
+
+		testCases := []struct {
+			name        string
+			fromTTL     *int64
+			toTTL       *int64
+			afterUpdate func(t *testing.T, before, after codersdk.NullTime)
+		}{
+			{
+				name:    "RemoveAutostopRemovesDeadline",
+				fromTTL: ptr.Ref((8 * time.Hour).Milliseconds()),
+				toTTL:   nil,
+				afterUpdate: func(t *testing.T, before, after codersdk.NullTime) {
+					require.NotZero(t, before)
+					require.Zero(t, after)
+				},
+			},
+			{
+				name:    "AddAutostopDoesNotAddDeadline",
+				fromTTL: nil,
+				toTTL:   ptr.Ref((8 * time.Hour).Milliseconds()),
+				afterUpdate: func(t *testing.T, before, after codersdk.NullTime) {
+					require.Zero(t, before)
+					require.Zero(t, after)
+				},
+			},
+			{
+				name:    "IncreaseAutostopDoesNotModifyDeadline",
+				fromTTL: ptr.Ref((4 * time.Hour).Milliseconds()),
+				toTTL:   ptr.Ref((8 * time.Hour).Milliseconds()),
+				afterUpdate: func(t *testing.T, before, after codersdk.NullTime) {
+					require.NotZero(t, before)
+					require.NotZero(t, after)
+					require.Equal(t, before, after)
+				},
+			},
+			{
+				name:    "DecreaseAutostopDoesNotModifyDeadline",
+				fromTTL: ptr.Ref((8 * time.Hour).Milliseconds()),
+				toTTL:   ptr.Ref((4 * time.Hour).Milliseconds()),
+				afterUpdate: func(t *testing.T, before, after codersdk.NullTime) {
+					require.NotZero(t, before)
+					require.NotZero(t, after)
+					require.Equal(t, before, after)
+				},
+			},
+		}
+
+		for _, testCase := range testCases {
+			testCase := testCase
+
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+
+				var (
+					client    = coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
+					user      = coderdtest.CreateFirstUser(t, client)
+					version   = coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
+					_         = coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+					template  = coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
+					workspace = coderdtest.CreateWorkspace(t, client, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+						cwr.TTLMillis = testCase.fromTTL
+					})
+					build = coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
+				)
+
+				ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+				defer cancel()
+
+				err := client.UpdateWorkspaceTTL(ctx, workspace.ID, codersdk.UpdateWorkspaceTTLRequest{
+					TTLMillis: testCase.toTTL,
+				})
+				require.NoError(t, err)
+
+				deadlineBefore := build.Deadline
+
+				build, err = client.WorkspaceBuild(ctx, build.ID)
+				require.NoError(t, err)
+
+				deadlineAfter := build.Deadline
+
+				testCase.afterUpdate(t, deadlineBefore, deadlineAfter)
+			})
+		}
+	})
+
 	t.Run("CustomAutostopDisabledByTemplate", func(t *testing.T) {
 		t.Parallel()
 		var (
@@ -2122,7 +2523,7 @@ func TestWorkspaceUpdateTTL(t *testing.T) {
 			version   = coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 			_         = coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 			project   = coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-			workspace = coderdtest.CreateWorkspace(t, client, user.OrganizationID, project.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+			workspace = coderdtest.CreateWorkspace(t, client, project.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 				cwr.AutostartSchedule = nil
 				cwr.TTLMillis = nil
 			})
@@ -2175,7 +2576,7 @@ func TestWorkspaceExtend(t *testing.T) {
 		version     = coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		_           = coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template    = coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace   = coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+		workspace   = coderdtest.CreateWorkspace(t, client, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 			cwr.TTLMillis = ptr.Ref(ttl.Milliseconds())
 		})
 		_ = coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
@@ -2243,7 +2644,7 @@ func TestWorkspaceUpdateAutomaticUpdates_OK(t *testing.T) {
 		version      = coderdtest.CreateTemplateVersion(t, adminClient, admin.OrganizationID, nil)
 		_            = coderdtest.AwaitTemplateVersionJobCompleted(t, adminClient, version.ID)
 		project      = coderdtest.CreateTemplate(t, adminClient, admin.OrganizationID, version.ID)
-		workspace    = coderdtest.CreateWorkspace(t, client, admin.OrganizationID, project.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+		workspace    = coderdtest.CreateWorkspace(t, client, project.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 			cwr.AutostartSchedule = nil
 			cwr.TTLMillis = nil
 			cwr.AutomaticUpdates = codersdk.AutomaticUpdatesNever
@@ -2335,7 +2736,7 @@ func TestWorkspaceWatcher(t *testing.T) {
 	})
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 	defer cancel()
@@ -2344,7 +2745,7 @@ func TestWorkspaceWatcher(t *testing.T) {
 	require.NoError(t, err)
 
 	// Wait events are easier to debug with timestamped logs.
-	logger := slogtest.Make(t, nil).Named(t.Name()).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t).Named(t.Name())
 	wait := func(event string, ready func(w codersdk.Workspace) bool) {
 		for {
 			select {
@@ -2494,7 +2895,7 @@ func TestWorkspaceResource(t *testing.T) {
 		})
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -2554,7 +2955,7 @@ func TestWorkspaceResource(t *testing.T) {
 		})
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -2628,7 +3029,7 @@ func TestWorkspaceResource(t *testing.T) {
 		})
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -2683,7 +3084,7 @@ func TestWorkspaceResource(t *testing.T) {
 		})
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -2761,9 +3162,9 @@ func TestWorkspaceWithRichParameters(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 	defer cancel()
 
-	firstParameterDescriptionPlaintext, err := parameter.Plaintext(firstParameterDescription)
+	firstParameterDescriptionPlaintext, err := render.PlaintextFromMarkdown(firstParameterDescription)
 	require.NoError(t, err)
-	secondParameterDescriptionPlaintext, err := parameter.Plaintext(secondParameterDescription)
+	secondParameterDescriptionPlaintext, err := render.PlaintextFromMarkdown(secondParameterDescription)
 	require.NoError(t, err)
 
 	templateRichParameters, err := client.TemplateVersionRichParameters(ctx, version.ID)
@@ -2787,7 +3188,7 @@ func TestWorkspaceWithRichParameters(t *testing.T) {
 	}
 
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 		cwr.RichParameterValues = expectedBuildParameters
 	})
 
@@ -2865,7 +3266,7 @@ func TestWorkspaceWithOptionalRichParameters(t *testing.T) {
 	require.Equal(t, secondParameterRequired, templateRichParameters[1].Required)
 
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 		cwr.RichParameterValues = []codersdk.WorkspaceBuildParameter{
 			// First parameter is optional, so coder will pick the default value.
 			{Name: secondParameterName, Value: secondParameterValue},
@@ -2945,7 +3346,7 @@ func TestWorkspaceWithEphemeralRichParameters(t *testing.T) {
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 
 	// Create workspace with default values
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	workspaceBuild := coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 	require.Equal(t, codersdk.WorkspaceStatusRunning, workspaceBuild.Status)
 
@@ -3031,7 +3432,7 @@ func TestWorkspaceDormant(t *testing.T) {
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID, func(ctr *codersdk.CreateTemplateRequest) {
 			ctr.TimeTilDormantAutoDeleteMillis = ptr.Ref[int64](timeTilDormantAutoDelete.Milliseconds())
 		})
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		_ = coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -3081,7 +3482,7 @@ func TestWorkspaceDormant(t *testing.T) {
 			version   = coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 			_         = coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 			template  = coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
-			workspace = coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+			workspace = coderdtest.CreateWorkspace(t, client, template.ID)
 			_         = coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 		)
 
@@ -3122,8 +3523,8 @@ func TestWorkspaceFavoriteUnfavorite(t *testing.T) {
 		owner                = coderdtest.CreateFirstUser(t, client)
 		memberClient, member = coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
 		// This will be our 'favorite' workspace
-		wsb1 = dbfake.WorkspaceBuild(t, db, database.Workspace{OwnerID: member.ID, OrganizationID: owner.OrganizationID}).Do()
-		wsb2 = dbfake.WorkspaceBuild(t, db, database.Workspace{OwnerID: owner.UserID, OrganizationID: owner.OrganizationID}).Do()
+		wsb1 = dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{OwnerID: member.ID, OrganizationID: owner.OrganizationID}).Do()
+		wsb2 = dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{OwnerID: owner.UserID, OrganizationID: owner.OrganizationID}).Do()
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
@@ -3191,4 +3592,354 @@ func TestWorkspaceFavoriteUnfavorite(t *testing.T) {
 	err = client.UnfavoriteWorkspace(ctx, wsb1.Workspace.ID)
 	require.ErrorAs(t, err, &sdkErr)
 	require.Equal(t, http.StatusForbidden, sdkErr.StatusCode())
+}
+
+func TestWorkspaceUsageTracking(t *testing.T) {
+	t.Parallel()
+	t.Run("NoExperiment", func(t *testing.T) {
+		t.Parallel()
+		client, db := coderdtest.NewWithDatabase(t, nil)
+		user := coderdtest.CreateFirstUser(t, client)
+		tmpDir := t.TempDir()
+		r := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
+			OrganizationID: user.OrganizationID,
+			OwnerID:        user.UserID,
+		}).WithAgent(func(agents []*proto.Agent) []*proto.Agent {
+			agents[0].Directory = tmpDir
+			return agents
+		}).Do()
+
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitMedium)
+		defer cancel()
+
+		// continue legacy behavior
+		err := client.PostWorkspaceUsage(ctx, r.Workspace.ID)
+		require.NoError(t, err)
+		err = client.PostWorkspaceUsageWithBody(ctx, r.Workspace.ID, codersdk.PostWorkspaceUsageRequest{})
+		require.NoError(t, err)
+	})
+	t.Run("Experiment", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitMedium)
+		defer cancel()
+		dv := coderdtest.DeploymentValues(t)
+		dv.Experiments = []string{string(codersdk.ExperimentWorkspaceUsage)}
+		client, db := coderdtest.NewWithDatabase(t, &coderdtest.Options{
+			DeploymentValues: dv,
+		})
+		user := coderdtest.CreateFirstUser(t, client)
+		tmpDir := t.TempDir()
+		org := dbgen.Organization(t, db, database.Organization{})
+		_ = dbgen.OrganizationMember(t, db, database.OrganizationMember{
+			UserID:         user.UserID,
+			OrganizationID: org.ID,
+		})
+		templateVersion := dbgen.TemplateVersion(t, db, database.TemplateVersion{
+			OrganizationID: org.ID,
+			CreatedBy:      user.UserID,
+		})
+		template := dbgen.Template(t, db, database.Template{
+			OrganizationID:  org.ID,
+			ActiveVersionID: templateVersion.ID,
+			CreatedBy:       user.UserID,
+			DefaultTTL:      int64(8 * time.Hour),
+		})
+		_, err := client.UpdateTemplateMeta(ctx, template.ID, codersdk.UpdateTemplateMeta{
+			ActivityBumpMillis: 8 * time.Hour.Milliseconds(),
+		})
+		require.NoError(t, err)
+		r := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
+			OrganizationID: user.OrganizationID,
+			OwnerID:        user.UserID,
+			TemplateID:     template.ID,
+			Ttl:            sql.NullInt64{Valid: true, Int64: int64(8 * time.Hour)},
+		}).WithAgent(func(agents []*proto.Agent) []*proto.Agent {
+			agents[0].Directory = tmpDir
+			return agents
+		}).Do()
+
+		// continue legacy behavior
+		err = client.PostWorkspaceUsage(ctx, r.Workspace.ID)
+		require.NoError(t, err)
+		err = client.PostWorkspaceUsageWithBody(ctx, r.Workspace.ID, codersdk.PostWorkspaceUsageRequest{})
+		require.NoError(t, err)
+
+		workspace, err := client.Workspace(ctx, r.Workspace.ID)
+		require.NoError(t, err)
+
+		// only agent id fails
+		err = client.PostWorkspaceUsageWithBody(ctx, r.Workspace.ID, codersdk.PostWorkspaceUsageRequest{
+			AgentID: workspace.LatestBuild.Resources[0].Agents[0].ID,
+		})
+		require.ErrorContains(t, err, "agent_id")
+		// only app name fails
+		err = client.PostWorkspaceUsageWithBody(ctx, r.Workspace.ID, codersdk.PostWorkspaceUsageRequest{
+			AppName: "ssh",
+		})
+		require.ErrorContains(t, err, "app_name")
+		// unknown app name fails
+		err = client.PostWorkspaceUsageWithBody(ctx, r.Workspace.ID, codersdk.PostWorkspaceUsageRequest{
+			AgentID: workspace.LatestBuild.Resources[0].Agents[0].ID,
+			AppName: "unknown",
+		})
+		require.ErrorContains(t, err, "app_name")
+
+		// vscode works
+		err = client.PostWorkspaceUsageWithBody(ctx, r.Workspace.ID, codersdk.PostWorkspaceUsageRequest{
+			AgentID: workspace.LatestBuild.Resources[0].Agents[0].ID,
+			AppName: "vscode",
+		})
+		require.NoError(t, err)
+		// jetbrains works
+		err = client.PostWorkspaceUsageWithBody(ctx, r.Workspace.ID, codersdk.PostWorkspaceUsageRequest{
+			AgentID: workspace.LatestBuild.Resources[0].Agents[0].ID,
+			AppName: "jetbrains",
+		})
+		require.NoError(t, err)
+		// reconnecting-pty works
+		err = client.PostWorkspaceUsageWithBody(ctx, r.Workspace.ID, codersdk.PostWorkspaceUsageRequest{
+			AgentID: workspace.LatestBuild.Resources[0].Agents[0].ID,
+			AppName: "reconnecting-pty",
+		})
+		require.NoError(t, err)
+		// ssh works
+		err = client.PostWorkspaceUsageWithBody(ctx, r.Workspace.ID, codersdk.PostWorkspaceUsageRequest{
+			AgentID: workspace.LatestBuild.Resources[0].Agents[0].ID,
+			AppName: "ssh",
+		})
+		require.NoError(t, err)
+
+		// ensure deadline has been bumped
+		newWorkspace, err := client.Workspace(ctx, r.Workspace.ID)
+		require.NoError(t, err)
+		require.True(t, workspace.LatestBuild.Deadline.Valid)
+		require.True(t, newWorkspace.LatestBuild.Deadline.Valid)
+		require.Greater(t, newWorkspace.LatestBuild.Deadline.Time, workspace.LatestBuild.Deadline.Time)
+	})
+}
+
+func TestWorkspaceNotifications(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Dormant", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("InitiatorNotOwner", func(t *testing.T) {
+			t.Parallel()
+
+			// Given
+			var (
+				notifyEnq = &notificationstest.FakeEnqueuer{}
+				client    = coderdtest.New(t, &coderdtest.Options{
+					IncludeProvisionerDaemon: true,
+					NotificationsEnqueuer:    notifyEnq,
+				})
+				user            = coderdtest.CreateFirstUser(t, client)
+				memberClient, _ = coderdtest.CreateAnotherUser(t, client, user.OrganizationID, rbac.RoleOwner())
+				version         = coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
+				_               = coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+				template        = coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
+				workspace       = coderdtest.CreateWorkspace(t, client, template.ID)
+				_               = coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
+			)
+
+			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+			t.Cleanup(cancel)
+
+			// When
+			err := memberClient.UpdateWorkspaceDormancy(ctx, workspace.ID, codersdk.UpdateWorkspaceDormancy{
+				Dormant: true,
+			})
+
+			// Then
+			require.NoError(t, err, "mark workspace as dormant")
+			sent := notifyEnq.Sent(notificationstest.WithTemplateID(notifications.TemplateWorkspaceDormant))
+			require.Len(t, sent, 1)
+			require.Equal(t, sent[0].TemplateID, notifications.TemplateWorkspaceDormant)
+			require.Equal(t, sent[0].UserID, workspace.OwnerID)
+			require.Contains(t, sent[0].Targets, template.ID)
+			require.Contains(t, sent[0].Targets, workspace.ID)
+			require.Contains(t, sent[0].Targets, workspace.OrganizationID)
+			require.Contains(t, sent[0].Targets, workspace.OwnerID)
+		})
+
+		t.Run("InitiatorIsOwner", func(t *testing.T) {
+			t.Parallel()
+
+			// Given
+			var (
+				notifyEnq = &notificationstest.FakeEnqueuer{}
+				client    = coderdtest.New(t, &coderdtest.Options{
+					IncludeProvisionerDaemon: true,
+					NotificationsEnqueuer:    notifyEnq,
+				})
+				user      = coderdtest.CreateFirstUser(t, client)
+				version   = coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
+				_         = coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+				template  = coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
+				workspace = coderdtest.CreateWorkspace(t, client, template.ID)
+				_         = coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
+			)
+
+			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+			t.Cleanup(cancel)
+
+			// When
+			err := client.UpdateWorkspaceDormancy(ctx, workspace.ID, codersdk.UpdateWorkspaceDormancy{
+				Dormant: true,
+			})
+
+			// Then
+			require.NoError(t, err, "mark workspace as dormant")
+			require.Len(t, notifyEnq.Sent(notificationstest.WithTemplateID(notifications.TemplateWorkspaceDormant)), 0)
+		})
+
+		t.Run("ActivateDormantWorkspace", func(t *testing.T) {
+			t.Parallel()
+
+			// Given
+			var (
+				notifyEnq = &notificationstest.FakeEnqueuer{}
+				client    = coderdtest.New(t, &coderdtest.Options{
+					IncludeProvisionerDaemon: true,
+					NotificationsEnqueuer:    notifyEnq,
+				})
+				user      = coderdtest.CreateFirstUser(t, client)
+				version   = coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
+				_         = coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+				template  = coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
+				workspace = coderdtest.CreateWorkspace(t, client, template.ID)
+				_         = coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
+			)
+
+			// When
+			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+			t.Cleanup(cancel)
+
+			// Make workspace dormant before activate it
+			err := client.UpdateWorkspaceDormancy(ctx, workspace.ID, codersdk.UpdateWorkspaceDormancy{
+				Dormant: true,
+			})
+			require.NoError(t, err, "mark workspace as dormant")
+			// Clear notifications before activating the workspace
+			notifyEnq.Clear()
+
+			// Then
+			err = client.UpdateWorkspaceDormancy(ctx, workspace.ID, codersdk.UpdateWorkspaceDormancy{
+				Dormant: false,
+			})
+			require.NoError(t, err, "mark workspace as active")
+			require.Len(t, notifyEnq.Sent(), 0)
+		})
+	})
+}
+
+func TestWorkspaceTimings(t *testing.T) {
+	t.Parallel()
+
+	db, pubsub := dbtestutil.NewDB(t)
+	client := coderdtest.New(t, &coderdtest.Options{
+		Database: db,
+		Pubsub:   pubsub,
+	})
+	coderdtest.CreateFirstUser(t, client)
+
+	t.Run("LatestBuild", func(t *testing.T) {
+		t.Parallel()
+
+		// Given: a workspace with many builds, provisioner, and agent script timings
+		db, pubsub := dbtestutil.NewDB(t)
+		client := coderdtest.New(t, &coderdtest.Options{
+			Database: db,
+			Pubsub:   pubsub,
+		})
+		owner := coderdtest.CreateFirstUser(t, client)
+		file := dbgen.File(t, db, database.File{
+			CreatedBy: owner.UserID,
+		})
+		versionJob := dbgen.ProvisionerJob(t, db, pubsub, database.ProvisionerJob{
+			OrganizationID: owner.OrganizationID,
+			InitiatorID:    owner.UserID,
+			FileID:         file.ID,
+			Tags: database.StringMap{
+				"custom": "true",
+			},
+		})
+		version := dbgen.TemplateVersion(t, db, database.TemplateVersion{
+			OrganizationID: owner.OrganizationID,
+			JobID:          versionJob.ID,
+			CreatedBy:      owner.UserID,
+		})
+		template := dbgen.Template(t, db, database.Template{
+			OrganizationID:  owner.OrganizationID,
+			ActiveVersionID: version.ID,
+			CreatedBy:       owner.UserID,
+		})
+		ws := dbgen.Workspace(t, db, database.WorkspaceTable{
+			OwnerID:        owner.UserID,
+			OrganizationID: owner.OrganizationID,
+			TemplateID:     template.ID,
+		})
+
+		// Create multiple builds
+		var buildNumber int32
+		makeBuild := func() database.WorkspaceBuild {
+			buildNumber++
+			jobID := uuid.New()
+			job := dbgen.ProvisionerJob(t, db, pubsub, database.ProvisionerJob{
+				ID:             jobID,
+				OrganizationID: owner.OrganizationID,
+				Tags:           database.StringMap{jobID.String(): "true"},
+			})
+			return dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+				WorkspaceID:       ws.ID,
+				TemplateVersionID: version.ID,
+				InitiatorID:       owner.UserID,
+				JobID:             job.ID,
+				BuildNumber:       buildNumber,
+			})
+		}
+		makeBuild()
+		makeBuild()
+		latestBuild := makeBuild()
+
+		// Add provisioner timings
+		dbgen.ProvisionerJobTimings(t, db, latestBuild, 5)
+
+		// Add agent script timings
+		resource := dbgen.WorkspaceResource(t, db, database.WorkspaceResource{
+			JobID: latestBuild.JobID,
+		})
+		agent := dbgen.WorkspaceAgent(t, db, database.WorkspaceAgent{
+			ResourceID: resource.ID,
+		})
+		scripts := dbgen.WorkspaceAgentScripts(t, db, 3, database.WorkspaceAgentScript{
+			WorkspaceAgentID: agent.ID,
+		})
+		dbgen.WorkspaceAgentScriptTimings(t, db, scripts)
+
+		// When: fetching the timings
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+		t.Cleanup(cancel)
+		res, err := client.WorkspaceTimings(ctx, ws.ID)
+
+		// Then: expect the timings to be returned
+		require.NoError(t, err)
+		require.Len(t, res.ProvisionerTimings, 5)
+		require.Len(t, res.AgentScriptTimings, 3)
+	})
+
+	t.Run("NonExistentWorkspace", func(t *testing.T) {
+		t.Parallel()
+
+		// When: fetching an inexistent workspace
+		workspaceID := uuid.New()
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+		t.Cleanup(cancel)
+		_, err := client.WorkspaceTimings(ctx, workspaceID)
+
+		// Then: expect a not found error
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "not found")
+	})
 }

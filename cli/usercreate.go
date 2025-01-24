@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
 	"golang.org/x/xerrors"
 
 	"github.com/coder/pretty"
@@ -19,9 +20,11 @@ func (r *RootCmd) userCreate() *serpent.Command {
 	var (
 		email        string
 		username     string
+		name         string
 		password     string
 		disableLogin bool
 		loginType    string
+		orgContext   = NewOrganizationContext()
 	)
 	client := new(codersdk.Client)
 	cmd := &serpent.Command{
@@ -31,13 +34,23 @@ func (r *RootCmd) userCreate() *serpent.Command {
 			r.InitClient(client),
 		),
 		Handler: func(inv *serpent.Invocation) error {
-			organization, err := CurrentOrganization(r, inv, client)
+			organization, err := orgContext.Selected(inv, client)
 			if err != nil {
 				return err
 			}
+			// We only prompt for the full name if both username and email have not
+			// been set. This is to avoid breaking existing non-interactive usage.
+			shouldPromptName := username == "" && email == ""
 			if username == "" {
 				username, err = cliui.Prompt(inv, cliui.PromptOptions{
 					Text: "Username:",
+					Validate: func(username string) error {
+						err = codersdk.NameValid(username)
+						if err != nil {
+							return xerrors.Errorf("username %q is invalid: %w", username, err)
+						}
+						return nil
+					},
 				})
 				if err != nil {
 					return err
@@ -58,6 +71,18 @@ func (r *RootCmd) userCreate() *serpent.Command {
 					return err
 				}
 			}
+			if name == "" && shouldPromptName {
+				rawName, err := cliui.Prompt(inv, cliui.PromptOptions{
+					Text: "Full name (optional):",
+				})
+				if err != nil {
+					return err
+				}
+				name = codersdk.NormalizeRealUsername(rawName)
+				if !strings.EqualFold(rawName, name) {
+					cliui.Warnf(inv.Stderr, "Normalized name to %q", name)
+				}
+			}
 			userLoginType := codersdk.LoginTypePassword
 			if disableLogin && loginType != "" {
 				return xerrors.New("You cannot specify both --disable-login and --login-type")
@@ -76,12 +101,13 @@ func (r *RootCmd) userCreate() *serpent.Command {
 				}
 			}
 
-			_, err = client.CreateUser(inv.Context(), codersdk.CreateUserRequest{
-				Email:          email,
-				Username:       username,
-				Password:       password,
-				OrganizationID: organization.ID,
-				UserLoginType:  userLoginType,
+			_, err = client.CreateUserWithOrgs(inv.Context(), codersdk.CreateUserRequestWithOrgs{
+				Email:           email,
+				Username:        username,
+				Name:            name,
+				Password:        password,
+				OrganizationIDs: []uuid.UUID{organization.ID},
+				UserLoginType:   userLoginType,
 			})
 			if err != nil {
 				return err
@@ -125,7 +151,22 @@ Create a workspace  `+pretty.Sprint(cliui.DefaultStyles.Code, "coder create")+`!
 			Flag:          "username",
 			FlagShorthand: "u",
 			Description:   "Specifies a username for the new user.",
-			Value:         serpent.StringOf(&username),
+			Value: serpent.Validate(serpent.StringOf(&username), func(_username *serpent.String) error {
+				username := _username.String()
+				if username != "" {
+					err := codersdk.NameValid(username)
+					if err != nil {
+						return xerrors.Errorf("username %q is invalid: %w", username, err)
+					}
+				}
+				return nil
+			}),
+		},
+		{
+			Flag:          "full-name",
+			FlagShorthand: "n",
+			Description:   "Specifies an optional human-readable name for the new user.",
+			Value:         serpent.StringOf(&name),
 		},
 		{
 			Flag:          "password",
@@ -151,5 +192,7 @@ Create a workspace  `+pretty.Sprint(cliui.DefaultStyles.Code, "coder create")+`!
 			Value: serpent.StringOf(&loginType),
 		},
 	}
+
+	orgContext.AttachOptions(cmd)
 	return cmd
 }
