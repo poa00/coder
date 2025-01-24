@@ -1,6 +1,6 @@
 {
   "format_version": "1.2",
-  "terraform_version": "1.5.5",
+  "terraform_version": "1.9.8",
   "planned_values": {
     "root_module": {
       "resources": [
@@ -20,6 +20,7 @@
             "login_before_ready": true,
             "metadata": [],
             "motd_file": null,
+            "order": null,
             "os": "windows",
             "shutdown_script": null,
             "shutdown_script_timeout": 300,
@@ -29,7 +30,9 @@
             "troubleshooting_url": null
           },
           "sensitive_values": {
-            "metadata": []
+            "display_apps": [],
+            "metadata": [],
+            "token": true
           }
         },
         {
@@ -68,6 +71,7 @@
           "login_before_ready": true,
           "metadata": [],
           "motd_file": null,
+          "order": null,
           "os": "windows",
           "shutdown_script": null,
           "shutdown_script_timeout": 300,
@@ -77,6 +81,7 @@
           "troubleshooting_url": null
         },
         "after_unknown": {
+          "display_apps": true,
           "id": true,
           "init_script": true,
           "metadata": [],
@@ -84,6 +89,7 @@
         },
         "before_sensitive": false,
         "after_sensitive": {
+          "display_apps": [],
           "metadata": [],
           "token": true
         }
@@ -113,7 +119,7 @@
   ],
   "prior_state": {
     "format_version": "1.0",
-    "terraform_version": "1.5.5",
+    "terraform_version": "1.9.8",
     "values": {
       "root_module": {
         "resources": [
@@ -130,7 +136,7 @@
               "display_name": null,
               "ephemeral": true,
               "icon": null,
-              "id": "858cb978-eef0-47e6-b7b8-7f9093303ad9",
+              "id": "df8ad066-047d-434d-baa3-e19517ee7395",
               "mutable": true,
               "name": "number_example",
               "option": null,
@@ -157,7 +163,7 @@
               "display_name": null,
               "ephemeral": false,
               "icon": null,
-              "id": "0add04ee-5c08-4702-b32e-727fc8c3fcd7",
+              "id": "7d9658aa-ff69-477a-9063-e9fd49fd9a9b",
               "mutable": false,
               "name": "number_example_max",
               "option": null,
@@ -196,7 +202,7 @@
               "display_name": null,
               "ephemeral": false,
               "icon": null,
-              "id": "90bc3085-b65d-496a-b52c-2a6bfda1c439",
+              "id": "bd6fcaac-db7f-4c4d-a664-fe7f47fad28a",
               "mutable": false,
               "name": "number_example_max_zero",
               "option": null,
@@ -235,7 +241,7 @@
               "display_name": null,
               "ephemeral": false,
               "icon": null,
-              "id": "2499264c-7fa4-41da-9c78-6b5c86ddfd9c",
+              "id": "8d42942d-5a10-43c9-a31d-d3fe9a7814e8",
               "mutable": false,
               "name": "number_example_min",
               "option": null,
@@ -274,7 +280,7 @@
               "display_name": null,
               "ephemeral": false,
               "icon": null,
-              "id": "dd6c2f30-6320-4e4a-ba82-deef628330f1",
+              "id": "695301d0-8325-4685-824d-1ca9591689e3",
               "mutable": false,
               "name": "number_example_min_max",
               "option": null,
@@ -313,7 +319,7 @@
               "display_name": null,
               "ephemeral": false,
               "icon": null,
-              "id": "8e04ddc9-c245-408d-92b0-dec669259b4a",
+              "id": "cd921934-d1b1-4370-8a73-2d43658ea877",
               "mutable": false,
               "name": "number_example_min_zero",
               "option": null,
@@ -348,7 +354,7 @@
       "coder": {
         "name": "coder",
         "full_name": "registry.terraform.io/coder/coder",
-        "version_constraint": "0.11.0"
+        "version_constraint": "0.22.0"
       },
       "null": {
         "name": "null",
@@ -545,5 +551,8 @@
       ]
     }
   },
-  "timestamp": "2023-08-30T19:25:35Z"
+  "timestamp": "2024-10-28T20:08:18Z",
+  "applyable": true,
+  "complete": true,
+  "errored": false
 }

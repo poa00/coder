@@ -1,59 +1,76 @@
-import PauseIcon from "@mui/icons-material/PauseOutlined";
 import type { Meta, StoryObj } from "@storybook/react";
-import { Avatar, AvatarIcon } from "./Avatar";
+import { Avatar } from "./Avatar";
 
 const meta: Meta<typeof Avatar> = {
-  title: "components/Avatar",
-  component: Avatar,
+	title: "components/Avatar",
+	component: Avatar,
+	args: {
+		src: "https://github.com/kylecarbs.png",
+	},
 };
 
 export default meta;
 type Story = StoryObj<typeof Avatar>;
 
-export const WithLetter: Story = {
-  args: {
-    children: "Coder",
-  },
+export const ImageLgSize: Story = {
+	args: { size: "lg" },
 };
 
-export const WithLetterXL = {
-  args: {
-    children: "Coder",
-    size: "xl",
-  },
+export const ImageMdSize: Story = {};
+
+export const ImageSmSize: Story = {
+	args: { size: "sm" },
 };
 
-export const WithImage = {
-  args: {
-    src: "https://avatars.githubusercontent.com/u/95932066?s=200&v=4",
-  },
+export const IconLgSize: Story = {
+	args: {
+		size: "lg",
+		variant: "icon",
+		src: "https://em-content.zobj.net/source/apple/391/billed-cap_1f9e2.png",
+	},
 };
 
-export const WithImageXL = {
-  args: {
-    src: "https://avatars.githubusercontent.com/u/95932066?s=200&v=4",
-    size: "xl",
-  },
+export const IconMdSize: Story = {
+	args: {
+		variant: "icon",
+		src: "https://em-content.zobj.net/source/apple/391/billed-cap_1f9e2.png",
+	},
 };
 
-export const WithMuiIcon = {
-  args: {
-    background: true,
-    children: <PauseIcon />,
-  },
+export const IconSmSize: Story = {
+	args: {
+		variant: "icon",
+		size: "sm",
+		src: "https://em-content.zobj.net/source/apple/391/billed-cap_1f9e2.png",
+	},
 };
 
-export const WithMuiIconXL = {
-  args: {
-    background: true,
-    children: <PauseIcon />,
-    size: "xl",
-  },
+export const NonSquaredIcon: Story = {
+	args: {
+		variant: "icon",
+		src: "/icon/docker.png",
+	},
 };
 
-export const WithAvatarIcon = {
-  args: {
-    background: true,
-    children: <AvatarIcon src="/icon/database.svg" alt="Database" />,
-  },
+export const FallbackLgSize: Story = {
+	args: {
+		src: "",
+		size: "lg",
+		fallback: "Adriana Rodrigues",
+	},
+};
+
+export const FallbackMdSize: Story = {
+	args: {
+		src: "",
+		fallback: "Adriana Rodrigues",
+	},
+};
+
+export const FallbackSmSize: Story = {
+	args: {
+		src: "",
+		size: "sm",
+		fallback: "Adriana Rodrigues",
+	},
 };

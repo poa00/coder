@@ -89,9 +89,9 @@ func parseSwaggerComment(commentGroup *ast.CommentGroup) SwaggerComment {
 		failures:   []response{},
 	}
 	for _, line := range commentGroup.List {
-		// @<annotationName> [args...]
+		// "// @<annotationName> [args...]" -> []string{"//", "@<annotationName>", "args..."}
 		splitN := strings.SplitN(strings.TrimSpace(line.Text), " ", 3)
-		if len(splitN) < 2 {
+		if len(splitN) < 3 {
 			continue // comment prefix without any content
 		}
 
@@ -300,13 +300,20 @@ func assertPathParametersDefined(t *testing.T, comment SwaggerComment) {
 }
 
 func assertSecurityDefined(t *testing.T, comment SwaggerComment) {
+	authorizedSecurityTags := []string{
+		"CoderSessionToken",
+		"CoderProvisionerKey",
+	}
+
 	if comment.router == "/updatecheck" ||
 		comment.router == "/buildinfo" ||
 		comment.router == "/" ||
-		comment.router == "/users/login" {
+		comment.router == "/users/login" ||
+		comment.router == "/users/otp/request" ||
+		comment.router == "/users/otp/change-password" {
 		return // endpoints do not require authorization
 	}
-	assert.Equal(t, "CoderSessionToken", comment.security, "@Security must be equal CoderSessionToken")
+	assert.Containsf(t, authorizedSecurityTags, comment.security, "@Security must be either of these options: %v", authorizedSecurityTags)
 }
 
 func assertAccept(t *testing.T, comment SwaggerComment) {

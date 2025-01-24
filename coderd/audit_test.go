@@ -8,11 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/coderd/audit"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/codersdk"
 )
 
@@ -42,6 +45,55 @@ func TestAuditLogs(t *testing.T) {
 		require.Len(t, alogs.AuditLogs, 1)
 	})
 
+	t.Run("IncludeUser", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		client := coderdtest.New(t, nil)
+		user := coderdtest.CreateFirstUser(t, client)
+		client2, user2 := coderdtest.CreateAnotherUser(t, client, user.OrganizationID, rbac.RoleOwner())
+
+		err := client2.CreateTestAuditLog(ctx, codersdk.CreateTestAuditLogRequest{
+			ResourceID: user2.ID,
+		})
+		require.NoError(t, err)
+
+		alogs, err := client.AuditLogs(ctx, codersdk.AuditLogsRequest{
+			Pagination: codersdk.Pagination{
+				Limit: 1,
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, int64(1), alogs.Count)
+		require.Len(t, alogs.AuditLogs, 1)
+
+		// Make sure the returned user is fully populated.
+		foundUser, err := client.User(ctx, user2.ID.String())
+		foundUser.OrganizationIDs = []uuid.UUID{} // Not included.
+		require.NoError(t, err)
+		require.Equal(t, foundUser, *alogs.AuditLogs[0].User)
+
+		// Delete the user and try again.  This is a soft delete so nothing should
+		// change.  If users are hard deleted we should get nil, but there is no way
+		// to test this at the moment.
+		err = client.DeleteUser(ctx, user2.ID)
+		require.NoError(t, err)
+
+		alogs, err = client.AuditLogs(ctx, codersdk.AuditLogsRequest{
+			Pagination: codersdk.Pagination{
+				Limit: 1,
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, int64(1), alogs.Count)
+		require.Len(t, alogs.AuditLogs, 1)
+
+		foundUser, err = client.User(ctx, user2.ID.String())
+		foundUser.OrganizationIDs = []uuid.UUID{} // Not included.
+		require.NoError(t, err)
+		require.Equal(t, foundUser, *alogs.AuditLogs[0].User)
+	})
+
 	t.Run("WorkspaceBuildAuditLink", func(t *testing.T) {
 		t.Parallel()
 
@@ -54,7 +106,7 @@ func TestAuditLogs(t *testing.T) {
 		)
 
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		buildResourceInfo := audit.AdditionalFields{
@@ -84,6 +136,87 @@ func TestAuditLogs(t *testing.T) {
 		require.Equal(t, auditLogs.AuditLogs[0].ResourceLink, fmt.Sprintf("/@%s/%s/builds/%s",
 			workspace.OwnerName, workspace.Name, buildNumberString))
 	})
+
+	t.Run("Organization", func(t *testing.T) {
+		t.Parallel()
+
+		logger := slogtest.Make(t, &slogtest.Options{
+			IgnoreErrors: true,
+		})
+		ctx := context.Background()
+		client := coderdtest.New(t, &coderdtest.Options{
+			Logger: &logger,
+		})
+		owner := coderdtest.CreateFirstUser(t, client)
+		orgAdmin, _ := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID, rbac.ScopedRoleOrgAdmin(owner.OrganizationID))
+
+		err := client.CreateTestAuditLog(ctx, codersdk.CreateTestAuditLogRequest{
+			ResourceID:     owner.UserID,
+			OrganizationID: owner.OrganizationID,
+		})
+		require.NoError(t, err)
+
+		// Add an extra audit log in another organization
+		err = client.CreateTestAuditLog(ctx, codersdk.CreateTestAuditLogRequest{
+			ResourceID: owner.UserID,
+		})
+		require.NoError(t, err)
+
+		// Fetching audit logs without an organization selector should only
+		// return organization audit logs the org admin is an admin of.
+		alogs, err := orgAdmin.AuditLogs(ctx, codersdk.AuditLogsRequest{
+			Pagination: codersdk.Pagination{
+				Limit: 5,
+			},
+		})
+		require.NoError(t, err)
+		require.Len(t, alogs.AuditLogs, 1)
+
+		// Using the organization selector allows the org admin to fetch audit logs
+		alogs, err = orgAdmin.AuditLogs(ctx, codersdk.AuditLogsRequest{
+			SearchQuery: fmt.Sprintf("organization:%s", owner.OrganizationID.String()),
+			Pagination: codersdk.Pagination{
+				Limit: 5,
+			},
+		})
+		require.NoError(t, err)
+		require.Len(t, alogs.AuditLogs, 1)
+
+		// Also try fetching by organization name
+		organization, err := orgAdmin.Organization(ctx, owner.OrganizationID)
+		require.NoError(t, err)
+
+		alogs, err = orgAdmin.AuditLogs(ctx, codersdk.AuditLogsRequest{
+			SearchQuery: fmt.Sprintf("organization:%s", organization.Name),
+			Pagination: codersdk.Pagination{
+				Limit: 5,
+			},
+		})
+		require.NoError(t, err)
+		require.Len(t, alogs.AuditLogs, 1)
+	})
+
+	t.Run("Organization404", func(t *testing.T) {
+		t.Parallel()
+
+		logger := slogtest.Make(t, &slogtest.Options{
+			IgnoreErrors: true,
+		})
+		ctx := context.Background()
+		client := coderdtest.New(t, &coderdtest.Options{
+			Logger: &logger,
+		})
+		owner := coderdtest.CreateFirstUser(t, client)
+		orgAdmin, _ := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID, rbac.ScopedRoleOrgAdmin(owner.OrganizationID))
+
+		_, err := orgAdmin.AuditLogs(ctx, codersdk.AuditLogsRequest{
+			SearchQuery: fmt.Sprintf("organization:%s", "random-name"),
+			Pagination: codersdk.Pagination{
+				Limit: 5,
+			},
+		})
+		require.Error(t, err)
+	})
 }
 
 func TestAuditLogsFilter(t *testing.T) {
@@ -101,7 +234,7 @@ func TestAuditLogsFilter(t *testing.T) {
 		)
 
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 
 		// Create two logs with "Create"
 		err := client.CreateTestAuditLog(ctx, codersdk.CreateTestAuditLogRequest{
@@ -242,9 +375,6 @@ func TestAuditLogsFilter(t *testing.T) {
 				t.Parallel()
 				auditLogs, err := client.AuditLogs(ctx, codersdk.AuditLogsRequest{
 					SearchQuery: testCase.SearchQuery,
-					Pagination: codersdk.Pagination{
-						Limit: 25,
-					},
 				})
 				if testCase.ExpectedError {
 					require.Error(t, err, "expected error")

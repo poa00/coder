@@ -138,14 +138,15 @@ func AllAppSharingLevelValues() []AppSharingLevel {
 type AuditAction string
 
 const (
-	AuditActionCreate   AuditAction = "create"
-	AuditActionWrite    AuditAction = "write"
-	AuditActionDelete   AuditAction = "delete"
-	AuditActionStart    AuditAction = "start"
-	AuditActionStop     AuditAction = "stop"
-	AuditActionLogin    AuditAction = "login"
-	AuditActionLogout   AuditAction = "logout"
-	AuditActionRegister AuditAction = "register"
+	AuditActionCreate               AuditAction = "create"
+	AuditActionWrite                AuditAction = "write"
+	AuditActionDelete               AuditAction = "delete"
+	AuditActionStart                AuditAction = "start"
+	AuditActionStop                 AuditAction = "stop"
+	AuditActionLogin                AuditAction = "login"
+	AuditActionLogout               AuditAction = "logout"
+	AuditActionRegister             AuditAction = "register"
+	AuditActionRequestPasswordReset AuditAction = "request_password_reset"
 )
 
 func (e *AuditAction) Scan(src interface{}) error {
@@ -192,7 +193,8 @@ func (e AuditAction) Valid() bool {
 		AuditActionStop,
 		AuditActionLogin,
 		AuditActionLogout,
-		AuditActionRegister:
+		AuditActionRegister,
+		AuditActionRequestPasswordReset:
 		return true
 	}
 	return false
@@ -208,6 +210,7 @@ func AllAuditActionValues() []AuditAction {
 		AuditActionLogin,
 		AuditActionLogout,
 		AuditActionRegister,
+		AuditActionRequestPasswordReset,
 	}
 }
 
@@ -336,6 +339,70 @@ func AllBuildReasonValues() []BuildReason {
 		BuildReasonDormancy,
 		BuildReasonFailedstop,
 		BuildReasonAutodelete,
+	}
+}
+
+type CryptoKeyFeature string
+
+const (
+	CryptoKeyFeatureWorkspaceAppsToken  CryptoKeyFeature = "workspace_apps_token"
+	CryptoKeyFeatureWorkspaceAppsAPIKey CryptoKeyFeature = "workspace_apps_api_key"
+	CryptoKeyFeatureOIDCConvert         CryptoKeyFeature = "oidc_convert"
+	CryptoKeyFeatureTailnetResume       CryptoKeyFeature = "tailnet_resume"
+)
+
+func (e *CryptoKeyFeature) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = CryptoKeyFeature(s)
+	case string:
+		*e = CryptoKeyFeature(s)
+	default:
+		return fmt.Errorf("unsupported scan type for CryptoKeyFeature: %T", src)
+	}
+	return nil
+}
+
+type NullCryptoKeyFeature struct {
+	CryptoKeyFeature CryptoKeyFeature `json:"crypto_key_feature"`
+	Valid            bool             `json:"valid"` // Valid is true if CryptoKeyFeature is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullCryptoKeyFeature) Scan(value interface{}) error {
+	if value == nil {
+		ns.CryptoKeyFeature, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.CryptoKeyFeature.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullCryptoKeyFeature) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.CryptoKeyFeature), nil
+}
+
+func (e CryptoKeyFeature) Valid() bool {
+	switch e {
+	case CryptoKeyFeatureWorkspaceAppsToken,
+		CryptoKeyFeatureWorkspaceAppsAPIKey,
+		CryptoKeyFeatureOIDCConvert,
+		CryptoKeyFeatureTailnetResume:
+		return true
+	}
+	return false
+}
+
+func AllCryptoKeyFeatureValues() []CryptoKeyFeature {
+	return []CryptoKeyFeature{
+		CryptoKeyFeatureWorkspaceAppsToken,
+		CryptoKeyFeatureWorkspaceAppsAPIKey,
+		CryptoKeyFeatureOIDCConvert,
+		CryptoKeyFeatureTailnetResume,
 	}
 }
 
@@ -660,6 +727,192 @@ func AllLoginTypeValues() []LoginType {
 	}
 }
 
+type NotificationMessageStatus string
+
+const (
+	NotificationMessageStatusPending          NotificationMessageStatus = "pending"
+	NotificationMessageStatusLeased           NotificationMessageStatus = "leased"
+	NotificationMessageStatusSent             NotificationMessageStatus = "sent"
+	NotificationMessageStatusPermanentFailure NotificationMessageStatus = "permanent_failure"
+	NotificationMessageStatusTemporaryFailure NotificationMessageStatus = "temporary_failure"
+	NotificationMessageStatusUnknown          NotificationMessageStatus = "unknown"
+	NotificationMessageStatusInhibited        NotificationMessageStatus = "inhibited"
+)
+
+func (e *NotificationMessageStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = NotificationMessageStatus(s)
+	case string:
+		*e = NotificationMessageStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for NotificationMessageStatus: %T", src)
+	}
+	return nil
+}
+
+type NullNotificationMessageStatus struct {
+	NotificationMessageStatus NotificationMessageStatus `json:"notification_message_status"`
+	Valid                     bool                      `json:"valid"` // Valid is true if NotificationMessageStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullNotificationMessageStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.NotificationMessageStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.NotificationMessageStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullNotificationMessageStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.NotificationMessageStatus), nil
+}
+
+func (e NotificationMessageStatus) Valid() bool {
+	switch e {
+	case NotificationMessageStatusPending,
+		NotificationMessageStatusLeased,
+		NotificationMessageStatusSent,
+		NotificationMessageStatusPermanentFailure,
+		NotificationMessageStatusTemporaryFailure,
+		NotificationMessageStatusUnknown,
+		NotificationMessageStatusInhibited:
+		return true
+	}
+	return false
+}
+
+func AllNotificationMessageStatusValues() []NotificationMessageStatus {
+	return []NotificationMessageStatus{
+		NotificationMessageStatusPending,
+		NotificationMessageStatusLeased,
+		NotificationMessageStatusSent,
+		NotificationMessageStatusPermanentFailure,
+		NotificationMessageStatusTemporaryFailure,
+		NotificationMessageStatusUnknown,
+		NotificationMessageStatusInhibited,
+	}
+}
+
+type NotificationMethod string
+
+const (
+	NotificationMethodSmtp    NotificationMethod = "smtp"
+	NotificationMethodWebhook NotificationMethod = "webhook"
+)
+
+func (e *NotificationMethod) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = NotificationMethod(s)
+	case string:
+		*e = NotificationMethod(s)
+	default:
+		return fmt.Errorf("unsupported scan type for NotificationMethod: %T", src)
+	}
+	return nil
+}
+
+type NullNotificationMethod struct {
+	NotificationMethod NotificationMethod `json:"notification_method"`
+	Valid              bool               `json:"valid"` // Valid is true if NotificationMethod is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullNotificationMethod) Scan(value interface{}) error {
+	if value == nil {
+		ns.NotificationMethod, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.NotificationMethod.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullNotificationMethod) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.NotificationMethod), nil
+}
+
+func (e NotificationMethod) Valid() bool {
+	switch e {
+	case NotificationMethodSmtp,
+		NotificationMethodWebhook:
+		return true
+	}
+	return false
+}
+
+func AllNotificationMethodValues() []NotificationMethod {
+	return []NotificationMethod{
+		NotificationMethodSmtp,
+		NotificationMethodWebhook,
+	}
+}
+
+type NotificationTemplateKind string
+
+const (
+	NotificationTemplateKindSystem NotificationTemplateKind = "system"
+)
+
+func (e *NotificationTemplateKind) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = NotificationTemplateKind(s)
+	case string:
+		*e = NotificationTemplateKind(s)
+	default:
+		return fmt.Errorf("unsupported scan type for NotificationTemplateKind: %T", src)
+	}
+	return nil
+}
+
+type NullNotificationTemplateKind struct {
+	NotificationTemplateKind NotificationTemplateKind `json:"notification_template_kind"`
+	Valid                    bool                     `json:"valid"` // Valid is true if NotificationTemplateKind is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullNotificationTemplateKind) Scan(value interface{}) error {
+	if value == nil {
+		ns.NotificationTemplateKind, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.NotificationTemplateKind.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullNotificationTemplateKind) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.NotificationTemplateKind), nil
+}
+
+func (e NotificationTemplateKind) Valid() bool {
+	switch e {
+	case NotificationTemplateKindSystem:
+		return true
+	}
+	return false
+}
+
+func AllNotificationTemplateKindValues() []NotificationTemplateKind {
+	return []NotificationTemplateKind{
+		NotificationTemplateKindSystem,
+	}
+}
+
 type ParameterDestinationScheme string
 
 const (
@@ -956,6 +1209,68 @@ func AllPortShareProtocolValues() []PortShareProtocol {
 	}
 }
 
+// The status of a provisioner daemon.
+type ProvisionerDaemonStatus string
+
+const (
+	ProvisionerDaemonStatusOffline ProvisionerDaemonStatus = "offline"
+	ProvisionerDaemonStatusIdle    ProvisionerDaemonStatus = "idle"
+	ProvisionerDaemonStatusBusy    ProvisionerDaemonStatus = "busy"
+)
+
+func (e *ProvisionerDaemonStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = ProvisionerDaemonStatus(s)
+	case string:
+		*e = ProvisionerDaemonStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for ProvisionerDaemonStatus: %T", src)
+	}
+	return nil
+}
+
+type NullProvisionerDaemonStatus struct {
+	ProvisionerDaemonStatus ProvisionerDaemonStatus `json:"provisioner_daemon_status"`
+	Valid                   bool                    `json:"valid"` // Valid is true if ProvisionerDaemonStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullProvisionerDaemonStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.ProvisionerDaemonStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.ProvisionerDaemonStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullProvisionerDaemonStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.ProvisionerDaemonStatus), nil
+}
+
+func (e ProvisionerDaemonStatus) Valid() bool {
+	switch e {
+	case ProvisionerDaemonStatusOffline,
+		ProvisionerDaemonStatusIdle,
+		ProvisionerDaemonStatusBusy:
+		return true
+	}
+	return false
+}
+
+func AllProvisionerDaemonStatusValues() []ProvisionerDaemonStatus {
+	return []ProvisionerDaemonStatus{
+		ProvisionerDaemonStatusOffline,
+		ProvisionerDaemonStatusIdle,
+		ProvisionerDaemonStatusBusy,
+	}
+}
+
 // Computed status of a provisioner job. Jobs could be stuck in a hung state, these states do not guarantee any transition to another state.
 type ProvisionerJobStatus string
 
@@ -1027,6 +1342,70 @@ func AllProvisionerJobStatusValues() []ProvisionerJobStatus {
 		ProvisionerJobStatusCanceled,
 		ProvisionerJobStatusFailed,
 		ProvisionerJobStatusUnknown,
+	}
+}
+
+type ProvisionerJobTimingStage string
+
+const (
+	ProvisionerJobTimingStageInit  ProvisionerJobTimingStage = "init"
+	ProvisionerJobTimingStagePlan  ProvisionerJobTimingStage = "plan"
+	ProvisionerJobTimingStageGraph ProvisionerJobTimingStage = "graph"
+	ProvisionerJobTimingStageApply ProvisionerJobTimingStage = "apply"
+)
+
+func (e *ProvisionerJobTimingStage) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = ProvisionerJobTimingStage(s)
+	case string:
+		*e = ProvisionerJobTimingStage(s)
+	default:
+		return fmt.Errorf("unsupported scan type for ProvisionerJobTimingStage: %T", src)
+	}
+	return nil
+}
+
+type NullProvisionerJobTimingStage struct {
+	ProvisionerJobTimingStage ProvisionerJobTimingStage `json:"provisioner_job_timing_stage"`
+	Valid                     bool                      `json:"valid"` // Valid is true if ProvisionerJobTimingStage is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullProvisionerJobTimingStage) Scan(value interface{}) error {
+	if value == nil {
+		ns.ProvisionerJobTimingStage, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.ProvisionerJobTimingStage.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullProvisionerJobTimingStage) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.ProvisionerJobTimingStage), nil
+}
+
+func (e ProvisionerJobTimingStage) Valid() bool {
+	switch e {
+	case ProvisionerJobTimingStageInit,
+		ProvisionerJobTimingStagePlan,
+		ProvisionerJobTimingStageGraph,
+		ProvisionerJobTimingStageApply:
+		return true
+	}
+	return false
+}
+
+func AllProvisionerJobTimingStageValues() []ProvisionerJobTimingStage {
+	return []ProvisionerJobTimingStage{
+		ProvisionerJobTimingStageInit,
+		ProvisionerJobTimingStagePlan,
+		ProvisionerJobTimingStageGraph,
+		ProvisionerJobTimingStageApply,
 	}
 }
 
@@ -1207,21 +1586,28 @@ func AllProvisionerTypeValues() []ProvisionerType {
 type ResourceType string
 
 const (
-	ResourceTypeOrganization            ResourceType = "organization"
-	ResourceTypeTemplate                ResourceType = "template"
-	ResourceTypeTemplateVersion         ResourceType = "template_version"
-	ResourceTypeUser                    ResourceType = "user"
-	ResourceTypeWorkspace               ResourceType = "workspace"
-	ResourceTypeGitSshKey               ResourceType = "git_ssh_key"
-	ResourceTypeApiKey                  ResourceType = "api_key"
-	ResourceTypeGroup                   ResourceType = "group"
-	ResourceTypeWorkspaceBuild          ResourceType = "workspace_build"
-	ResourceTypeLicense                 ResourceType = "license"
-	ResourceTypeWorkspaceProxy          ResourceType = "workspace_proxy"
-	ResourceTypeConvertLogin            ResourceType = "convert_login"
-	ResourceTypeHealthSettings          ResourceType = "health_settings"
-	ResourceTypeOauth2ProviderApp       ResourceType = "oauth2_provider_app"
-	ResourceTypeOauth2ProviderAppSecret ResourceType = "oauth2_provider_app_secret"
+	ResourceTypeOrganization                ResourceType = "organization"
+	ResourceTypeTemplate                    ResourceType = "template"
+	ResourceTypeTemplateVersion             ResourceType = "template_version"
+	ResourceTypeUser                        ResourceType = "user"
+	ResourceTypeWorkspace                   ResourceType = "workspace"
+	ResourceTypeGitSshKey                   ResourceType = "git_ssh_key"
+	ResourceTypeApiKey                      ResourceType = "api_key"
+	ResourceTypeGroup                       ResourceType = "group"
+	ResourceTypeWorkspaceBuild              ResourceType = "workspace_build"
+	ResourceTypeLicense                     ResourceType = "license"
+	ResourceTypeWorkspaceProxy              ResourceType = "workspace_proxy"
+	ResourceTypeConvertLogin                ResourceType = "convert_login"
+	ResourceTypeHealthSettings              ResourceType = "health_settings"
+	ResourceTypeOauth2ProviderApp           ResourceType = "oauth2_provider_app"
+	ResourceTypeOauth2ProviderAppSecret     ResourceType = "oauth2_provider_app_secret"
+	ResourceTypeCustomRole                  ResourceType = "custom_role"
+	ResourceTypeOrganizationMember          ResourceType = "organization_member"
+	ResourceTypeNotificationsSettings       ResourceType = "notifications_settings"
+	ResourceTypeNotificationTemplate        ResourceType = "notification_template"
+	ResourceTypeIdpSyncSettingsOrganization ResourceType = "idp_sync_settings_organization"
+	ResourceTypeIdpSyncSettingsGroup        ResourceType = "idp_sync_settings_group"
+	ResourceTypeIdpSyncSettingsRole         ResourceType = "idp_sync_settings_role"
 )
 
 func (e *ResourceType) Scan(src interface{}) error {
@@ -1275,7 +1661,14 @@ func (e ResourceType) Valid() bool {
 		ResourceTypeConvertLogin,
 		ResourceTypeHealthSettings,
 		ResourceTypeOauth2ProviderApp,
-		ResourceTypeOauth2ProviderAppSecret:
+		ResourceTypeOauth2ProviderAppSecret,
+		ResourceTypeCustomRole,
+		ResourceTypeOrganizationMember,
+		ResourceTypeNotificationsSettings,
+		ResourceTypeNotificationTemplate,
+		ResourceTypeIdpSyncSettingsOrganization,
+		ResourceTypeIdpSyncSettingsGroup,
+		ResourceTypeIdpSyncSettingsRole:
 		return true
 	}
 	return false
@@ -1298,6 +1691,13 @@ func AllResourceTypeValues() []ResourceType {
 		ResourceTypeHealthSettings,
 		ResourceTypeOauth2ProviderApp,
 		ResourceTypeOauth2ProviderAppSecret,
+		ResourceTypeCustomRole,
+		ResourceTypeOrganizationMember,
+		ResourceTypeNotificationsSettings,
+		ResourceTypeNotificationTemplate,
+		ResourceTypeIdpSyncSettingsOrganization,
+		ResourceTypeIdpSyncSettingsGroup,
+		ResourceTypeIdpSyncSettingsRole,
 	}
 }
 
@@ -1558,6 +1958,133 @@ func AllWorkspaceAgentLifecycleStateValues() []WorkspaceAgentLifecycleState {
 	}
 }
 
+// What stage the script was ran in.
+type WorkspaceAgentScriptTimingStage string
+
+const (
+	WorkspaceAgentScriptTimingStageStart WorkspaceAgentScriptTimingStage = "start"
+	WorkspaceAgentScriptTimingStageStop  WorkspaceAgentScriptTimingStage = "stop"
+	WorkspaceAgentScriptTimingStageCron  WorkspaceAgentScriptTimingStage = "cron"
+)
+
+func (e *WorkspaceAgentScriptTimingStage) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = WorkspaceAgentScriptTimingStage(s)
+	case string:
+		*e = WorkspaceAgentScriptTimingStage(s)
+	default:
+		return fmt.Errorf("unsupported scan type for WorkspaceAgentScriptTimingStage: %T", src)
+	}
+	return nil
+}
+
+type NullWorkspaceAgentScriptTimingStage struct {
+	WorkspaceAgentScriptTimingStage WorkspaceAgentScriptTimingStage `json:"workspace_agent_script_timing_stage"`
+	Valid                           bool                            `json:"valid"` // Valid is true if WorkspaceAgentScriptTimingStage is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullWorkspaceAgentScriptTimingStage) Scan(value interface{}) error {
+	if value == nil {
+		ns.WorkspaceAgentScriptTimingStage, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.WorkspaceAgentScriptTimingStage.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullWorkspaceAgentScriptTimingStage) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.WorkspaceAgentScriptTimingStage), nil
+}
+
+func (e WorkspaceAgentScriptTimingStage) Valid() bool {
+	switch e {
+	case WorkspaceAgentScriptTimingStageStart,
+		WorkspaceAgentScriptTimingStageStop,
+		WorkspaceAgentScriptTimingStageCron:
+		return true
+	}
+	return false
+}
+
+func AllWorkspaceAgentScriptTimingStageValues() []WorkspaceAgentScriptTimingStage {
+	return []WorkspaceAgentScriptTimingStage{
+		WorkspaceAgentScriptTimingStageStart,
+		WorkspaceAgentScriptTimingStageStop,
+		WorkspaceAgentScriptTimingStageCron,
+	}
+}
+
+// What the exit status of the script is.
+type WorkspaceAgentScriptTimingStatus string
+
+const (
+	WorkspaceAgentScriptTimingStatusOk            WorkspaceAgentScriptTimingStatus = "ok"
+	WorkspaceAgentScriptTimingStatusExitFailure   WorkspaceAgentScriptTimingStatus = "exit_failure"
+	WorkspaceAgentScriptTimingStatusTimedOut      WorkspaceAgentScriptTimingStatus = "timed_out"
+	WorkspaceAgentScriptTimingStatusPipesLeftOpen WorkspaceAgentScriptTimingStatus = "pipes_left_open"
+)
+
+func (e *WorkspaceAgentScriptTimingStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = WorkspaceAgentScriptTimingStatus(s)
+	case string:
+		*e = WorkspaceAgentScriptTimingStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for WorkspaceAgentScriptTimingStatus: %T", src)
+	}
+	return nil
+}
+
+type NullWorkspaceAgentScriptTimingStatus struct {
+	WorkspaceAgentScriptTimingStatus WorkspaceAgentScriptTimingStatus `json:"workspace_agent_script_timing_status"`
+	Valid                            bool                             `json:"valid"` // Valid is true if WorkspaceAgentScriptTimingStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullWorkspaceAgentScriptTimingStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.WorkspaceAgentScriptTimingStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.WorkspaceAgentScriptTimingStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullWorkspaceAgentScriptTimingStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.WorkspaceAgentScriptTimingStatus), nil
+}
+
+func (e WorkspaceAgentScriptTimingStatus) Valid() bool {
+	switch e {
+	case WorkspaceAgentScriptTimingStatusOk,
+		WorkspaceAgentScriptTimingStatusExitFailure,
+		WorkspaceAgentScriptTimingStatusTimedOut,
+		WorkspaceAgentScriptTimingStatusPipesLeftOpen:
+		return true
+	}
+	return false
+}
+
+func AllWorkspaceAgentScriptTimingStatusValues() []WorkspaceAgentScriptTimingStatus {
+	return []WorkspaceAgentScriptTimingStatus{
+		WorkspaceAgentScriptTimingStatusOk,
+		WorkspaceAgentScriptTimingStatusExitFailure,
+		WorkspaceAgentScriptTimingStatusTimedOut,
+		WorkspaceAgentScriptTimingStatusPipesLeftOpen,
+	}
+}
+
 type WorkspaceAgentSubsystem string
 
 const (
@@ -1686,6 +2213,67 @@ func AllWorkspaceAppHealthValues() []WorkspaceAppHealth {
 	}
 }
 
+type WorkspaceAppOpenIn string
+
+const (
+	WorkspaceAppOpenInTab        WorkspaceAppOpenIn = "tab"
+	WorkspaceAppOpenInWindow     WorkspaceAppOpenIn = "window"
+	WorkspaceAppOpenInSlimWindow WorkspaceAppOpenIn = "slim-window"
+)
+
+func (e *WorkspaceAppOpenIn) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = WorkspaceAppOpenIn(s)
+	case string:
+		*e = WorkspaceAppOpenIn(s)
+	default:
+		return fmt.Errorf("unsupported scan type for WorkspaceAppOpenIn: %T", src)
+	}
+	return nil
+}
+
+type NullWorkspaceAppOpenIn struct {
+	WorkspaceAppOpenIn WorkspaceAppOpenIn `json:"workspace_app_open_in"`
+	Valid              bool               `json:"valid"` // Valid is true if WorkspaceAppOpenIn is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullWorkspaceAppOpenIn) Scan(value interface{}) error {
+	if value == nil {
+		ns.WorkspaceAppOpenIn, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.WorkspaceAppOpenIn.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullWorkspaceAppOpenIn) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.WorkspaceAppOpenIn), nil
+}
+
+func (e WorkspaceAppOpenIn) Valid() bool {
+	switch e {
+	case WorkspaceAppOpenInTab,
+		WorkspaceAppOpenInWindow,
+		WorkspaceAppOpenInSlimWindow:
+		return true
+	}
+	return false
+}
+
+func AllWorkspaceAppOpenInValues() []WorkspaceAppOpenIn {
+	return []WorkspaceAppOpenIn{
+		WorkspaceAppOpenInTab,
+		WorkspaceAppOpenInWindow,
+		WorkspaceAppOpenInSlimWindow,
+	}
+}
+
 type WorkspaceTransition string
 
 const (
@@ -1781,6 +2369,30 @@ type AuditLog struct {
 	ResourceIcon     string          `db:"resource_icon" json:"resource_icon"`
 }
 
+type CryptoKey struct {
+	Feature     CryptoKeyFeature `db:"feature" json:"feature"`
+	Sequence    int32            `db:"sequence" json:"sequence"`
+	Secret      sql.NullString   `db:"secret" json:"secret"`
+	SecretKeyID sql.NullString   `db:"secret_key_id" json:"secret_key_id"`
+	StartsAt    time.Time        `db:"starts_at" json:"starts_at"`
+	DeletesAt   sql.NullTime     `db:"deletes_at" json:"deletes_at"`
+}
+
+// Custom roles allow dynamic roles expanded at runtime
+type CustomRole struct {
+	Name            string                `db:"name" json:"name"`
+	DisplayName     string                `db:"display_name" json:"display_name"`
+	SitePermissions CustomRolePermissions `db:"site_permissions" json:"site_permissions"`
+	OrgPermissions  CustomRolePermissions `db:"org_permissions" json:"org_permissions"`
+	UserPermissions CustomRolePermissions `db:"user_permissions" json:"user_permissions"`
+	CreatedAt       time.Time             `db:"created_at" json:"created_at"`
+	UpdatedAt       time.Time             `db:"updated_at" json:"updated_at"`
+	// Roles can optionally be scoped to an organization
+	OrganizationID uuid.NullUUID `db:"organization_id" json:"organization_id"`
+	// Custom roles ID is used purely for auditing purposes. Name is a better unique identifier.
+	ID uuid.UUID `db:"id" json:"id"`
+}
+
 // A table used to store the keys used to encrypt the database.
 type DBCryptKey struct {
 	// An integer used to identify the key.
@@ -1841,7 +2453,30 @@ type Group struct {
 	Source GroupSource `db:"source" json:"source"`
 }
 
+// Joins group members with user information, organization ID, group name. Includes both regular group members and organization members (as part of the "Everyone" group).
 type GroupMember struct {
+	UserID                 uuid.UUID     `db:"user_id" json:"user_id"`
+	UserEmail              string        `db:"user_email" json:"user_email"`
+	UserUsername           string        `db:"user_username" json:"user_username"`
+	UserHashedPassword     []byte        `db:"user_hashed_password" json:"user_hashed_password"`
+	UserCreatedAt          time.Time     `db:"user_created_at" json:"user_created_at"`
+	UserUpdatedAt          time.Time     `db:"user_updated_at" json:"user_updated_at"`
+	UserStatus             UserStatus    `db:"user_status" json:"user_status"`
+	UserRbacRoles          []string      `db:"user_rbac_roles" json:"user_rbac_roles"`
+	UserLoginType          LoginType     `db:"user_login_type" json:"user_login_type"`
+	UserAvatarUrl          string        `db:"user_avatar_url" json:"user_avatar_url"`
+	UserDeleted            bool          `db:"user_deleted" json:"user_deleted"`
+	UserLastSeenAt         time.Time     `db:"user_last_seen_at" json:"user_last_seen_at"`
+	UserQuietHoursSchedule string        `db:"user_quiet_hours_schedule" json:"user_quiet_hours_schedule"`
+	UserThemePreference    string        `db:"user_theme_preference" json:"user_theme_preference"`
+	UserName               string        `db:"user_name" json:"user_name"`
+	UserGithubComUserID    sql.NullInt64 `db:"user_github_com_user_id" json:"user_github_com_user_id"`
+	OrganizationID         uuid.UUID     `db:"organization_id" json:"organization_id"`
+	GroupName              string        `db:"group_name" json:"group_name"`
+	GroupID                uuid.UUID     `db:"group_id" json:"group_id"`
+}
+
+type GroupMemberTable struct {
 	UserID  uuid.UUID `db:"user_id" json:"user_id"`
 	GroupID uuid.UUID `db:"group_id" json:"group_id"`
 }
@@ -1862,6 +2497,54 @@ type License struct {
 	// exp tracks the claim of the same name in the JWT, and we include it here so that we can easily query for licenses that have not yet expired.
 	Exp  time.Time `db:"exp" json:"exp"`
 	UUID uuid.UUID `db:"uuid" json:"uuid"`
+}
+
+type NotificationMessage struct {
+	ID                     uuid.UUID                 `db:"id" json:"id"`
+	NotificationTemplateID uuid.UUID                 `db:"notification_template_id" json:"notification_template_id"`
+	UserID                 uuid.UUID                 `db:"user_id" json:"user_id"`
+	Method                 NotificationMethod        `db:"method" json:"method"`
+	Status                 NotificationMessageStatus `db:"status" json:"status"`
+	StatusReason           sql.NullString            `db:"status_reason" json:"status_reason"`
+	CreatedBy              string                    `db:"created_by" json:"created_by"`
+	Payload                []byte                    `db:"payload" json:"payload"`
+	AttemptCount           sql.NullInt32             `db:"attempt_count" json:"attempt_count"`
+	Targets                []uuid.UUID               `db:"targets" json:"targets"`
+	CreatedAt              time.Time                 `db:"created_at" json:"created_at"`
+	UpdatedAt              sql.NullTime              `db:"updated_at" json:"updated_at"`
+	LeasedUntil            sql.NullTime              `db:"leased_until" json:"leased_until"`
+	NextRetryAfter         sql.NullTime              `db:"next_retry_after" json:"next_retry_after"`
+	QueuedSeconds          sql.NullFloat64           `db:"queued_seconds" json:"queued_seconds"`
+	// Auto-generated by insert/update trigger, used to prevent duplicate notifications from being enqueued on the same day
+	DedupeHash sql.NullString `db:"dedupe_hash" json:"dedupe_hash"`
+}
+
+type NotificationPreference struct {
+	UserID                 uuid.UUID `db:"user_id" json:"user_id"`
+	NotificationTemplateID uuid.UUID `db:"notification_template_id" json:"notification_template_id"`
+	Disabled               bool      `db:"disabled" json:"disabled"`
+	CreatedAt              time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt              time.Time `db:"updated_at" json:"updated_at"`
+}
+
+// Log of generated reports for users.
+type NotificationReportGeneratorLog struct {
+	NotificationTemplateID uuid.UUID `db:"notification_template_id" json:"notification_template_id"`
+	LastGeneratedAt        time.Time `db:"last_generated_at" json:"last_generated_at"`
+}
+
+// Templates from which to create notification messages.
+type NotificationTemplate struct {
+	ID            uuid.UUID      `db:"id" json:"id"`
+	Name          string         `db:"name" json:"name"`
+	TitleTemplate string         `db:"title_template" json:"title_template"`
+	BodyTemplate  string         `db:"body_template" json:"body_template"`
+	Actions       []byte         `db:"actions" json:"actions"`
+	Group         sql.NullString `db:"group" json:"group"`
+	// NULL defers to the deployment-level method
+	Method           NullNotificationMethod   `db:"method" json:"method"`
+	Kind             NotificationTemplateKind `db:"kind" json:"kind"`
+	EnabledByDefault bool                     `db:"enabled_by_default" json:"enabled_by_default"`
 }
 
 // A table used to configure apps that can use Coder as an OAuth2 provider, the reverse of what we are calling external authentication.
@@ -1914,6 +2597,8 @@ type Organization struct {
 	CreatedAt   time.Time `db:"created_at" json:"created_at"`
 	UpdatedAt   time.Time `db:"updated_at" json:"updated_at"`
 	IsDefault   bool      `db:"is_default" json:"is_default"`
+	DisplayName string    `db:"display_name" json:"display_name"`
+	Icon        string    `db:"icon" json:"icon"`
 }
 
 type OrganizationMember struct {
@@ -1968,6 +2653,7 @@ type ProvisionerDaemon struct {
 	// The API version of the provisioner daemon
 	APIVersion     string    `db:"api_version" json:"api_version"`
 	OrganizationID uuid.UUID `db:"organization_id" json:"organization_id"`
+	KeyID          uuid.UUID `db:"key_id" json:"key_id"`
 }
 
 type ProvisionerJob struct {
@@ -2001,6 +2687,42 @@ type ProvisionerJobLog struct {
 	Stage     string    `db:"stage" json:"stage"`
 	Output    string    `db:"output" json:"output"`
 	ID        int64     `db:"id" json:"id"`
+}
+
+type ProvisionerJobStat struct {
+	JobID          uuid.UUID            `db:"job_id" json:"job_id"`
+	JobStatus      ProvisionerJobStatus `db:"job_status" json:"job_status"`
+	WorkspaceID    uuid.UUID            `db:"workspace_id" json:"workspace_id"`
+	WorkerID       uuid.NullUUID        `db:"worker_id" json:"worker_id"`
+	Error          sql.NullString       `db:"error" json:"error"`
+	ErrorCode      sql.NullString       `db:"error_code" json:"error_code"`
+	UpdatedAt      time.Time            `db:"updated_at" json:"updated_at"`
+	QueuedSecs     float64              `db:"queued_secs" json:"queued_secs"`
+	CompletionSecs float64              `db:"completion_secs" json:"completion_secs"`
+	CanceledSecs   float64              `db:"canceled_secs" json:"canceled_secs"`
+	InitSecs       float64              `db:"init_secs" json:"init_secs"`
+	PlanSecs       float64              `db:"plan_secs" json:"plan_secs"`
+	GraphSecs      float64              `db:"graph_secs" json:"graph_secs"`
+	ApplySecs      float64              `db:"apply_secs" json:"apply_secs"`
+}
+
+type ProvisionerJobTiming struct {
+	JobID     uuid.UUID                 `db:"job_id" json:"job_id"`
+	StartedAt time.Time                 `db:"started_at" json:"started_at"`
+	EndedAt   time.Time                 `db:"ended_at" json:"ended_at"`
+	Stage     ProvisionerJobTimingStage `db:"stage" json:"stage"`
+	Source    string                    `db:"source" json:"source"`
+	Action    string                    `db:"action" json:"action"`
+	Resource  string                    `db:"resource" json:"resource"`
+}
+
+type ProvisionerKey struct {
+	ID             uuid.UUID `db:"id" json:"id"`
+	CreatedAt      time.Time `db:"created_at" json:"created_at"`
+	OrganizationID uuid.UUID `db:"organization_id" json:"organization_id"`
+	Name           string    `db:"name" json:"name"`
+	HashedSecret   []byte    `db:"hashed_secret" json:"hashed_secret"`
+	Tags           StringMap `db:"tags" json:"tags"`
 }
 
 type Replica struct {
@@ -2065,7 +2787,7 @@ type TailnetTunnel struct {
 	UpdatedAt     time.Time `db:"updated_at" json:"updated_at"`
 }
 
-// Joins in the username + avatar url of the created by user.
+// Joins in the display name information such as username, avatar, and organization name.
 type Template struct {
 	ID                            uuid.UUID       `db:"id" json:"id"`
 	CreatedAt                     time.Time       `db:"created_at" json:"created_at"`
@@ -2083,7 +2805,6 @@ type Template struct {
 	GroupACL                      TemplateACL     `db:"group_acl" json:"group_acl"`
 	DisplayName                   string          `db:"display_name" json:"display_name"`
 	AllowUserCancelWorkspaceJobs  bool            `db:"allow_user_cancel_workspace_jobs" json:"allow_user_cancel_workspace_jobs"`
-	MaxTTL                        int64           `db:"max_ttl" json:"max_ttl"`
 	AllowUserAutostart            bool            `db:"allow_user_autostart" json:"allow_user_autostart"`
 	AllowUserAutostop             bool            `db:"allow_user_autostop" json:"allow_user_autostop"`
 	FailureTTL                    int64           `db:"failure_ttl" json:"failure_ttl"`
@@ -2094,11 +2815,13 @@ type Template struct {
 	AutostartBlockDaysOfWeek      int16           `db:"autostart_block_days_of_week" json:"autostart_block_days_of_week"`
 	RequireActiveVersion          bool            `db:"require_active_version" json:"require_active_version"`
 	Deprecated                    string          `db:"deprecated" json:"deprecated"`
-	UseMaxTtl                     bool            `db:"use_max_ttl" json:"use_max_ttl"`
 	ActivityBump                  int64           `db:"activity_bump" json:"activity_bump"`
 	MaxPortSharingLevel           AppSharingLevel `db:"max_port_sharing_level" json:"max_port_sharing_level"`
 	CreatedByAvatarURL            string          `db:"created_by_avatar_url" json:"created_by_avatar_url"`
 	CreatedByUsername             string          `db:"created_by_username" json:"created_by_username"`
+	OrganizationName              string          `db:"organization_name" json:"organization_name"`
+	OrganizationDisplayName       string          `db:"organization_display_name" json:"organization_display_name"`
+	OrganizationIcon              string          `db:"organization_icon" json:"organization_icon"`
 }
 
 type TemplateTable struct {
@@ -2120,8 +2843,7 @@ type TemplateTable struct {
 	// Display name is a custom, human-friendly template name that user can set.
 	DisplayName string `db:"display_name" json:"display_name"`
 	// Allow users to cancel in-progress workspace jobs.
-	AllowUserCancelWorkspaceJobs bool  `db:"allow_user_cancel_workspace_jobs" json:"allow_user_cancel_workspace_jobs"`
-	MaxTTL                       int64 `db:"max_ttl" json:"max_ttl"`
+	AllowUserCancelWorkspaceJobs bool `db:"allow_user_cancel_workspace_jobs" json:"allow_user_cancel_workspace_jobs"`
 	// Allow users to specify an autostart schedule for workspaces (enterprise).
 	AllowUserAutostart bool `db:"allow_user_autostart" json:"allow_user_autostart"`
 	// Allow users to specify custom autostop values for workspaces (enterprise).
@@ -2138,9 +2860,36 @@ type TemplateTable struct {
 	RequireActiveVersion     bool  `db:"require_active_version" json:"require_active_version"`
 	// If set to a non empty string, the template will no longer be able to be used. The message will be displayed to the user.
 	Deprecated          string          `db:"deprecated" json:"deprecated"`
-	UseMaxTtl           bool            `db:"use_max_ttl" json:"use_max_ttl"`
 	ActivityBump        int64           `db:"activity_bump" json:"activity_bump"`
 	MaxPortSharingLevel AppSharingLevel `db:"max_port_sharing_level" json:"max_port_sharing_level"`
+}
+
+// Records aggregated usage statistics for templates/users. All usage is rounded up to the nearest minute.
+type TemplateUsageStat struct {
+	// Start time of the usage period.
+	StartTime time.Time `db:"start_time" json:"start_time"`
+	// End time of the usage period.
+	EndTime time.Time `db:"end_time" json:"end_time"`
+	// ID of the template being used.
+	TemplateID uuid.UUID `db:"template_id" json:"template_id"`
+	// ID of the user using the template.
+	UserID uuid.UUID `db:"user_id" json:"user_id"`
+	// Median latency the user is experiencing, in milliseconds. Null means no value was recorded.
+	MedianLatencyMs sql.NullFloat64 `db:"median_latency_ms" json:"median_latency_ms"`
+	// Total minutes the user has been using the template.
+	UsageMins int16 `db:"usage_mins" json:"usage_mins"`
+	// Total minutes the user has been using SSH.
+	SshMins int16 `db:"ssh_mins" json:"ssh_mins"`
+	// Total minutes the user has been using SFTP.
+	SftpMins int16 `db:"sftp_mins" json:"sftp_mins"`
+	// Total minutes the user has been using the reconnecting PTY.
+	ReconnectingPtyMins int16 `db:"reconnecting_pty_mins" json:"reconnecting_pty_mins"`
+	// Total minutes the user has been using VSCode.
+	VscodeMins int16 `db:"vscode_mins" json:"vscode_mins"`
+	// Total minutes the user has been using JetBrains.
+	JetbrainsMins int16 `db:"jetbrains_mins" json:"jetbrains_mins"`
+	// Object with app names as keys and total minutes used as values. Null means no app usage was recorded.
+	AppUsageMins StringMapOfInt `db:"app_usage_mins" json:"app_usage_mins"`
 }
 
 // Joins in the username + avatar url of the created by user.
@@ -2157,6 +2906,7 @@ type TemplateVersion struct {
 	ExternalAuthProviders json.RawMessage `db:"external_auth_providers" json:"external_auth_providers"`
 	Message               string          `db:"message" json:"message"`
 	Archived              bool            `db:"archived" json:"archived"`
+	SourceExampleID       sql.NullString  `db:"source_example_id" json:"source_example_id"`
 	CreatedByAvatarURL    string          `db:"created_by_avatar_url" json:"created_by_avatar_url"`
 	CreatedByUsername     string          `db:"created_by_username" json:"created_by_username"`
 }
@@ -2210,8 +2960,9 @@ type TemplateVersionTable struct {
 	// IDs of External auth providers for a specific template version
 	ExternalAuthProviders json.RawMessage `db:"external_auth_providers" json:"external_auth_providers"`
 	// Message describing the changes in this version of the template, similar to a Git commit message. Like a commit message, this should be a short, high-level description of the changes in this version of the template. This message is immutable and should not be updated after the fact.
-	Message  string `db:"message" json:"message"`
-	Archived bool   `db:"archived" json:"archived"`
+	Message         string         `db:"message" json:"message"`
+	Archived        bool           `db:"archived" json:"archived"`
+	SourceExampleID sql.NullString `db:"source_example_id" json:"source_example_id"`
 }
 
 type TemplateVersionVariable struct {
@@ -2230,6 +2981,12 @@ type TemplateVersionVariable struct {
 	Required bool `db:"required" json:"required"`
 	// Sensitive variables have their values redacted in logs or site UI
 	Sensitive bool `db:"sensitive" json:"sensitive"`
+}
+
+type TemplateVersionWorkspaceTag struct {
+	TemplateVersionID uuid.UUID `db:"template_version_id" json:"template_version_id"`
+	Key               string    `db:"key" json:"key"`
+	Value             string    `db:"value" json:"value"`
 }
 
 type User struct {
@@ -2251,6 +3008,19 @@ type User struct {
 	ThemePreference string `db:"theme_preference" json:"theme_preference"`
 	// Name of the Coder user
 	Name string `db:"name" json:"name"`
+	// The GitHub.com numerical user ID. At time of implementation, this is used to check if the user has starred the Coder repository.
+	GithubComUserID sql.NullInt64 `db:"github_com_user_id" json:"github_com_user_id"`
+	// A hash of the one-time-passcode given to the user.
+	HashedOneTimePasscode []byte `db:"hashed_one_time_passcode" json:"hashed_one_time_passcode"`
+	// The time when the one-time-passcode expires.
+	OneTimePasscodeExpiresAt sql.NullTime `db:"one_time_passcode_expires_at" json:"one_time_passcode_expires_at"`
+}
+
+// Tracks when users were deleted
+type UserDeleted struct {
+	ID        uuid.UUID `db:"id" json:"id"`
+	UserID    uuid.UUID `db:"user_id" json:"user_id"`
+	DeletedAt time.Time `db:"deleted_at" json:"deleted_at"`
 }
 
 type UserLink struct {
@@ -2264,8 +3034,16 @@ type UserLink struct {
 	OAuthAccessTokenKeyID sql.NullString `db:"oauth_access_token_key_id" json:"oauth_access_token_key_id"`
 	// The ID of the key used to encrypt the OAuth refresh token. If this is NULL, the refresh token is not encrypted
 	OAuthRefreshTokenKeyID sql.NullString `db:"oauth_refresh_token_key_id" json:"oauth_refresh_token_key_id"`
-	// Debug information includes information like id_token and userinfo claims.
-	DebugContext json.RawMessage `db:"debug_context" json:"debug_context"`
+	// Claims from the IDP for the linked user. Includes both id_token and userinfo claims.
+	Claims UserLinkClaims `db:"claims" json:"claims"`
+}
+
+// Tracks the history of user status changes
+type UserStatusChange struct {
+	ID        uuid.UUID  `db:"id" json:"id"`
+	UserID    uuid.UUID  `db:"user_id" json:"user_id"`
+	NewStatus UserStatus `db:"new_status" json:"new_status"`
+	ChangedAt time.Time  `db:"changed_at" json:"changed_at"`
 }
 
 // Visible fields of users are allowed to be joined with other tables for including context of other resources.
@@ -2275,23 +3053,34 @@ type VisibleUser struct {
 	AvatarURL string    `db:"avatar_url" json:"avatar_url"`
 }
 
+// Joins in the display name information such as username, avatar, and organization name.
 type Workspace struct {
-	ID                uuid.UUID        `db:"id" json:"id"`
-	CreatedAt         time.Time        `db:"created_at" json:"created_at"`
-	UpdatedAt         time.Time        `db:"updated_at" json:"updated_at"`
-	OwnerID           uuid.UUID        `db:"owner_id" json:"owner_id"`
-	OrganizationID    uuid.UUID        `db:"organization_id" json:"organization_id"`
-	TemplateID        uuid.UUID        `db:"template_id" json:"template_id"`
-	Deleted           bool             `db:"deleted" json:"deleted"`
-	Name              string           `db:"name" json:"name"`
-	AutostartSchedule sql.NullString   `db:"autostart_schedule" json:"autostart_schedule"`
-	Ttl               sql.NullInt64    `db:"ttl" json:"ttl"`
-	LastUsedAt        time.Time        `db:"last_used_at" json:"last_used_at"`
-	DormantAt         sql.NullTime     `db:"dormant_at" json:"dormant_at"`
-	DeletingAt        sql.NullTime     `db:"deleting_at" json:"deleting_at"`
-	AutomaticUpdates  AutomaticUpdates `db:"automatic_updates" json:"automatic_updates"`
-	// Favorite is true if the workspace owner has favorited the workspace.
-	Favorite bool `db:"favorite" json:"favorite"`
+	ID                      uuid.UUID        `db:"id" json:"id"`
+	CreatedAt               time.Time        `db:"created_at" json:"created_at"`
+	UpdatedAt               time.Time        `db:"updated_at" json:"updated_at"`
+	OwnerID                 uuid.UUID        `db:"owner_id" json:"owner_id"`
+	OrganizationID          uuid.UUID        `db:"organization_id" json:"organization_id"`
+	TemplateID              uuid.UUID        `db:"template_id" json:"template_id"`
+	Deleted                 bool             `db:"deleted" json:"deleted"`
+	Name                    string           `db:"name" json:"name"`
+	AutostartSchedule       sql.NullString   `db:"autostart_schedule" json:"autostart_schedule"`
+	Ttl                     sql.NullInt64    `db:"ttl" json:"ttl"`
+	LastUsedAt              time.Time        `db:"last_used_at" json:"last_used_at"`
+	DormantAt               sql.NullTime     `db:"dormant_at" json:"dormant_at"`
+	DeletingAt              sql.NullTime     `db:"deleting_at" json:"deleting_at"`
+	AutomaticUpdates        AutomaticUpdates `db:"automatic_updates" json:"automatic_updates"`
+	Favorite                bool             `db:"favorite" json:"favorite"`
+	NextStartAt             sql.NullTime     `db:"next_start_at" json:"next_start_at"`
+	OwnerAvatarUrl          string           `db:"owner_avatar_url" json:"owner_avatar_url"`
+	OwnerUsername           string           `db:"owner_username" json:"owner_username"`
+	OrganizationName        string           `db:"organization_name" json:"organization_name"`
+	OrganizationDisplayName string           `db:"organization_display_name" json:"organization_display_name"`
+	OrganizationIcon        string           `db:"organization_icon" json:"organization_icon"`
+	OrganizationDescription string           `db:"organization_description" json:"organization_description"`
+	TemplateName            string           `db:"template_name" json:"template_name"`
+	TemplateDisplayName     string           `db:"template_display_name" json:"template_display_name"`
+	TemplateIcon            string           `db:"template_icon" json:"template_icon"`
+	TemplateDescription     string           `db:"template_description" json:"template_description"`
 }
 
 type WorkspaceAgent struct {
@@ -2389,6 +3178,17 @@ type WorkspaceAgentScript struct {
 	RunOnStart       bool      `db:"run_on_start" json:"run_on_start"`
 	RunOnStop        bool      `db:"run_on_stop" json:"run_on_stop"`
 	TimeoutSeconds   int32     `db:"timeout_seconds" json:"timeout_seconds"`
+	DisplayName      string    `db:"display_name" json:"display_name"`
+	ID               uuid.UUID `db:"id" json:"id"`
+}
+
+type WorkspaceAgentScriptTiming struct {
+	ScriptID  uuid.UUID                        `db:"script_id" json:"script_id"`
+	StartedAt time.Time                        `db:"started_at" json:"started_at"`
+	EndedAt   time.Time                        `db:"ended_at" json:"ended_at"`
+	ExitCode  int32                            `db:"exit_code" json:"exit_code"`
+	Stage     WorkspaceAgentScriptTimingStage  `db:"stage" json:"stage"`
+	Status    WorkspaceAgentScriptTimingStatus `db:"status" json:"status"`
 }
 
 type WorkspaceAgentStat struct {
@@ -2409,6 +3209,7 @@ type WorkspaceAgentStat struct {
 	SessionCountJetBrains       int64           `db:"session_count_jetbrains" json:"session_count_jetbrains"`
 	SessionCountReconnectingPTY int64           `db:"session_count_reconnecting_pty" json:"session_count_reconnecting_pty"`
 	SessionCountSSH             int64           `db:"session_count_ssh" json:"session_count_ssh"`
+	Usage                       bool            `db:"usage" json:"usage"`
 }
 
 type WorkspaceApp struct {
@@ -2429,6 +3230,9 @@ type WorkspaceApp struct {
 	External             bool               `db:"external" json:"external"`
 	// Specifies the order in which to display agent app in user interfaces.
 	DisplayOrder int32 `db:"display_order" json:"display_order"`
+	// Determines if the app is not shown in user interfaces.
+	Hidden bool               `db:"hidden" json:"hidden"`
+	OpenIn WorkspaceAppOpenIn `db:"open_in" json:"open_in"`
 }
 
 // A record of workspace app usage statistics
@@ -2500,6 +3304,16 @@ type WorkspaceBuildTable struct {
 	MaxDeadline       time.Time           `db:"max_deadline" json:"max_deadline"`
 }
 
+type WorkspaceModule struct {
+	ID         uuid.UUID           `db:"id" json:"id"`
+	JobID      uuid.UUID           `db:"job_id" json:"job_id"`
+	Transition WorkspaceTransition `db:"transition" json:"transition"`
+	Source     string              `db:"source" json:"source"`
+	Version    string              `db:"version" json:"version"`
+	Key        string              `db:"key" json:"key"`
+	CreatedAt  time.Time           `db:"created_at" json:"created_at"`
+}
+
 type WorkspaceProxy struct {
 	ID          uuid.UUID `db:"id" json:"id"`
 	Name        string    `db:"name" json:"name"`
@@ -2534,6 +3348,7 @@ type WorkspaceResource struct {
 	Icon         string              `db:"icon" json:"icon"`
 	InstanceType sql.NullString      `db:"instance_type" json:"instance_type"`
 	DailyCost    int32               `db:"daily_cost" json:"daily_cost"`
+	ModulePath   sql.NullString      `db:"module_path" json:"module_path"`
 }
 
 type WorkspaceResourceMetadatum struct {
@@ -2542,4 +3357,24 @@ type WorkspaceResourceMetadatum struct {
 	Value               sql.NullString `db:"value" json:"value"`
 	Sensitive           bool           `db:"sensitive" json:"sensitive"`
 	ID                  int64          `db:"id" json:"id"`
+}
+
+type WorkspaceTable struct {
+	ID                uuid.UUID        `db:"id" json:"id"`
+	CreatedAt         time.Time        `db:"created_at" json:"created_at"`
+	UpdatedAt         time.Time        `db:"updated_at" json:"updated_at"`
+	OwnerID           uuid.UUID        `db:"owner_id" json:"owner_id"`
+	OrganizationID    uuid.UUID        `db:"organization_id" json:"organization_id"`
+	TemplateID        uuid.UUID        `db:"template_id" json:"template_id"`
+	Deleted           bool             `db:"deleted" json:"deleted"`
+	Name              string           `db:"name" json:"name"`
+	AutostartSchedule sql.NullString   `db:"autostart_schedule" json:"autostart_schedule"`
+	Ttl               sql.NullInt64    `db:"ttl" json:"ttl"`
+	LastUsedAt        time.Time        `db:"last_used_at" json:"last_used_at"`
+	DormantAt         sql.NullTime     `db:"dormant_at" json:"dormant_at"`
+	DeletingAt        sql.NullTime     `db:"deleting_at" json:"deleting_at"`
+	AutomaticUpdates  AutomaticUpdates `db:"automatic_updates" json:"automatic_updates"`
+	// Favorite is true if the workspace owner has favorited the workspace.
+	Favorite    bool         `db:"favorite" json:"favorite"`
+	NextStartAt sql.NullTime `db:"next_start_at" json:"next_start_at"`
 }

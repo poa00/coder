@@ -6,23 +6,25 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/coder/pretty"
+	"github.com/coder/serpent"
 
-	"github.com/coder/coder/v2/cli/clibase"
 	"github.com/coder/coder/v2/cli/cliui"
 	"github.com/coder/coder/v2/codersdk"
 )
 
-func (r *RootCmd) rename() *clibase.Cmd {
+func (r *RootCmd) rename() *serpent.Command {
+	var appearanceConfig codersdk.AppearanceConfig
 	client := new(codersdk.Client)
-	cmd := &clibase.Cmd{
+	cmd := &serpent.Command{
 		Annotations: workspaceCommand,
 		Use:         "rename <workspace> <new name>",
 		Short:       "Rename a workspace",
-		Middleware: clibase.Chain(
-			clibase.RequireNArgs(2),
+		Middleware: serpent.Chain(
+			serpent.RequireNArgs(2),
 			r.InitClient(client),
+			initAppearance(client, &appearanceConfig),
 		),
-		Handler: func(inv *clibase.Invocation) error {
+		Handler: func(inv *serpent.Invocation) error {
 			workspace, err := namedWorkspace(inv.Context(), client, inv.Args[0])
 			if err != nil {
 				return xerrors.Errorf("get workspace: %w", err)
@@ -31,7 +33,7 @@ func (r *RootCmd) rename() *clibase.Cmd {
 			_, _ = fmt.Fprintf(inv.Stdout, "%s\n\n",
 				pretty.Sprint(cliui.DefaultStyles.Wrap, "WARNING: A rename can result in data loss if a resource references the workspace name in the template (e.g volumes). Please backup any data before proceeding."),
 			)
-			_, _ = fmt.Fprintf(inv.Stdout, "See: %s\n\n", "https://coder.com/docs/coder-oss/latest/templates/resource-persistence#%EF%B8%8F-persistence-pitfalls")
+			_, _ = fmt.Fprintf(inv.Stdout, "See: %s%s\n\n", appearanceConfig.DocsURL, "/templates/resource-persistence#%EF%B8%8F-persistence-pitfalls")
 			_, err = cliui.Prompt(inv, cliui.PromptOptions{
 				Text: fmt.Sprintf("Type %q to confirm rename:", workspace.Name),
 				Validate: func(s string) error {

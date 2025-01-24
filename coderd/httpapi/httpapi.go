@@ -43,28 +43,30 @@ func init() {
 		if !ok {
 			return false
 		}
-		valid := NameValid(str)
+		valid := codersdk.NameValid(str)
 		return valid == nil
 	}
-	for _, tag := range []string{"username", "template_name", "workspace_name", "oauth2_app_name"} {
+	for _, tag := range []string{"username", "organization_name", "template_name", "workspace_name", "oauth2_app_name"} {
 		err := Validate.RegisterValidation(tag, nameValidator)
 		if err != nil {
 			panic(err)
 		}
 	}
 
-	templateDisplayNameValidator := func(fl validator.FieldLevel) bool {
+	displayNameValidator := func(fl validator.FieldLevel) bool {
 		f := fl.Field().Interface()
 		str, ok := f.(string)
 		if !ok {
 			return false
 		}
-		valid := TemplateDisplayNameValid(str)
+		valid := codersdk.DisplayNameValid(str)
 		return valid == nil
 	}
-	err := Validate.RegisterValidation("template_display_name", templateDisplayNameValidator)
-	if err != nil {
-		panic(err)
+	for _, displayNameTag := range []string{"organization_display_name", "template_display_name", "group_display_name"} {
+		err := Validate.RegisterValidation(displayNameTag, displayNameValidator)
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	templateVersionNameValidator := func(fl validator.FieldLevel) bool {
@@ -73,10 +75,10 @@ func init() {
 		if !ok {
 			return false
 		}
-		valid := TemplateVersionNameValid(str)
+		valid := codersdk.TemplateVersionNameValid(str)
 		return valid == nil
 	}
-	err = Validate.RegisterValidation("template_version_name", templateVersionNameValidator)
+	err := Validate.RegisterValidation("template_version_name", templateVersionNameValidator)
 	if err != nil {
 		panic(err)
 	}
@@ -87,10 +89,24 @@ func init() {
 		if !ok {
 			return false
 		}
-		valid := UserRealNameValid(str)
+		valid := codersdk.UserRealNameValid(str)
 		return valid == nil
 	}
 	err = Validate.RegisterValidation("user_real_name", userRealNameValidator)
+	if err != nil {
+		panic(err)
+	}
+
+	groupNameValidator := func(fl validator.FieldLevel) bool {
+		f := fl.Field().Interface()
+		str, ok := f.(string)
+		if !ok {
+			return false
+		}
+		valid := codersdk.GroupNameValid(str)
+		return valid == nil
+	}
+	err = Validate.RegisterValidation("group_name", groupNameValidator)
 	if err != nil {
 		panic(err)
 	}
@@ -105,11 +121,23 @@ func Is404Error(err error) bool {
 	}
 
 	// This tests for dbauthz.IsNotAuthorizedError and rbac.IsUnauthorizedError.
+	if IsUnauthorizedError(err) {
+		return true
+	}
+	return xerrors.Is(err, sql.ErrNoRows)
+}
+
+func IsUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// This tests for dbauthz.IsNotAuthorizedError and rbac.IsUnauthorizedError.
 	var unauthorized httpapiconstraints.IsUnauthorizedError
 	if errors.As(err, &unauthorized) && unauthorized.IsUnauthorized() {
 		return true
 	}
-	return xerrors.Is(err, sql.ErrNoRows)
+	return false
 }
 
 // Convenience error functions don't take contexts since their responses are
@@ -240,7 +268,7 @@ const websocketCloseMaxLen = 123
 func WebsocketCloseSprintf(format string, vars ...any) string {
 	msg := fmt.Sprintf(format, vars...)
 
-	// Cap msg length at 123 bytes. nhooyr/websocket only allows close messages
+	// Cap msg length at 123 bytes. coder/websocket only allows close messages
 	// of this length.
 	if len(msg) > websocketCloseMaxLen {
 		// Trim the string to 123 bytes. If we accidentally cut in the middle of

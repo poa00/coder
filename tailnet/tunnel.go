@@ -1,6 +1,7 @@
 package tailnet
 
 import (
+	"context"
 	"net/netip"
 
 	"github.com/google/uuid"
@@ -12,13 +13,13 @@ import (
 var legacyWorkspaceAgentIP = netip.MustParseAddr("fd7a:115c:a1e0:49d6:b259:b7ac:b1b2:48f4")
 
 type CoordinateeAuth interface {
-	Authorize(req *proto.CoordinateRequest) error
+	Authorize(ctx context.Context, req *proto.CoordinateRequest) error
 }
 
 // SingleTailnetCoordinateeAuth allows all tunnels, since Coderd and wsproxy are allowed to initiate a tunnel to any agent
 type SingleTailnetCoordinateeAuth struct{}
 
-func (SingleTailnetCoordinateeAuth) Authorize(*proto.CoordinateRequest) error {
+func (SingleTailnetCoordinateeAuth) Authorize(context.Context, *proto.CoordinateRequest) error {
 	return nil
 }
 
@@ -27,7 +28,7 @@ type ClientCoordinateeAuth struct {
 	AgentID uuid.UUID
 }
 
-func (c ClientCoordinateeAuth) Authorize(req *proto.CoordinateRequest) error {
+func (c ClientCoordinateeAuth) Authorize(_ context.Context, req *proto.CoordinateRequest) error {
 	if tun := req.GetAddTunnel(); tun != nil {
 		uid, err := uuid.FromBytes(tun.Id)
 		if err != nil {
@@ -39,20 +40,7 @@ func (c ClientCoordinateeAuth) Authorize(req *proto.CoordinateRequest) error {
 		}
 	}
 
-	if upd := req.GetUpdateSelf(); upd != nil {
-		for _, addrStr := range upd.Node.Addresses {
-			pre, err := netip.ParsePrefix(addrStr)
-			if err != nil {
-				return xerrors.Errorf("parse node address: %w", err)
-			}
-
-			if pre.Bits() != 128 {
-				return xerrors.Errorf("invalid address bits, expected 128, got %d", pre.Bits())
-			}
-		}
-	}
-
-	return nil
+	return handleClientNodeRequests(req)
 }
 
 // AgentCoordinateeAuth disallows all tunnels, since agents are not allowed to initiate their own tunnels
@@ -60,7 +48,7 @@ type AgentCoordinateeAuth struct {
 	ID uuid.UUID
 }
 
-func (a AgentCoordinateeAuth) Authorize(req *proto.CoordinateRequest) error {
+func (a AgentCoordinateeAuth) Authorize(_ context.Context, req *proto.CoordinateRequest) error {
 	if tun := req.GetAddTunnel(); tun != nil {
 		return xerrors.New("agents cannot open tunnels")
 	}
@@ -76,13 +64,54 @@ func (a AgentCoordinateeAuth) Authorize(req *proto.CoordinateRequest) error {
 				return xerrors.Errorf("invalid address bits, expected 128, got %d", pre.Bits())
 			}
 
-			if IPFromUUID(a.ID).Compare(pre.Addr()) != 0 &&
+			if TailscaleServicePrefix.AddrFromUUID(a.ID).Compare(pre.Addr()) != 0 &&
+				CoderServicePrefix.AddrFromUUID(a.ID).Compare(pre.Addr()) != 0 &&
 				legacyWorkspaceAgentIP.Compare(pre.Addr()) != 0 {
 				return xerrors.Errorf("invalid node address, got %s", pre.Addr().String())
 			}
 		}
 	}
 
+	return nil
+}
+
+type ClientUserCoordinateeAuth struct {
+	Auth TunnelAuthorizer
+}
+
+func (a ClientUserCoordinateeAuth) Authorize(ctx context.Context, req *proto.CoordinateRequest) error {
+	if tun := req.GetAddTunnel(); tun != nil {
+		uid, err := uuid.FromBytes(tun.Id)
+		if err != nil {
+			return xerrors.Errorf("parse add tunnel id: %w", err)
+		}
+		err = a.Auth.AuthorizeTunnel(ctx, uid)
+		if err != nil {
+			return xerrors.Errorf("workspace agent not found or you do not have permission")
+		}
+	}
+
+	return handleClientNodeRequests(req)
+}
+
+// handleClientNodeRequests validates GetUpdateSelf requests and declines ReadyForHandshake requests
+func handleClientNodeRequests(req *proto.CoordinateRequest) error {
+	if upd := req.GetUpdateSelf(); upd != nil {
+		for _, addrStr := range upd.Node.Addresses {
+			pre, err := netip.ParsePrefix(addrStr)
+			if err != nil {
+				return xerrors.Errorf("parse node address: %w", err)
+			}
+
+			if pre.Bits() != 128 {
+				return xerrors.Errorf("invalid address bits, expected 128, got %d", pre.Bits())
+			}
+		}
+	}
+
+	if rfh := req.GetReadyForHandshake(); rfh != nil {
+		return xerrors.Errorf("clients may not send ready_for_handshake")
+	}
 	return nil
 }
 
@@ -145,6 +174,12 @@ func (s *tunnelStore) findTunnelPeers(id uuid.UUID) []uuid.UUID {
 		out = append(out, id)
 	}
 	return out
+}
+
+func (s *tunnelStore) tunnelExists(src, dst uuid.UUID) bool {
+	_, srcOK := s.bySrc[src][dst]
+	_, dstOK := s.byDst[src][dst]
+	return srcOK || dstOK
 }
 
 func (s *tunnelStore) htmlDebug() []HTMLTunnel {

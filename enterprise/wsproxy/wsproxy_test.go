@@ -24,18 +24,22 @@ import (
 	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent/agenttest"
 	"github.com/coder/coder/v2/buildinfo"
-	"github.com/coder/coder/v2/cli/clibase"
 	"github.com/coder/coder/v2/coderd/coderdtest"
+	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/dbgen"
+	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/healthcheck/derphealth"
 	"github.com/coder/coder/v2/coderd/httpmw"
 	"github.com/coder/coder/v2/coderd/workspaceapps/apptest"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/coder/v2/cryptorand"
 	"github.com/coder/coder/v2/enterprise/coderd/coderdenttest"
 	"github.com/coder/coder/v2/enterprise/coderd/license"
 	"github.com/coder/coder/v2/enterprise/wsproxy/wsproxysdk"
 	"github.com/coder/coder/v2/provisioner/echo"
 	"github.com/coder/coder/v2/testutil"
+	"github.com/coder/serpent"
 )
 
 func TestDERPOnly(t *testing.T) {
@@ -63,7 +67,8 @@ func TestDERPOnly(t *testing.T) {
 		},
 		LicenseOptions: &coderdenttest.LicenseOptions{
 			Features: license.Features{
-				codersdk.FeatureWorkspaceProxy: 1,
+				codersdk.FeatureWorkspaceProxy:        1,
+				codersdk.FeatureMultipleOrganizations: 1,
 			},
 		},
 	})
@@ -110,7 +115,8 @@ func TestDERP(t *testing.T) {
 		},
 		LicenseOptions: &coderdenttest.LicenseOptions{
 			Features: license.Features{
-				codersdk.FeatureWorkspaceProxy: 1,
+				codersdk.FeatureWorkspaceProxy:        1,
+				codersdk.FeatureMultipleOrganizations: 1,
 			},
 		},
 	})
@@ -174,7 +180,7 @@ func TestDERP(t *testing.T) {
 	})
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	build := coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 	workspace.LatestBuild = build
 
@@ -196,7 +202,7 @@ resourceLoop:
 		t.Parallel()
 
 		ctx := testutil.Context(t, testutil.WaitLong)
-		connInfo, err := client.WorkspaceAgentConnectionInfo(ctx, agentID)
+		connInfo, err := workspacesdk.New(client).AgentConnectionInfo(ctx, agentID)
 		require.NoError(t, err)
 
 		// There should be three DERP regions in the map: the primary, and each
@@ -269,7 +275,7 @@ resourceLoop:
 		t.Parallel()
 
 		ctx := testutil.Context(t, testutil.WaitLong)
-		connInfo, err := client.WorkspaceAgentConnectionInfo(ctx, agentID)
+		connInfo, err := workspacesdk.New(client).AgentConnectionInfo(ctx, agentID)
 		require.NoError(t, err)
 		require.NotNil(t, connInfo.DERPMap)
 		require.Len(t, connInfo.DERPMap.Regions, 3+len(api.DeploymentValues.DERP.Server.STUNAddresses.Value()))
@@ -307,7 +313,7 @@ resourceLoop:
 		t.Parallel()
 
 		// Try to connect to the DERP server on the no-derp-proxy region.
-		client, err := derphttp.NewClient(key.NewNode(), proxyAPI3.Options.AccessURL.String(), func(format string, args ...any) {})
+		client, err := derphttp.NewClient(key.NewNode(), proxyAPI3.Options.AccessURL.String(), func(string, ...any) {})
 		require.NoError(t, err)
 
 		ctx := testutil.Context(t, testutil.WaitLong)
@@ -323,6 +329,7 @@ func TestDERPEndToEnd(t *testing.T) {
 	deploymentValues.Experiments = []string{
 		"*",
 	}
+	deploymentValues.DERP.Config.BlockDirect = true
 
 	client, closer, api, user := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
 		Options: &coderdtest.Options{
@@ -341,7 +348,8 @@ func TestDERPEndToEnd(t *testing.T) {
 		},
 		LicenseOptions: &coderdenttest.LicenseOptions{
 			Features: license.Features{
-				codersdk.FeatureWorkspaceProxy: 1,
+				codersdk.FeatureWorkspaceProxy:        1,
+				codersdk.FeatureMultipleOrganizations: 1,
 			},
 		},
 	})
@@ -397,7 +405,7 @@ func TestDERPEndToEnd(t *testing.T) {
 		proxyOnlyDERPMap.OmitDefaultRegions = true
 		return true
 	}, testutil.WaitLong, testutil.IntervalMedium)
-	newDERPMapper := func(derpMap *tailcfg.DERPMap) *tailcfg.DERPMap {
+	newDERPMapper := func(_ *tailcfg.DERPMap) *tailcfg.DERPMap {
 		return proxyOnlyDERPMap
 	}
 	api.AGPL.DERPMapper.Store(&newDERPMapper)
@@ -410,7 +418,7 @@ func TestDERPEndToEnd(t *testing.T) {
 	})
 	template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-	workspace := coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID)
+	workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 	build := coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 	workspace.LatestBuild = build
 
@@ -429,13 +437,14 @@ resourceLoop:
 	_ = coderdtest.AwaitWorkspaceAgents(t, client, workspace.ID)
 
 	// Connect to the workspace agent.
-	conn, err := client.DialWorkspaceAgent(ctx, agentID, &codersdk.DialWorkspaceAgentOptions{
-		Logger: slogtest.Make(t, &slogtest.Options{
-			IgnoreErrors: true,
-		}).Named("client").Leveled(slog.LevelDebug),
-		// Force DERP.
-		BlockEndpoints: true,
-	})
+	conn, err := workspacesdk.New(client).
+		DialAgent(ctx, agentID, &workspacesdk.DialAgentOptions{
+			Logger: slogtest.Make(t, &slogtest.Options{
+				IgnoreErrors: true,
+			}).Named("client").Leveled(slog.LevelDebug),
+			// Force DERP.
+			BlockEndpoints: true,
+		})
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		err := conn.Close()
@@ -477,7 +486,8 @@ func TestDERPMesh(t *testing.T) {
 		},
 		LicenseOptions: &coderdenttest.LicenseOptions{
 			Features: license.Features{
-				codersdk.FeatureWorkspaceProxy: 1,
+				codersdk.FeatureWorkspaceProxy:        1,
+				codersdk.FeatureMultipleOrganizations: 1,
 			},
 		},
 	})
@@ -563,10 +573,10 @@ func TestWorkspaceProxyDERPMeshProbe(t *testing.T) {
 		return proxyRes
 	}
 
-	registerBrokenProxy := func(ctx context.Context, t *testing.T, primaryAccessURL *url.URL, accessURL, token string) {
+	registerBrokenProxy := func(ctx context.Context, t *testing.T, primaryAccessURL *url.URL, accessURL, token string) uuid.UUID {
 		t.Helper()
 		// Create a HTTP server that always replies with 500.
-		srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 			rw.WriteHeader(http.StatusInternalServerError)
 		}))
 		t.Cleanup(srv.Close)
@@ -574,21 +584,23 @@ func TestWorkspaceProxyDERPMeshProbe(t *testing.T) {
 		// Register a proxy.
 		wsproxyClient := wsproxysdk.New(primaryAccessURL)
 		wsproxyClient.SetSessionToken(token)
-
 		hostname, err := cryptorand.String(6)
 		require.NoError(t, err)
+		replicaID := uuid.New()
 		_, err = wsproxyClient.RegisterWorkspaceProxy(ctx, wsproxysdk.RegisterWorkspaceProxyRequest{
 			AccessURL:           accessURL,
 			WildcardHostname:    "",
 			DerpEnabled:         true,
 			DerpOnly:            false,
-			ReplicaID:           uuid.New(),
+			ReplicaID:           replicaID,
 			ReplicaHostname:     hostname,
 			ReplicaError:        "",
 			ReplicaRelayAddress: srv.URL,
 			Version:             buildinfo.Version(),
 		})
 		require.NoError(t, err)
+
+		return replicaID
 	}
 
 	t.Run("ProbeOK", func(t *testing.T) {
@@ -616,7 +628,8 @@ func TestWorkspaceProxyDERPMeshProbe(t *testing.T) {
 			},
 			LicenseOptions: &coderdenttest.LicenseOptions{
 				Features: license.Features{
-					codersdk.FeatureWorkspaceProxy: 1,
+					codersdk.FeatureWorkspaceProxy:        1,
+					codersdk.FeatureMultipleOrganizations: 1,
 				},
 			},
 		})
@@ -726,7 +739,8 @@ func TestWorkspaceProxyDERPMeshProbe(t *testing.T) {
 			},
 			LicenseOptions: &coderdenttest.LicenseOptions{
 				Features: license.Features{
-					codersdk.FeatureWorkspaceProxy: 1,
+					codersdk.FeatureWorkspaceProxy:        1,
+					codersdk.FeatureMultipleOrganizations: 1,
 				},
 			},
 		})
@@ -781,8 +795,121 @@ func TestWorkspaceProxyDERPMeshProbe(t *testing.T) {
 		resp.Body.Close()
 		require.NoError(t, err)
 
-		require.Len(t, respJSON.Errors, 1, "proxy is healthy")
-		require.Contains(t, respJSON.Errors[0], "High availability networking")
+		require.Len(t, respJSON.Warnings, 1, "proxy is healthy")
+		require.Contains(t, respJSON.Warnings[0], "High availability networking")
+	})
+
+	// This test catches a regression we detected on dogfood which caused
+	// proxies to remain unhealthy after a mesh failure if they dropped to zero
+	// siblings after the failure.
+	t.Run("HealthyZero", func(t *testing.T) {
+		t.Parallel()
+
+		deploymentValues := coderdtest.DeploymentValues(t)
+		deploymentValues.Experiments = []string{
+			"*",
+		}
+
+		client, closer, api, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
+			Options: &coderdtest.Options{
+				DeploymentValues:         deploymentValues,
+				AppHostname:              "*.primary.test.coder.com",
+				IncludeProvisionerDaemon: true,
+				RealIPConfig: &httpmw.RealIPConfig{
+					TrustedOrigins: []*net.IPNet{{
+						IP:   net.ParseIP("127.0.0.1"),
+						Mask: net.CIDRMask(8, 32),
+					}},
+					TrustedHeaders: []string{
+						"CF-Connecting-IP",
+					},
+				},
+			},
+			LicenseOptions: &coderdenttest.LicenseOptions{
+				Features: license.Features{
+					codersdk.FeatureWorkspaceProxy:        1,
+					codersdk.FeatureMultipleOrganizations: 1,
+				},
+			},
+		})
+		t.Cleanup(func() {
+			_ = closer.Close()
+		})
+
+		proxyURL, err := url.Parse("https://proxy2.test.coder.com")
+		require.NoError(t, err)
+
+		// Create 1 real proxy replica.
+		replicaPingErr := make(chan string, 4)
+		proxy := coderdenttest.NewWorkspaceProxyReplica(t, api, client, &coderdenttest.ProxyOptions{
+			Name:     "proxy-2",
+			ProxyURL: proxyURL,
+			ReplicaPingCallback: func(_ []codersdk.Replica, err string) {
+				replicaPingErr <- err
+			},
+		})
+
+		ctx := testutil.Context(t, testutil.WaitLong)
+		otherReplicaID := registerBrokenProxy(ctx, t, api.AccessURL, proxyURL.String(), proxy.Options.ProxySessionToken)
+
+		// Force the proxy to re-register immediately.
+		err = proxy.RegisterNow()
+		require.NoError(t, err, "failed to force proxy to re-register")
+
+		// Wait for the ping to fail.
+		for {
+			replicaErr := testutil.RequireRecvCtx(ctx, t, replicaPingErr)
+			t.Log("replica ping error:", replicaErr)
+			if replicaErr != "" {
+				break
+			}
+		}
+
+		// GET /healthz-report
+		u := proxy.ServerURL.ResolveReference(&url.URL{Path: "/healthz-report"})
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		var respJSON codersdk.ProxyHealthReport
+		err = json.NewDecoder(resp.Body).Decode(&respJSON)
+		resp.Body.Close()
+		require.NoError(t, err)
+		require.Len(t, respJSON.Warnings, 1, "proxy is healthy")
+		require.Contains(t, respJSON.Warnings[0], "High availability networking")
+
+		// Deregister the other replica.
+		wsproxyClient := wsproxysdk.New(api.AccessURL)
+		wsproxyClient.SetSessionToken(proxy.Options.ProxySessionToken)
+		err = wsproxyClient.DeregisterWorkspaceProxy(ctx, wsproxysdk.DeregisterWorkspaceProxyRequest{
+			ReplicaID: otherReplicaID,
+		})
+		require.NoError(t, err)
+
+		// Force the proxy to re-register immediately.
+		err = proxy.RegisterNow()
+		require.NoError(t, err, "failed to force proxy to re-register")
+
+		// Wait for the ping to be skipped.
+		for {
+			replicaErr := testutil.RequireRecvCtx(ctx, t, replicaPingErr)
+			t.Log("replica ping error:", replicaErr)
+			// Should be empty because there are no more peers. This was where
+			// the regression was.
+			if replicaErr == "" {
+				break
+			}
+		}
+
+		// GET /healthz-report
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		require.NoError(t, err)
+		resp, err = http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		err = json.NewDecoder(resp.Body).Decode(&respJSON)
+		resp.Body.Close()
+		require.NoError(t, err)
+		require.Len(t, respJSON.Warnings, 0, "proxy is unhealthy")
 	})
 }
 
@@ -791,9 +918,9 @@ func TestWorkspaceProxyWorkspaceApps(t *testing.T) {
 
 	apptest.Run(t, false, func(t *testing.T, opts *apptest.DeploymentOptions) *apptest.Deployment {
 		deploymentValues := coderdtest.DeploymentValues(t)
-		deploymentValues.DisablePathApps = clibase.Bool(opts.DisablePathApps)
-		deploymentValues.Dangerous.AllowPathAppSharing = clibase.Bool(opts.DangerousAllowPathAppSharing)
-		deploymentValues.Dangerous.AllowPathAppSiteOwnerAccess = clibase.Bool(opts.DangerousAllowPathAppSiteOwnerAccess)
+		deploymentValues.DisablePathApps = serpent.Bool(opts.DisablePathApps)
+		deploymentValues.Dangerous.AllowPathAppSharing = serpent.Bool(opts.DangerousAllowPathAppSharing)
+		deploymentValues.Dangerous.AllowPathAppSiteOwnerAccess = serpent.Bool(opts.DangerousAllowPathAppSiteOwnerAccess)
 		deploymentValues.Experiments = []string{
 			"*",
 		}
@@ -808,6 +935,9 @@ func TestWorkspaceProxyWorkspaceApps(t *testing.T) {
 		if opts.PrimaryAppHost == "" {
 			opts.PrimaryAppHost = "*.primary.test.coder.com"
 		}
+
+		db, pubsub := dbtestutil.NewDB(t)
+
 		client, closer, api, user := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues:         deploymentValues,
@@ -823,15 +953,25 @@ func TestWorkspaceProxyWorkspaceApps(t *testing.T) {
 					},
 				},
 				WorkspaceAppsStatsCollectorOptions: opts.StatsCollectorOptions,
+				Database:                           db,
+				Pubsub:                             pubsub,
 			},
 			LicenseOptions: &coderdenttest.LicenseOptions{
 				Features: license.Features{
-					codersdk.FeatureWorkspaceProxy: 1,
+					codersdk.FeatureWorkspaceProxy:        1,
+					codersdk.FeatureMultipleOrganizations: 1,
 				},
 			},
 		})
 		t.Cleanup(func() {
 			_ = closer.Close()
+		})
+
+		_ = dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature: database.CryptoKeyFeatureWorkspaceAppsToken,
+		})
+		_ = dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature: database.CryptoKeyFeatureWorkspaceAppsAPIKey,
 		})
 
 		// Create the external proxy
@@ -860,9 +1000,9 @@ func TestWorkspaceProxyWorkspaceApps_BlockDirect(t *testing.T) {
 
 	apptest.Run(t, false, func(t *testing.T, opts *apptest.DeploymentOptions) *apptest.Deployment {
 		deploymentValues := coderdtest.DeploymentValues(t)
-		deploymentValues.DisablePathApps = clibase.Bool(opts.DisablePathApps)
-		deploymentValues.Dangerous.AllowPathAppSharing = clibase.Bool(opts.DangerousAllowPathAppSharing)
-		deploymentValues.Dangerous.AllowPathAppSiteOwnerAccess = clibase.Bool(opts.DangerousAllowPathAppSiteOwnerAccess)
+		deploymentValues.DisablePathApps = serpent.Bool(opts.DisablePathApps)
+		deploymentValues.Dangerous.AllowPathAppSharing = serpent.Bool(opts.DangerousAllowPathAppSharing)
+		deploymentValues.Dangerous.AllowPathAppSiteOwnerAccess = serpent.Bool(opts.DangerousAllowPathAppSiteOwnerAccess)
 		deploymentValues.Experiments = []string{
 			"*",
 		}
@@ -877,6 +1017,8 @@ func TestWorkspaceProxyWorkspaceApps_BlockDirect(t *testing.T) {
 		if opts.PrimaryAppHost == "" {
 			opts.PrimaryAppHost = "*.primary.test.coder.com"
 		}
+
+		db, pubsub := dbtestutil.NewDB(t)
 		client, closer, api, user := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues:         deploymentValues,
@@ -892,15 +1034,25 @@ func TestWorkspaceProxyWorkspaceApps_BlockDirect(t *testing.T) {
 					},
 				},
 				WorkspaceAppsStatsCollectorOptions: opts.StatsCollectorOptions,
+				Database:                           db,
+				Pubsub:                             pubsub,
 			},
 			LicenseOptions: &coderdenttest.LicenseOptions{
 				Features: license.Features{
-					codersdk.FeatureWorkspaceProxy: 1,
+					codersdk.FeatureWorkspaceProxy:        1,
+					codersdk.FeatureMultipleOrganizations: 1,
 				},
 			},
 		})
 		t.Cleanup(func() {
 			_ = closer.Close()
+		})
+
+		_ = dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature: database.CryptoKeyFeatureWorkspaceAppsToken,
+		})
+		_ = dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature: database.CryptoKeyFeatureWorkspaceAppsAPIKey,
 		})
 
 		// Create the external proxy

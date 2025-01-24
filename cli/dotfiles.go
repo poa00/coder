@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,26 +14,26 @@ import (
 
 	"github.com/coder/pretty"
 
-	"github.com/coder/coder/v2/cli/clibase"
 	"github.com/coder/coder/v2/cli/cliui"
+	"github.com/coder/serpent"
 )
 
-func (r *RootCmd) dotfiles() *clibase.Cmd {
+func (r *RootCmd) dotfiles() *serpent.Command {
 	var symlinkDir string
 	var gitbranch string
 	var dotfilesRepoDir string
 
-	cmd := &clibase.Cmd{
+	cmd := &serpent.Command{
 		Use:        "dotfiles <git_repo_url>",
-		Middleware: clibase.RequireNArgs(1),
+		Middleware: serpent.RequireNArgs(1),
 		Short:      "Personalize your workspace by applying a canonical dotfiles repository",
-		Long: formatExamples(
-			example{
+		Long: FormatExamples(
+			Example{
 				Description: "Check out and install a dotfiles repository without prompts",
 				Command:     "coder dotfiles --yes git@github.com:example/dotfiles.git",
 			},
 		),
-		Handler: func(inv *clibase.Invocation) error {
+		Handler: func(inv *serpent.Invocation) error {
 			var (
 				gitRepo     = inv.Args[0]
 				cfg         = r.createConfig()
@@ -184,7 +183,7 @@ func (r *RootCmd) dotfiles() *clibase.Cmd {
 				}
 			}
 
-			script := findScript(installScriptSet, files)
+			script := findScript(installScriptSet, dotfilesDir)
 			if script != "" {
 				_, err = cliui.Prompt(inv, cliui.PromptOptions{
 					Text:      fmt.Sprintf("Running install script %s.\n\n  Continue?", script),
@@ -204,7 +203,7 @@ func (r *RootCmd) dotfiles() *clibase.Cmd {
 				}
 
 				if fi.Mode()&0o111 == 0 {
-					return xerrors.Errorf("script %q is not executable. See https://coder.com/docs/v2/latest/dotfiles for information on how to resolve the issue.", script)
+					return xerrors.Errorf("script %q does not have execute permissions", script)
 				}
 
 				// it is safe to use a variable command here because it's from
@@ -276,26 +275,26 @@ func (r *RootCmd) dotfiles() *clibase.Cmd {
 			return nil
 		},
 	}
-	cmd.Options = clibase.OptionSet{
+	cmd.Options = serpent.OptionSet{
 		{
 			Flag:        "symlink-dir",
 			Env:         "CODER_SYMLINK_DIR",
 			Description: "Specifies the directory for the dotfiles symlink destinations. If empty, will use $HOME.",
-			Value:       clibase.StringOf(&symlinkDir),
+			Value:       serpent.StringOf(&symlinkDir),
 		},
 		{
 			Flag:          "branch",
 			FlagShorthand: "b",
 			Description: "Specifies which branch to clone. " +
 				"If empty, will default to cloning the default branch or using the existing branch in the cloned repo on disk.",
-			Value: clibase.StringOf(&gitbranch),
+			Value: serpent.StringOf(&gitbranch),
 		},
 		{
 			Flag:        "repo-dir",
 			Default:     "dotfiles",
 			Env:         "CODER_DOTFILES_REPO_DIR",
 			Description: "Specifies the directory for the dotfiles repository, relative to global config directory.",
-			Value:       clibase.StringOf(&dotfilesRepoDir),
+			Value:       serpent.StringOf(&dotfilesRepoDir),
 		},
 		cliui.SkipPromptOption(),
 	}
@@ -308,7 +307,7 @@ type ensureCorrectGitBranchParams struct {
 	gitBranch     string
 }
 
-func ensureCorrectGitBranch(baseInv *clibase.Invocation, params ensureCorrectGitBranchParams) error {
+func ensureCorrectGitBranch(baseInv *serpent.Invocation, params ensureCorrectGitBranchParams) error {
 	dotfileCmd := func(cmd string, args ...string) *exec.Cmd {
 		c := exec.CommandContext(baseInv.Context(), cmd, args...)
 		c.Dir = params.repoDir
@@ -361,15 +360,12 @@ func dirExists(name string) (bool, error) {
 }
 
 // findScript will find the first file that matches the script set.
-func findScript(scriptSet []string, files []fs.DirEntry) string {
+func findScript(scriptSet []string, directory string) string {
 	for _, i := range scriptSet {
-		for _, f := range files {
-			if f.Name() == i {
-				return f.Name()
-			}
+		if _, err := os.Stat(filepath.Join(directory, i)); err == nil {
+			return i
 		}
 	}
-
 	return ""
 }
 

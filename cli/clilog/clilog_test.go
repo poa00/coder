@@ -2,16 +2,15 @@ package clilog_test
 
 import (
 	"encoding/json"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/coder/coder/v2/cli/clibase"
 	"github.com/coder/coder/v2/cli/clilog"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/serpent"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,7 +22,7 @@ func TestBuilder(t *testing.T) {
 	t.Run("NoConfiguration", func(t *testing.T) {
 		t.Parallel()
 
-		cmd := &clibase.Cmd{
+		cmd := &serpent.Command{
 			Use:     "test",
 			Handler: testHandler(t),
 		}
@@ -35,7 +34,7 @@ func TestBuilder(t *testing.T) {
 		t.Parallel()
 
 		tempFile := filepath.Join(t.TempDir(), "test.log")
-		cmd := &clibase.Cmd{
+		cmd := &serpent.Command{
 			Use: "test",
 			Handler: testHandler(t,
 				clilog.WithHuman(tempFile),
@@ -51,7 +50,7 @@ func TestBuilder(t *testing.T) {
 		t.Parallel()
 
 		tempFile := filepath.Join(t.TempDir(), "test.log")
-		cmd := &clibase.Cmd{
+		cmd := &serpent.Command{
 			Use: "test",
 			Handler: testHandler(t,
 				clilog.WithHuman(tempFile),
@@ -68,7 +67,7 @@ func TestBuilder(t *testing.T) {
 		t.Parallel()
 
 		tempFile := filepath.Join(t.TempDir(), "test.log")
-		cmd := &clibase.Cmd{
+		cmd := &serpent.Command{
 			Use:     "test",
 			Handler: testHandler(t, clilog.WithHuman(tempFile)),
 		}
@@ -81,7 +80,7 @@ func TestBuilder(t *testing.T) {
 		t.Parallel()
 
 		tempFile := filepath.Join(t.TempDir(), "test.log")
-		cmd := &clibase.Cmd{
+		cmd := &serpent.Command{
 			Use:     "test",
 			Handler: testHandler(t, clilog.WithJSON(tempFile), clilog.WithVerbose()),
 		}
@@ -107,7 +106,7 @@ func TestBuilder(t *testing.T) {
 
 			// Use the default deployment values.
 			dv := coderdtest.DeploymentValues(t)
-			cmd := &clibase.Cmd{
+			cmd := &serpent.Command{
 				Use:     "test",
 				Handler: testHandler(t, clilog.FromDeploymentValues(dv)),
 			}
@@ -127,15 +126,15 @@ func TestBuilder(t *testing.T) {
 			dv := &codersdk.DeploymentValues{
 				Logging: codersdk.LoggingConfig{
 					Filter: []string{"foo", "baz"},
-					Human:  clibase.String(tempFile),
-					JSON:   clibase.String(tempJSON),
+					Human:  serpent.String(tempFile),
+					JSON:   serpent.String(tempJSON),
 				},
 				Verbose: true,
 				Trace: codersdk.TraceConfig{
 					Enable: true,
 				},
 			}
-			cmd := &clibase.Cmd{
+			cmd := &serpent.Command{
 				Use:     "test",
 				Handler: testHandler(t, clilog.FromDeploymentValues(dv)),
 			}
@@ -144,30 +143,6 @@ func TestBuilder(t *testing.T) {
 			assertLogs(t, tempFile, infoLog, warnLog)
 			assertLogsJSON(t, tempJSON, info, infoLog, warn, warnLog)
 		})
-	})
-
-	t.Run("NotFound", func(t *testing.T) {
-		t.Parallel()
-
-		tempFile := filepath.Join(t.TempDir(), "doesnotexist", "test.log")
-		cmd := &clibase.Cmd{
-			Use: "test",
-			Handler: func(inv *clibase.Invocation) error {
-				logger, closeLog, err := clilog.New(
-					clilog.WithFilter("foo", "baz"),
-					clilog.WithHuman(tempFile),
-					clilog.WithVerbose(),
-				).Build(inv)
-				if err != nil {
-					return err
-				}
-				defer closeLog()
-				logger.Error(inv.Context(), "you will never see this")
-				return nil
-			},
-		}
-		err := cmd.Invoke().Run()
-		require.ErrorIs(t, err, fs.ErrNotExist)
 	})
 }
 
@@ -181,10 +156,10 @@ var (
 	filterLog = "this is an important debug message you want to see"
 )
 
-func testHandler(t testing.TB, opts ...clilog.Option) clibase.HandlerFunc {
+func testHandler(t testing.TB, opts ...clilog.Option) serpent.HandlerFunc {
 	t.Helper()
 
-	return func(inv *clibase.Invocation) error {
+	return func(inv *serpent.Invocation) error {
 		logger, closeLog, err := clilog.New(opts...).Build(inv)
 		if err != nil {
 			return err

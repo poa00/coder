@@ -2,7 +2,6 @@ package healthcheck
 
 import (
 	"context"
-	"sort"
 	"time"
 
 	"golang.org/x/mod/semver"
@@ -16,11 +15,11 @@ import (
 	"github.com/coder/coder/v2/coderd/healthcheck/health"
 	"github.com/coder/coder/v2/coderd/provisionerdserver"
 	"github.com/coder/coder/v2/coderd/util/ptr"
-	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/codersdk/healthsdk"
 	"github.com/coder/coder/v2/provisionerd/proto"
 )
 
-type ProvisionerDaemonsReport codersdk.ProvisionerDaemonsReport
+type ProvisionerDaemonsReport healthsdk.ProvisionerDaemonsReport
 
 type ProvisionerDaemonsReportDeps struct {
 	// Required
@@ -40,7 +39,7 @@ type ProvisionerDaemonsStore interface {
 }
 
 func (r *ProvisionerDaemonsReport) Run(ctx context.Context, opts *ProvisionerDaemonsReportDeps) {
-	r.Items = make([]codersdk.ProvisionerDaemonsReportItem, 0)
+	r.Items = make([]healthsdk.ProvisionerDaemonsReportItem, 0)
 	r.Severity = health.SeverityOK
 	r.Warnings = make([]health.Message, 0)
 	r.Dismissed = opts.Dismissed
@@ -51,7 +50,7 @@ func (r *ProvisionerDaemonsReport) Run(ctx context.Context, opts *ProvisionerDae
 	now := opts.TimeNow()
 
 	if opts.StaleInterval == 0 {
-		opts.StaleInterval = provisionerdserver.DefaultHeartbeatInterval * 3
+		opts.StaleInterval = provisionerdserver.StaleInterval
 	}
 
 	if opts.CurrentVersion == "" {
@@ -80,23 +79,10 @@ func (r *ProvisionerDaemonsReport) Run(ctx context.Context, opts *ProvisionerDae
 		return
 	}
 
-	// Ensure stable order for display and for tests
-	sort.Slice(daemons, func(i, j int) bool {
-		return daemons[i].Name < daemons[j].Name
-	})
-
-	for _, daemon := range daemons {
-		// Daemon never connected, skip.
-		if !daemon.LastSeenAt.Valid {
-			continue
-		}
-		// Daemon has gone away, skip.
-		if now.Sub(daemon.LastSeenAt.Time) > (opts.StaleInterval) {
-			continue
-		}
-
-		it := codersdk.ProvisionerDaemonsReportItem{
-			ProvisionerDaemon: db2sdk.ProvisionerDaemon(daemon),
+	recentDaemons := db2sdk.RecentProvisionerDaemons(now, opts.StaleInterval, daemons)
+	for _, daemon := range recentDaemons {
+		it := healthsdk.ProvisionerDaemonsReportItem{
+			ProvisionerDaemon: daemon,
 			Warnings:          make([]health.Message, 0),
 		}
 

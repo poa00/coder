@@ -29,9 +29,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/fullsailor/pkcs7"
+	"github.com/go-chi/chi/v5"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/google/uuid"
 	"github.com/moby/moby/pkg/namesgenerator"
@@ -54,15 +56,21 @@ import (
 	"github.com/coder/coder/v2/coderd/audit"
 	"github.com/coder/coder/v2/coderd/autobuild"
 	"github.com/coder/coder/v2/coderd/awsidentity"
-	"github.com/coder/coder/v2/coderd/batchstats"
+	"github.com/coder/coder/v2/coderd/cryptokeys"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
+	"github.com/coder/coder/v2/coderd/database/dbrollup"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/database/pubsub"
 	"github.com/coder/coder/v2/coderd/externalauth"
 	"github.com/coder/coder/v2/coderd/gitsshkey"
 	"github.com/coder/coder/v2/coderd/httpmw"
+	"github.com/coder/coder/v2/coderd/notifications"
+	"github.com/coder/coder/v2/coderd/notifications/notificationstest"
 	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/policy"
+	"github.com/coder/coder/v2/coderd/runtimeconfig"
 	"github.com/coder/coder/v2/coderd/schedule"
 	"github.com/coder/coder/v2/coderd/telemetry"
 	"github.com/coder/coder/v2/coderd/unhanger"
@@ -70,9 +78,11 @@ import (
 	"github.com/coder/coder/v2/coderd/util/ptr"
 	"github.com/coder/coder/v2/coderd/workspaceapps"
 	"github.com/coder/coder/v2/coderd/workspaceapps/appurl"
+	"github.com/coder/coder/v2/coderd/workspacestats"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/agentsdk"
 	"github.com/coder/coder/v2/codersdk/drpc"
+	"github.com/coder/coder/v2/codersdk/healthsdk"
 	"github.com/coder/coder/v2/cryptorand"
 	"github.com/coder/coder/v2/provisioner/echo"
 	"github.com/coder/coder/v2/provisionerd"
@@ -81,37 +91,35 @@ import (
 	sdkproto "github.com/coder/coder/v2/provisionersdk/proto"
 	"github.com/coder/coder/v2/tailnet"
 	"github.com/coder/coder/v2/testutil"
+	"github.com/coder/quartz"
 )
-
-// AppSecurityKey is a 96-byte key used to sign JWTs and encrypt JWEs for
-// workspace app tokens in tests.
-var AppSecurityKey = must(workspaceapps.KeyFromString("6465616e207761732068657265206465616e207761732068657265206465616e207761732068657265206465616e207761732068657265206465616e207761732068657265206465616e207761732068657265206465616e2077617320686572"))
 
 type Options struct {
 	// AccessURL denotes a custom access URL. By default we use the httptest
 	// server's URL. Setting this may result in unexpected behavior (especially
 	// with running agents).
-	AccessURL             *url.URL
-	AppHostname           string
-	AWSCertificates       awsidentity.Certificates
-	Authorizer            rbac.Authorizer
-	AzureCertificates     x509.VerifyOptions
-	GithubOAuth2Config    *coderd.GithubOAuth2Config
-	RealIPConfig          *httpmw.RealIPConfig
-	OIDCConfig            *coderd.OIDCConfig
-	GoogleTokenValidator  *idtoken.Validator
-	SSHKeygenAlgorithm    gitsshkey.Algorithm
-	AutobuildTicker       <-chan time.Time
-	AutobuildStats        chan<- autobuild.Stats
-	Auditor               audit.Auditor
-	TLSCertificates       []tls.Certificate
-	ExternalAuthConfigs   []*externalauth.Config
-	TrialGenerator        func(ctx context.Context, body codersdk.LicensorTrialRequest) error
-	RefreshEntitlements   func(ctx context.Context) error
-	TemplateScheduleStore schedule.TemplateScheduleStore
-	Coordinator           tailnet.Coordinator
+	AccessURL                      *url.URL
+	AppHostname                    string
+	AWSCertificates                awsidentity.Certificates
+	Authorizer                     rbac.Authorizer
+	AzureCertificates              x509.VerifyOptions
+	GithubOAuth2Config             *coderd.GithubOAuth2Config
+	RealIPConfig                   *httpmw.RealIPConfig
+	OIDCConfig                     *coderd.OIDCConfig
+	GoogleTokenValidator           *idtoken.Validator
+	SSHKeygenAlgorithm             gitsshkey.Algorithm
+	AutobuildTicker                <-chan time.Time
+	AutobuildStats                 chan<- autobuild.Stats
+	Auditor                        audit.Auditor
+	TLSCertificates                []tls.Certificate
+	ExternalAuthConfigs            []*externalauth.Config
+	TrialGenerator                 func(ctx context.Context, body codersdk.LicensorTrialRequest) error
+	RefreshEntitlements            func(ctx context.Context) error
+	TemplateScheduleStore          schedule.TemplateScheduleStore
+	Coordinator                    tailnet.Coordinator
+	CoordinatorResumeTokenProvider tailnet.ResumeTokenProvider
 
-	HealthcheckFunc    func(ctx context.Context, apiKey string) *codersdk.HealthcheckReport
+	HealthcheckFunc    func(ctx context.Context, apiKey string) *healthsdk.HealthcheckReport
 	HealthcheckTimeout time.Duration
 	HealthcheckRefresh time.Duration
 
@@ -120,8 +128,12 @@ type Options struct {
 	LoginRateLimit int
 	FilesRateLimit int
 
+	// OneTimePasscodeValidityPeriod specifies how long a one time passcode should be valid for.
+	OneTimePasscodeValidityPeriod time.Duration
+
 	// IncludeProvisionerDaemon when true means to start an in-memory provisionerD
 	IncludeProvisionerDaemon    bool
+	ProvisionerDaemonTags       map[string]string
 	MetricsCacheRefreshInterval time.Duration
 	AgentStatsRefreshInterval   time.Duration
 	DeploymentValues            *codersdk.DeploymentValues
@@ -135,17 +147,29 @@ type Options struct {
 	Database database.Store
 	Pubsub   pubsub.Pubsub
 
+	// APIMiddleware inserts middleware before api.RootHandler, this can be
+	// useful in certain tests where you want to intercept requests before
+	// passing them on to the API, e.g. for synchronization of execution.
+	APIMiddleware func(http.Handler) http.Handler
+
 	ConfigSSH codersdk.SSHConfigResponse
 
 	SwaggerEndpoint bool
 	// Logger should only be overridden if you expect errors
 	// as part of your test.
 	Logger       *slog.Logger
-	StatsBatcher *batchstats.Batcher
+	StatsBatcher workspacestats.Batcher
 
 	WorkspaceAppsStatsCollectorOptions workspaceapps.StatsCollectorOptions
 	AllowWorkspaceRenames              bool
 	NewTicker                          func(duration time.Duration) (<-chan time.Time, func())
+	DatabaseRolluper                   *dbrollup.Rolluper
+	WorkspaceUsageTrackerFlush         chan int
+	WorkspaceUsageTrackerTick          chan time.Time
+	NotificationsEnqueuer              notifications.Enqueuer
+	APIKeyEncryptionCache              cryptokeys.EncryptionKeycache
+	OIDCConvertKeyCache                cryptokeys.SigningKeycache
+	Clock                              quartz.Clock
 }
 
 // New constructs a codersdk client connected to an in-memory API instance.
@@ -193,7 +217,7 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 		options = &Options{}
 	}
 	if options.Logger == nil {
-		logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug).Named("coderd")
+		logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true}).Leveled(slog.LevelDebug).Named("coderd")
 		options.Logger = &logger
 	}
 	if options.GoogleTokenValidator == nil {
@@ -215,7 +239,7 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 	}
 
 	if options.Authorizer == nil {
-		defAuth := rbac.NewCachingAuthorizer(prometheus.NewRegistry())
+		defAuth := rbac.NewStrictCachingAuthorizer(prometheus.NewRegistry())
 		if _, ok := t.(*testing.T); ok {
 			options.Authorizer = &RecordingAuthorizer{
 				Wrapped: defAuth,
@@ -229,11 +253,19 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 	if options.Database == nil {
 		options.Database, options.Pubsub = dbtestutil.NewDB(t)
 	}
+	if options.CoordinatorResumeTokenProvider == nil {
+		options.CoordinatorResumeTokenProvider = tailnet.NewInsecureTestResumeTokenProvider()
+	}
+
+	if options.NotificationsEnqueuer == nil {
+		options.NotificationsEnqueuer = &notificationstest.FakeEnqueuer{}
+	}
 
 	accessControlStore := &atomic.Pointer[dbauthz.AccessControlStore]{}
 	var acs dbauthz.AccessControlStore = dbauthz.AGPLTemplateAccessControlStore{}
 	accessControlStore.Store(&acs)
 
+	runtimeManager := runtimeconfig.NewManager()
 	options.Database = dbauthz.New(options.Database, options.Authorizer, *options.Logger, accessControlStore)
 
 	// Some routes expect a deployment ID, so just make sure one exists.
@@ -249,8 +281,19 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 	if options.DeploymentValues == nil {
 		options.DeploymentValues = DeploymentValues(t)
 	}
-	// This value is not safe to run in parallel. Force it to be false.
-	options.DeploymentValues.DisableOwnerWorkspaceExec = false
+	// DisableOwnerWorkspaceExec modifies the 'global' RBAC roles. Fast-fail tests if we detect this.
+	if !options.DeploymentValues.DisableOwnerWorkspaceExec.Value() {
+		ownerSubj := rbac.Subject{
+			Roles: rbac.RoleIdentifiers{rbac.RoleOwner()},
+			Scope: rbac.ScopeAll,
+		}
+		if err := options.Authorizer.Authorize(context.Background(), ownerSubj, policy.ActionSSH, rbac.ResourceWorkspace); err != nil {
+			if rbac.IsUnauthorizedError(err) {
+				t.Fatal("Side-effect of DisableOwnerWorkspaceExec detected in unrelated test. Please move the test that requires DisableOwnerWorkspaceExec to its own package so that it does not impact other tests!")
+			}
+			require.NoError(t, err)
+		}
+	}
 
 	// If no ratelimits are set, disable all rate limiting for tests.
 	if options.APIRateLimit == 0 {
@@ -265,14 +308,21 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 	if options.StatsBatcher == nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
-		batcher, closeBatcher, err := batchstats.New(ctx,
-			batchstats.WithStore(options.Database),
+		batcher, closeBatcher, err := workspacestats.NewBatcher(ctx,
+			workspacestats.BatcherWithStore(options.Database),
 			// Avoid cluttering up test output.
-			batchstats.WithLogger(slog.Make(sloghuman.Sink(io.Discard))),
+			workspacestats.BatcherWithLogger(slog.Make(sloghuman.Sink(io.Discard))),
 		)
 		require.NoError(t, err, "create stats batcher")
 		options.StatsBatcher = batcher
 		t.Cleanup(closeBatcher)
+	}
+	if options.NotificationsEnqueuer == nil {
+		options.NotificationsEnqueuer = &notificationstest.FakeEnqueuer{}
+	}
+
+	if options.OneTimePasscodeValidityPeriod == 0 {
+		options.OneTimePasscodeValidityPeriod = testutil.WaitLong
 	}
 
 	var templateScheduleStore atomic.Pointer[schedule.TemplateScheduleStore]
@@ -292,11 +342,13 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 		ctx,
 		options.Database,
 		options.Pubsub,
+		prometheus.NewRegistry(),
 		&templateScheduleStore,
 		&auditor,
 		accessControlStore,
 		*options.Logger,
 		options.AutobuildTicker,
+		options.NotificationsEnqueuer,
 	).WithStatsChannel(options.AutobuildStats)
 	lifecycleExecutor.Run()
 
@@ -305,6 +357,36 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 	hangDetector := unhanger.New(ctx, options.Database, options.Pubsub, options.Logger.Named("unhanger.detector"), hangDetectorTicker.C)
 	hangDetector.Start()
 	t.Cleanup(hangDetector.Close)
+
+	// Did last_used_at not update? Scratching your noggin? Here's why.
+	// Workspace usage tracking must be triggered manually in tests.
+	// The vast majority of existing tests do not depend on last_used_at
+	// and adding an extra time-based background goroutine to all existing
+	// tests may lead to future flakes and goleak complaints.
+	// Instead, pass in your own flush and ticker like so:
+	//
+	//   tickCh = make(chan time.Time)
+	//   flushCh = make(chan int, 1)
+	//   client  = coderdtest.New(t, &coderdtest.Options{
+	//     WorkspaceUsageTrackerFlush: flushCh,
+	//     WorkspaceUsageTrackerTick: tickCh
+	//   })
+	//
+	// Now to trigger a tick, just write to `tickCh`.
+	// Reading from `flushCh` will ensure that workspaceusage.Tracker flushed.
+	// See TestPortForward or TestTracker_MultipleInstances for how this works in practice.
+	if options.WorkspaceUsageTrackerFlush == nil {
+		options.WorkspaceUsageTrackerFlush = make(chan int, 1) // buffering just in case
+	}
+	if options.WorkspaceUsageTrackerTick == nil {
+		options.WorkspaceUsageTrackerTick = make(chan time.Time, 1) // buffering just in case
+	}
+	// Close is called by API.Close()
+	wuTracker := workspacestats.NewTracker(
+		options.Database,
+		workspacestats.TrackerWithLogger(options.Logger.Named("workspace_usage_tracker")),
+		workspacestats.TrackerWithTickFlush(options.WorkspaceUsageTrackerTick, options.WorkspaceUsageTrackerFlush),
+	)
 
 	var mutex sync.RWMutex
 	var handler http.Handler
@@ -396,7 +478,11 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 	if !options.DeploymentValues.DERP.Server.Enable.Value() {
 		region = nil
 	}
-	derpMap, err := tailnet.NewDERPMap(ctx, region, stunAddresses, "", "", options.DeploymentValues.DERP.Config.BlockDirect.Value())
+	derpMap, err := tailnet.NewDERPMap(ctx, region, stunAddresses,
+		options.DeploymentValues.DERP.Config.URL.Value(),
+		options.DeploymentValues.DERP.Config.Path.Value(),
+		options.DeploymentValues.DERP.Config.BlockDirect.Value(),
+	)
 	require.NoError(t, err)
 
 	return func(h http.Handler) {
@@ -413,6 +499,7 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 			AppHostnameRegex:               appHostnameRegex,
 			Logger:                         *options.Logger,
 			CacheDir:                       t.TempDir(),
+			RuntimeConfig:                  runtimeManager,
 			Database:                       options.Database,
 			Pubsub:                         options.Pubsub,
 			ExternalAuthConfigs:            options.ExternalAuthConfigs,
@@ -439,13 +526,13 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 			TailnetCoordinator:                 options.Coordinator,
 			BaseDERPMap:                        derpMap,
 			DERPMapUpdateFrequency:             150 * time.Millisecond,
+			CoordinatorResumeTokenProvider:     options.CoordinatorResumeTokenProvider,
 			MetricsCacheRefreshInterval:        options.MetricsCacheRefreshInterval,
 			AgentStatsRefreshInterval:          options.AgentStatsRefreshInterval,
 			DeploymentValues:                   options.DeploymentValues,
 			DeploymentOptions:                  codersdk.DeploymentOptionsWithoutSecrets(options.DeploymentValues.Options()),
 			UpdateCheckOptions:                 options.UpdateCheckOptions,
 			SwaggerEndpoint:                    options.SwaggerEndpoint,
-			AppSecurityKey:                     AppSecurityKey,
 			SSHConfig:                          options.ConfigSSH,
 			HealthcheckFunc:                    options.HealthcheckFunc,
 			HealthcheckTimeout:                 options.HealthcheckTimeout,
@@ -454,6 +541,13 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 			WorkspaceAppsStatsCollectorOptions: options.WorkspaceAppsStatsCollectorOptions,
 			AllowWorkspaceRenames:              options.AllowWorkspaceRenames,
 			NewTicker:                          options.NewTicker,
+			DatabaseRolluper:                   options.DatabaseRolluper,
+			WorkspaceUsageTracker:              wuTracker,
+			NotificationsEnqueuer:              options.NotificationsEnqueuer,
+			OneTimePasscodeValidityPeriod:      options.OneTimePasscodeValidityPeriod,
+			Clock:                              options.Clock,
+			AppEncryptionKeyCache:              options.APIKeyEncryptionCache,
+			OIDCConvertKeyCache:                options.OIDCConvertKeyCache,
 		}
 }
 
@@ -467,10 +561,17 @@ func NewWithAPI(t testing.TB, options *Options) (*codersdk.Client, io.Closer, *c
 	setHandler, cancelFunc, serverURL, newOptions := NewOptions(t, options)
 	// We set the handler after server creation for the access URL.
 	coderAPI := coderd.New(newOptions)
-	setHandler(coderAPI.RootHandler)
+	rootHandler := coderAPI.RootHandler
+	if options.APIMiddleware != nil {
+		r := chi.NewRouter()
+		r.Use(options.APIMiddleware)
+		r.Mount("/", rootHandler)
+		rootHandler = r
+	}
+	setHandler(rootHandler)
 	var provisionerCloser io.Closer = nopcloser{}
 	if options.IncludeProvisionerDaemon {
-		provisionerCloser = NewProvisionerDaemon(t, coderAPI)
+		provisionerCloser = NewTaggedProvisionerDaemon(t, coderAPI, "test", options.ProvisionerDaemonTags)
 	}
 	client := codersdk.New(serverURL)
 	t.Cleanup(func() {
@@ -482,14 +583,18 @@ func NewWithAPI(t testing.TB, options *Options) (*codersdk.Client, io.Closer, *c
 	return client, provisionerCloser, coderAPI
 }
 
-// provisionerdCloser wraps a provisioner daemon as an io.Closer that can be called multiple times
-type provisionerdCloser struct {
+// ProvisionerdCloser wraps a provisioner daemon as an io.Closer that can be called multiple times
+type ProvisionerdCloser struct {
 	mu     sync.Mutex
 	closed bool
 	d      *provisionerd.Server
 }
 
-func (c *provisionerdCloser) Close() error {
+func NewProvisionerDaemonCloser(d *provisionerd.Server) *ProvisionerdCloser {
+	return &ProvisionerdCloser{d: d}
+}
+
+func (c *ProvisionerdCloser) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -498,7 +603,7 @@ func (c *provisionerdCloser) Close() error {
 	c.closed = true
 	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
 	defer cancel()
-	shutdownErr := c.d.Shutdown(ctx)
+	shutdownErr := c.d.Shutdown(ctx, true)
 	closeErr := c.d.Close()
 	if shutdownErr != nil {
 		return shutdownErr
@@ -510,6 +615,10 @@ func (c *provisionerdCloser) Close() error {
 // well with coderd testing. It registers the "echo" provisioner for
 // quick testing.
 func NewProvisionerDaemon(t testing.TB, coderAPI *coderd.API) io.Closer {
+	return NewTaggedProvisionerDaemon(t, coderAPI, "test", nil)
+}
+
+func NewTaggedProvisionerDaemon(t testing.TB, coderAPI *coderd.API, name string, provisionerTags map[string]string) io.Closer {
 	t.Helper()
 
 	// t.Cleanup runs in last added, first called order. t.TempDir() will delete
@@ -535,8 +644,9 @@ func NewProvisionerDaemon(t testing.TB, coderAPI *coderd.API) io.Closer {
 		assert.NoError(t, err)
 	}()
 
+	connectedCh := make(chan struct{})
 	daemon := provisionerd.New(func(dialCtx context.Context) (provisionerdproto.DRPCProvisionerDaemonClient, error) {
-		return coderAPI.CreateInMemoryProvisionerDaemon(dialCtx, "test")
+		return coderAPI.CreateInMemoryTaggedProvisionerDaemon(dialCtx, name, []codersdk.ProvisionerType{codersdk.ProvisionerTypeEcho}, provisionerTags)
 	}, &provisionerd.Options{
 		Logger:              coderAPI.Logger.Named("provisionerd").Leveled(slog.LevelDebug),
 		UpdateInterval:      250 * time.Millisecond,
@@ -544,50 +654,13 @@ func NewProvisionerDaemon(t testing.TB, coderAPI *coderd.API) io.Closer {
 		Connector: provisionerd.LocalProvisioners{
 			string(database.ProvisionerTypeEcho): sdkproto.NewDRPCProvisionerClient(echoClient),
 		},
+		InitConnectionCh: connectedCh,
 	})
-	closer := &provisionerdCloser{d: daemon}
-	t.Cleanup(func() {
-		_ = closer.Close()
-	})
-	return closer
-}
-
-func NewExternalProvisionerDaemon(t testing.TB, client *codersdk.Client, org uuid.UUID, tags map[string]string) io.Closer {
-	echoClient, echoServer := drpc.MemTransportPipe()
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	serveDone := make(chan struct{})
-	t.Cleanup(func() {
-		_ = echoClient.Close()
-		_ = echoServer.Close()
-		cancelFunc()
-		<-serveDone
-	})
-	go func() {
-		defer close(serveDone)
-		err := echo.Serve(ctx, &provisionersdk.ServeOptions{
-			Listener:      echoServer,
-			WorkDirectory: t.TempDir(),
-		})
-		assert.NoError(t, err)
-	}()
-
-	daemon := provisionerd.New(func(ctx context.Context) (provisionerdproto.DRPCProvisionerDaemonClient, error) {
-		return client.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-			ID:           uuid.New(),
-			Name:         t.Name(),
-			Organization: org,
-			Provisioners: []codersdk.ProvisionerType{codersdk.ProvisionerTypeEcho},
-			Tags:         tags,
-		})
-	}, &provisionerd.Options{
-		Logger:              slogtest.Make(t, nil).Named("provisionerd").Leveled(slog.LevelDebug),
-		UpdateInterval:      250 * time.Millisecond,
-		ForceCancelInterval: 5 * time.Second,
-		Connector: provisionerd.LocalProvisioners{
-			string(database.ProvisionerTypeEcho): sdkproto.NewDRPCProvisionerClient(echoClient),
-		},
-	})
-	closer := &provisionerdCloser{d: daemon}
+	// Wait for the provisioner daemon to connect before continuing.
+	// Users of this function tend to assume that the provisioner is connected
+	// and ready to use when that may not strictly be the case.
+	<-connectedCh
+	closer := NewProvisionerDaemonCloser(daemon)
 	t.Cleanup(func() {
 		_ = closer.Close()
 	})
@@ -598,6 +671,17 @@ var FirstUserParams = codersdk.CreateFirstUserRequest{
 	Email:    "testuser@coder.com",
 	Username: "testuser",
 	Password: "SomeSecurePassword!",
+	Name:     "Test User",
+}
+
+var TrialUserParams = codersdk.CreateFirstUserTrialInfo{
+	FirstName:   "John",
+	LastName:    "Doe",
+	PhoneNumber: "9999999999",
+	JobTitle:    "Engineer",
+	CompanyName: "Acme Inc",
+	Country:     "United States",
+	Developers:  "10-50",
 }
 
 // CreateFirstUser creates a user with preset credentials and authenticates
@@ -616,24 +700,29 @@ func CreateFirstUser(t testing.TB, client *codersdk.Client) codersdk.CreateFirst
 }
 
 // CreateAnotherUser creates and authenticates a new user.
-func CreateAnotherUser(t testing.TB, client *codersdk.Client, organizationID uuid.UUID, roles ...string) (*codersdk.Client, codersdk.User) {
-	return createAnotherUserRetry(t, client, organizationID, 5, roles)
+// Roles can include org scoped roles with 'roleName:<organization_id>'
+func CreateAnotherUser(t testing.TB, client *codersdk.Client, organizationID uuid.UUID, roles ...rbac.RoleIdentifier) (*codersdk.Client, codersdk.User) {
+	return createAnotherUserRetry(t, client, []uuid.UUID{organizationID}, 5, roles)
 }
 
-func CreateAnotherUserMutators(t testing.TB, client *codersdk.Client, organizationID uuid.UUID, roles []string, mutators ...func(r *codersdk.CreateUserRequest)) (*codersdk.Client, codersdk.User) {
-	return createAnotherUserRetry(t, client, organizationID, 5, roles, mutators...)
+func CreateAnotherUserMutators(t testing.TB, client *codersdk.Client, organizationID uuid.UUID, roles []rbac.RoleIdentifier, mutators ...func(r *codersdk.CreateUserRequestWithOrgs)) (*codersdk.Client, codersdk.User) {
+	return createAnotherUserRetry(t, client, []uuid.UUID{organizationID}, 5, roles, mutators...)
 }
 
 // AuthzUserSubject does not include the user's groups.
 func AuthzUserSubject(user codersdk.User, orgID uuid.UUID) rbac.Subject {
-	roles := make(rbac.RoleNames, 0, len(user.Roles))
+	roles := make(rbac.RoleIdentifiers, 0, len(user.Roles))
 	// Member role is always implied
 	roles = append(roles, rbac.RoleMember())
 	for _, r := range user.Roles {
-		roles = append(roles, r.Name)
+		orgID, _ := uuid.Parse(r.OrganizationID) // defaults to nil
+		roles = append(roles, rbac.RoleIdentifier{
+			Name:           r.Name,
+			OrganizationID: orgID,
+		})
 	}
 	// We assume only 1 org exists
-	roles = append(roles, rbac.RoleOrgMember(orgID))
+	roles = append(roles, rbac.ScopedRoleOrgMember(orgID))
 
 	return rbac.Subject{
 		ID:     user.ID.String(),
@@ -643,30 +732,34 @@ func AuthzUserSubject(user codersdk.User, orgID uuid.UUID) rbac.Subject {
 	}
 }
 
-func createAnotherUserRetry(t testing.TB, client *codersdk.Client, organizationID uuid.UUID, retries int, roles []string, mutators ...func(r *codersdk.CreateUserRequest)) (*codersdk.Client, codersdk.User) {
-	req := codersdk.CreateUserRequest{
-		Email:          namesgenerator.GetRandomName(10) + "@coder.com",
-		Username:       RandomUsername(t),
-		Password:       "SomeSecurePassword!",
-		OrganizationID: organizationID,
+func createAnotherUserRetry(t testing.TB, client *codersdk.Client, organizationIDs []uuid.UUID, retries int, roles []rbac.RoleIdentifier, mutators ...func(r *codersdk.CreateUserRequestWithOrgs)) (*codersdk.Client, codersdk.User) {
+	req := codersdk.CreateUserRequestWithOrgs{
+		Email:           namesgenerator.GetRandomName(10) + "@coder.com",
+		Username:        RandomUsername(t),
+		Name:            RandomName(t),
+		Password:        "SomeSecurePassword!",
+		OrganizationIDs: organizationIDs,
+		// Always create users as active in tests to ignore an extra audit log
+		// when logging in.
+		UserStatus: ptr.Ref(codersdk.UserStatusActive),
 	}
 	for _, m := range mutators {
 		m(&req)
 	}
 
-	user, err := client.CreateUser(context.Background(), req)
+	user, err := client.CreateUserWithOrgs(context.Background(), req)
 	var apiError *codersdk.Error
 	// If the user already exists by username or email conflict, try again up to "retries" times.
 	if err != nil && retries >= 0 && xerrors.As(err, &apiError) {
 		if apiError.StatusCode() == http.StatusConflict {
 			retries--
-			return createAnotherUserRetry(t, client, organizationID, retries, roles)
+			return createAnotherUserRetry(t, client, organizationIDs, retries, roles)
 		}
 	}
 	require.NoError(t, err)
 
 	var sessionToken string
-	if req.DisableLogin || req.UserLoginType == codersdk.LoginTypeNone {
+	if req.UserLoginType == codersdk.LoginTypeNone {
 		// Cannot log in with a disabled login user. So make it an api key from
 		// the client making this user.
 		token, err := client.CreateToken(context.Background(), user.ID.String(), codersdk.CreateTokenRequest{
@@ -701,35 +794,58 @@ func createAnotherUserRetry(t testing.TB, client *codersdk.Client, organizationI
 
 	if len(roles) > 0 {
 		// Find the roles for the org vs the site wide roles
-		orgRoles := make(map[string][]string)
-		var siteRoles []string
+		orgRoles := make(map[uuid.UUID][]rbac.RoleIdentifier)
+		var siteRoles []rbac.RoleIdentifier
 
 		for _, roleName := range roles {
-			roleName := roleName
-			orgID, ok := rbac.IsOrgRole(roleName)
+			ok := roleName.IsOrgRole()
 			if ok {
-				orgRoles[orgID] = append(orgRoles[orgID], roleName)
+				orgRoles[roleName.OrganizationID] = append(orgRoles[roleName.OrganizationID], roleName)
 			} else {
 				siteRoles = append(siteRoles, roleName)
 			}
 		}
 		// Update the roles
 		for _, r := range user.Roles {
-			siteRoles = append(siteRoles, r.Name)
+			orgID, _ := uuid.Parse(r.OrganizationID)
+			siteRoles = append(siteRoles, rbac.RoleIdentifier{
+				Name:           r.Name,
+				OrganizationID: orgID,
+			})
 		}
 
-		user, err = client.UpdateUserRoles(context.Background(), user.ID.String(), codersdk.UpdateRoles{Roles: siteRoles})
+		onlyName := func(role rbac.RoleIdentifier) string {
+			return role.Name
+		}
+
+		user, err = client.UpdateUserRoles(context.Background(), user.ID.String(), codersdk.UpdateRoles{Roles: db2sdk.List(siteRoles, onlyName)})
 		require.NoError(t, err, "update site roles")
+
+		// isMember keeps track of which orgs the user was added to as a member
+		isMember := make(map[uuid.UUID]bool)
+		for _, orgID := range organizationIDs {
+			isMember[orgID] = true
+		}
 
 		// Update org roles
 		for orgID, roles := range orgRoles {
-			organizationID, err := uuid.Parse(orgID)
-			require.NoError(t, err, fmt.Sprintf("parse org id %q", orgID))
-			_, err = client.UpdateOrganizationMemberRoles(context.Background(), organizationID, user.ID.String(),
-				codersdk.UpdateRoles{Roles: roles})
+			// The user must be an organization of any orgRoles, so insert
+			// the organization member, then assign the roles.
+			if !isMember[orgID] {
+				_, err = client.PostOrganizationMember(context.Background(), orgID, user.ID.String())
+				require.NoError(t, err, "add user to organization as member")
+			}
+
+			_, err = client.UpdateOrganizationMemberRoles(context.Background(), orgID, user.ID.String(),
+				codersdk.UpdateRoles{Roles: db2sdk.List(roles, onlyName)})
 			require.NoError(t, err, "update org membership roles")
+			isMember[orgID] = true
 		}
 	}
+
+	user, err = client.User(context.Background(), user.Username)
+	require.NoError(t, err, "update final user")
+
 	return other, user
 }
 
@@ -976,7 +1092,7 @@ func (w WorkspaceAgentWaiter) Wait() []codersdk.WorkspaceResource {
 	require.Eventually(w.t, func() bool {
 		var err error
 		workspace, err := w.client.Workspace(ctx, w.workspaceID)
-		if !assert.NoError(w.t, err) {
+		if err != nil {
 			return false
 		}
 		if workspace.LatestBuild.Job.CompletedAt == nil {
@@ -1013,7 +1129,7 @@ func (w WorkspaceAgentWaiter) Wait() []codersdk.WorkspaceResource {
 // CreateWorkspace creates a workspace for the user and template provided.
 // A random name is generated for it.
 // To customize the defaults, pass a mutator func.
-func CreateWorkspace(t testing.TB, client *codersdk.Client, organization uuid.UUID, templateID uuid.UUID, mutators ...func(*codersdk.CreateWorkspaceRequest)) codersdk.Workspace {
+func CreateWorkspace(t testing.TB, client *codersdk.Client, templateID uuid.UUID, mutators ...func(*codersdk.CreateWorkspaceRequest)) codersdk.Workspace {
 	t.Helper()
 	req := codersdk.CreateWorkspaceRequest{
 		TemplateID:        templateID,
@@ -1025,7 +1141,7 @@ func CreateWorkspace(t testing.TB, client *codersdk.Client, organization uuid.UU
 	for _, mutator := range mutators {
 		mutator(&req)
 	}
-	workspace, err := client.CreateWorkspace(context.Background(), organization, codersdk.Me, req)
+	workspace, err := client.CreateUserWorkspace(context.Background(), codersdk.Me, req)
 	require.NoError(t, err)
 	return workspace
 }
@@ -1071,7 +1187,7 @@ func MustWorkspace(t testing.TB, client *codersdk.Client, workspaceID uuid.UUID)
 
 // RequestExternalAuthCallback makes a request with the proper OAuth2 state cookie
 // to the external auth callback endpoint.
-func RequestExternalAuthCallback(t testing.TB, providerID string, client *codersdk.Client) *http.Response {
+func RequestExternalAuthCallback(t testing.TB, providerID string, client *codersdk.Client, opts ...func(*http.Request)) *http.Response {
 	client.HTTPClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
@@ -1088,6 +1204,9 @@ func RequestExternalAuthCallback(t testing.TB, providerID string, client *coders
 		Name:  codersdk.SessionTokenCookie,
 		Value: client.SessionToken(),
 	})
+	for _, opt := range opts {
+		opt(req)
+	}
 	res, err := client.HTTPClient.Do(req)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -1289,6 +1408,28 @@ func RandomUsername(t testing.TB) string {
 	return n
 }
 
+func RandomName(t testing.TB) string {
+	var sb strings.Builder
+	var err error
+	ss := strings.Split(namesgenerator.GetRandomName(10), "_")
+	for si, s := range ss {
+		for ri, r := range s {
+			if ri == 0 {
+				_, err = sb.WriteRune(unicode.ToTitle(r))
+				require.NoError(t, err)
+			} else {
+				_, err = sb.WriteRune(r)
+				require.NoError(t, err)
+			}
+		}
+		if si < len(ss)-1 {
+			_, err = sb.WriteRune(' ')
+			require.NoError(t, err)
+		}
+	}
+	return sb.String()
+}
+
 // Used to easily create an HTTP transport!
 type roundTripper func(req *http.Request) (*http.Response, error)
 
@@ -1307,10 +1448,13 @@ func SDKError(t testing.TB, err error) *codersdk.Error {
 	return cerr
 }
 
-func DeploymentValues(t testing.TB) *codersdk.DeploymentValues {
-	var cfg codersdk.DeploymentValues
+func DeploymentValues(t testing.TB, mut ...func(*codersdk.DeploymentValues)) *codersdk.DeploymentValues {
+	cfg := &codersdk.DeploymentValues{}
 	opts := cfg.Options()
 	err := opts.SetDefaults()
 	require.NoError(t, err)
-	return &cfg
+	for _, fn := range mut {
+		fn(cfg)
+	}
+	return cfg
 }

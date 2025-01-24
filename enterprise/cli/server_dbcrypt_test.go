@@ -14,7 +14,6 @@ import (
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbgen"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
-	"github.com/coder/coder/v2/coderd/database/postgres"
 	"github.com/coder/coder/v2/enterprise/dbcrypt"
 	"github.com/coder/coder/v2/pty/ptytest"
 	"github.com/coder/coder/v2/testutil"
@@ -33,9 +32,8 @@ func TestServerDBCrypt(t *testing.T) {
 	t.Cleanup(cancel)
 
 	// Setup a postgres database.
-	connectionURL, closePg, err := postgres.Open()
+	connectionURL, err := dbtestutil.Open(t)
 	require.NoError(t, err)
-	t.Cleanup(closePg)
 	t.Cleanup(func() { dbtestutil.DumpOnFailure(t, connectionURL) })
 
 	sqlDB, err := sql.Open("postgres", connectionURL)

@@ -5,34 +5,36 @@ import (
 
 	"golang.org/x/xerrors"
 
-	"github.com/coder/coder/v2/cli/clibase"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/serpent"
 )
 
-func (r *RootCmd) update() *clibase.Cmd {
-	var parameterFlags workspaceParameterFlags
-
+func (r *RootCmd) update() *serpent.Command {
+	var (
+		parameterFlags workspaceParameterFlags
+		bflags         buildFlags
+	)
 	client := new(codersdk.Client)
-	cmd := &clibase.Cmd{
+	cmd := &serpent.Command{
 		Annotations: workspaceCommand,
 		Use:         "update <workspace>",
 		Short:       "Will update and start a given workspace if it is out of date",
 		Long:        "Use --always-prompt to change the parameter values of the workspace.",
-		Middleware: clibase.Chain(
-			clibase.RequireNArgs(1),
+		Middleware: serpent.Chain(
+			serpent.RequireNArgs(1),
 			r.InitClient(client),
 		),
-		Handler: func(inv *clibase.Invocation) error {
+		Handler: func(inv *serpent.Invocation) error {
 			workspace, err := namedWorkspace(inv.Context(), client, inv.Args[0])
 			if err != nil {
 				return err
 			}
-			if !workspace.Outdated && !parameterFlags.promptRichParameters && !parameterFlags.promptBuildOptions && len(parameterFlags.buildOptions) == 0 {
-				_, _ = fmt.Fprintf(inv.Stdout, "Workspace isn't outdated!\n")
+			if !workspace.Outdated && !parameterFlags.promptRichParameters && !parameterFlags.promptEphemeralParameters && len(parameterFlags.ephemeralParameters) == 0 {
+				_, _ = fmt.Fprintf(inv.Stdout, "Workspace is up-to-date.\n")
 				return nil
 			}
 
-			build, err := startWorkspace(inv, client, workspace, parameterFlags, WorkspaceUpdate)
+			build, err := startWorkspace(inv, client, workspace, parameterFlags, bflags, WorkspaceUpdate)
 			if err != nil {
 				return xerrors.Errorf("start workspace: %w", err)
 			}
@@ -54,5 +56,6 @@ func (r *RootCmd) update() *clibase.Cmd {
 	}
 
 	cmd.Options = append(cmd.Options, parameterFlags.allOptions()...)
+	cmd.Options = append(cmd.Options, bflags.cliOptions()...)
 	return cmd
 }

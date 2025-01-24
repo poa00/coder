@@ -3,6 +3,7 @@ package apptest
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v4"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,9 +28,11 @@ import (
 
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/jwtutils"
 	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/workspaceapps"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/coder/v2/testutil"
 )
 
@@ -70,6 +73,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 
 		t.Run("SignedTokenQueryParameter", func(t *testing.T) {
 			t.Parallel()
+
 			if appHostIsPrimary {
 				t.Skip("Tickets are not used for terminal requests on the primary.")
 			}
@@ -101,8 +105,6 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 	t.Run("WorkspaceAppsProxyPath", func(t *testing.T) {
 		t.Parallel()
 
-		appDetails := setupProxyTest(t, nil)
-
 		t.Run("Disabled", func(t *testing.T) {
 			t.Parallel()
 
@@ -132,6 +134,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 				t.Skip("This test only applies when testing apps on the primary.")
 			}
 
+			appDetails := setupProxyTest(t, nil)
 			unauthedClient := appDetails.AppClient(t)
 			unauthedClient.SetSessionToken("")
 
@@ -148,7 +151,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			require.True(t, loc.Query().Has("message"))
 			require.True(t, loc.Query().Has("redirect"))
-			assertWorkspaceLastUsedAtUpdated(t, appDetails)
+			assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
 		})
 
 		t.Run("LoginWithoutAuthOnProxy", func(t *testing.T) {
@@ -158,6 +161,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 				t.Skip("This test only applies when testing apps on workspace proxies.")
 			}
 
+			appDetails := setupProxyTest(t, nil)
 			unauthedClient := appDetails.AppClient(t)
 			unauthedClient.SetSessionToken("")
 
@@ -186,12 +190,13 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			// request is getting stripped.
 			require.Equal(t, u.Path, redirectURI.Path+"/")
 			require.Equal(t, u.RawQuery, redirectURI.RawQuery)
-			assertWorkspaceLastUsedAtUpdated(t, appDetails)
+			assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
 		})
 
 		t.Run("NoAccessShould404", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			userClient, _ := coderdtest.CreateAnotherUser(t, appDetails.SDKClient, appDetails.FirstUser.OrganizationID, rbac.RoleMember())
 			userAppClient := appDetails.AppClient(t)
 			userAppClient.SetSessionToken(userClient.SessionToken())
@@ -210,6 +215,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 		t.Run("RedirectsWithSlash", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -226,6 +232,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 		t.Run("RedirectsWithQuery", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -245,6 +252,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 		t.Run("Proxies", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -333,6 +341,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 		t.Run("BlocksMe", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -347,13 +356,13 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 			require.Contains(t, string(body), "must be accessed with the full username, not @me")
-			// TODO(cian): A blocked request should not count as workspace usage.
-			// assertWorkspaceLastUsedAtNotUpdated(t, appDetails.AppClient(t), appDetails)
+			assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
 		})
 
 		t.Run("ForwardsIP", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -373,6 +382,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 		t.Run("ProxyError", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -388,6 +398,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 		t.Run("NoProxyPort", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -397,7 +408,68 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			// TODO(@deansheather): This should be 400. There's a todo in the
 			// resolve request code to fix this.
 			require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+			assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
+		})
+
+		t.Run("BadJWT", func(t *testing.T) {
+			t.Parallel()
+
+			appDetails := setupProxyTest(t, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+			defer cancel()
+
+			u := appDetails.PathAppURL(appDetails.Apps.Owner)
+			resp, err := requestWithRetries(ctx, t, appDetails.AppClient(t), http.MethodGet, u.String(), nil)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, proxyTestAppBody, string(body))
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			appTokenCookie := findCookie(resp.Cookies(), codersdk.SignedAppTokenCookie)
+			require.NotNil(t, appTokenCookie, "no signed app token cookie in response")
+			require.Equal(t, appTokenCookie.Path, u.Path, "incorrect path on app token cookie")
+
+			object, err := jose.ParseSigned(appTokenCookie.Value, []jose.SignatureAlgorithm{jwtutils.SigningAlgo})
+			require.NoError(t, err)
+			require.Len(t, object.Signatures, 1)
+
+			// Parse the payload.
+			var tok workspaceapps.SignedToken
+			//nolint:gosec
+			err = json.Unmarshal(object.UnsafePayloadWithoutVerification(), &tok)
+			require.NoError(t, err)
+
+			appTokenClient := appDetails.AppClient(t)
+			apiKey := appTokenClient.SessionToken()
+			appTokenClient.SetSessionToken("")
+			appTokenClient.HTTPClient.Jar, err = cookiejar.New(nil)
+			require.NoError(t, err)
+			// Sign the token with an old-style key.
+			appTokenCookie.Value = generateBadJWT(t, tok)
+			appTokenClient.HTTPClient.Jar.SetCookies(u,
+				[]*http.Cookie{
+					appTokenCookie,
+					{
+						Name:  codersdk.PathAppSessionTokenCookie,
+						Value: apiKey,
+					},
+				},
+			)
+
+			resp, err = requestWithRetries(ctx, t, appTokenClient, http.MethodGet, u.String(), nil)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err = io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, proxyTestAppBody, string(body))
+			require.Equal(t, http.StatusOK, resp.StatusCode)
 			assertWorkspaceLastUsedAtUpdated(t, appDetails)
+
+			// Since the old token is invalid, the signed app token cookie should have a new value.
+			newTokenCookie := findCookie(resp.Cookies(), codersdk.SignedAppTokenCookie)
+			require.NotEqual(t, appTokenCookie.Value, newTokenCookie.Value)
 		})
 	})
 
@@ -454,7 +526,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 					appClient.SetSessionToken("")
 
 					// Try to load the application without authentication.
-					u := c.appURL
+					u := *c.appURL
 					u.Path = path.Join(u.Path, "/test")
 					req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 					require.NoError(t, err)
@@ -491,7 +563,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 
 					// Copy the query parameters and then check equality.
 					u.RawQuery = gotLocation.RawQuery
-					require.Equal(t, u, gotLocation)
+					require.Equal(t, u, *gotLocation)
 
 					// Verify the API key is set.
 					encryptedAPIKey := gotLocation.Query().Get(workspaceapps.SubdomainProxyAPIKeyParam)
@@ -532,32 +604,31 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 					appTokenAPIClient.HTTPClient.Transport = appDetails.SDKClient.HTTPClient.Transport
 
 					var (
-						canCreateApplicationConnect = "can-create-application_connect"
-						canReadUserMe               = "can-read-user-me"
+						canApplicationConnect = "can-create-application_connect"
+						canReadUserMe         = "can-read-user-me"
 					)
 					authRes, err := appTokenAPIClient.AuthCheck(ctx, codersdk.AuthorizationRequest{
 						Checks: map[string]codersdk.AuthorizationCheck{
-							canCreateApplicationConnect: {
+							canApplicationConnect: {
 								Object: codersdk.AuthorizationObject{
-									ResourceType:   "application_connect",
-									OwnerID:        "me",
+									ResourceType:   "workspace",
+									OwnerID:        appDetails.FirstUser.UserID.String(),
 									OrganizationID: appDetails.FirstUser.OrganizationID.String(),
 								},
-								Action: "create",
+								Action: codersdk.ActionApplicationConnect,
 							},
 							canReadUserMe: {
 								Object: codersdk.AuthorizationObject{
 									ResourceType: "user",
-									OwnerID:      "me",
 									ResourceID:   appDetails.FirstUser.UserID.String(),
 								},
-								Action: "read",
+								Action: codersdk.ActionRead,
 							},
 						},
 					})
 					require.NoError(t, err)
 
-					require.True(t, authRes[canCreateApplicationConnect])
+					require.True(t, authRes[canApplicationConnect])
 					require.False(t, authRes[canReadUserMe])
 
 					// Load the application page with the API key set.
@@ -571,6 +642,38 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 					require.NoError(t, err)
 					resp.Body.Close()
 					require.Equal(t, http.StatusOK, resp.StatusCode)
+				})
+
+				t.Run("BadJWE", func(t *testing.T) {
+					t.Parallel()
+
+					ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+					defer cancel()
+
+					currentKeyStr := appDetails.SDKClient.SessionToken()
+					appClient := appDetails.AppClient(t)
+					appClient.SetSessionToken("")
+					u := *c.appURL
+					u.Path = path.Join(u.Path, "/test")
+					badToken := generateBadJWE(t, workspaceapps.EncryptedAPIKeyPayload{
+						APIKey: currentKeyStr,
+					})
+
+					u.RawQuery = (url.Values{
+						workspaceapps.SubdomainProxyAPIKeyParam: {badToken},
+					}).Encode()
+
+					req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+					require.NoError(t, err)
+
+					var resp *http.Response
+					resp, err = doWithRetries(t, appClient, req)
+					require.NoError(t, err)
+					defer resp.Body.Close()
+					require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+					body, err := io.ReadAll(resp.Body)
+					require.NoError(t, err)
+					require.Contains(t, string(body), "Could not decrypt API key. Please remove the query parameter and try again.")
 				})
 			}
 		})
@@ -610,7 +713,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 
 		// Parse the JWT without verifying it (since we can't access the key
 		// from this test).
-		object, err := jose.ParseSigned(appTokenCookie.Value)
+		object, err := jose.ParseSigned(appTokenCookie.Value, []jose.SignatureAlgorithm{jwtutils.SigningAlgo})
 		require.NoError(t, err)
 		require.Len(t, object.Signatures, 1)
 
@@ -636,6 +739,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 		_ = resp.Body.Close()
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		require.Equal(t, resp.Header.Get("X-Got-Host"), u.Host)
+		assertWorkspaceLastUsedAtUpdated(t, appDetails)
 	})
 
 	t.Run("WorkspaceAppsProxySubdomainHostnamePrefix/Different", func(t *testing.T) {
@@ -686,6 +790,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 		require.NoError(t, err)
 		_ = resp.Body.Close()
 		require.NotEqual(t, http.StatusOK, resp.StatusCode)
+		assertWorkspaceLastUsedAtUpdated(t, appDetails)
 	})
 
 	// This test ensures that the subdomain handler does nothing if
@@ -754,11 +859,10 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 	t.Run("WorkspaceAppsProxySubdomain", func(t *testing.T) {
 		t.Parallel()
 
-		appDetails := setupProxyTest(t, nil)
-
 		t.Run("NoAccessShould401", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			userClient, _ := coderdtest.CreateAnotherUser(t, appDetails.SDKClient, appDetails.FirstUser.OrganizationID, rbac.RoleMember())
 			userAppClient := appDetails.AppClient(t)
 			userAppClient.SetSessionToken(userClient.SessionToken())
@@ -770,11 +874,13 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusNotFound, resp.StatusCode)
+			assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
 		})
 
 		t.Run("RedirectsWithSlash", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -789,11 +895,13 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			loc, err := resp.Location()
 			require.NoError(t, err)
 			require.Equal(t, appDetails.SubdomainAppURL(appDetails.Apps.Owner).Path, loc.Path)
+			assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
 		})
 
 		t.Run("RedirectsWithQuery", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -807,11 +915,13 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			loc, err := resp.Location()
 			require.NoError(t, err)
 			require.Equal(t, appDetails.SubdomainAppURL(appDetails.Apps.Owner).RawQuery, loc.RawQuery)
+			assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
 		})
 
 		t.Run("Proxies", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -848,6 +958,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			require.Equal(t, proxyTestAppBody, string(body))
 			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assertWorkspaceLastUsedAtUpdated(t, appDetails)
 		})
 
 		t.Run("ProxiesHTTPS", func(t *testing.T) {
@@ -892,11 +1003,13 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			require.Equal(t, proxyTestAppBody, string(body))
 			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assertWorkspaceLastUsedAtUpdated(t, appDetails)
 		})
 
 		t.Run("ProxiesPort", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -907,11 +1020,13 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			require.Equal(t, proxyTestAppBody, string(body))
 			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assertWorkspaceLastUsedAtUpdated(t, appDetails)
 		})
 
 		t.Run("ProxyError", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
@@ -919,16 +1034,18 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+			assertWorkspaceLastUsedAtUpdated(t, appDetails)
 		})
 
 		t.Run("ProxyPortMinimumError", func(t *testing.T) {
 			t.Parallel()
 
+			appDetails := setupProxyTest(t, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 			defer cancel()
 
 			app := appDetails.Apps.Port
-			app.AppSlugOrPort = strconv.Itoa(codersdk.WorkspaceAgentMinimumListeningPort - 1)
+			app.AppSlugOrPort = strconv.Itoa(workspacesdk.AgentMinimumListeningPort - 1)
 			resp, err := requestWithRetries(ctx, t, appDetails.AppClient(t), http.MethodGet, appDetails.SubdomainAppURL(app).String(), nil)
 			require.NoError(t, err)
 			defer resp.Body.Close()
@@ -939,6 +1056,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			err = json.NewDecoder(resp.Body).Decode(&resBody)
 			require.NoError(t, err)
 			require.Contains(t, resBody.Message, "Coder reserves ports less than")
+			assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
 		})
 
 		t.Run("SuffixWildcardOK", func(t *testing.T) {
@@ -961,6 +1079,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			require.Equal(t, proxyTestAppBody, string(body))
 			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assertWorkspaceLastUsedAtUpdated(t, appDetails)
 		})
 
 		t.Run("WildcardPortOK", func(t *testing.T) {
@@ -993,16 +1112,19 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			require.Equal(t, proxyTestAppBody, string(body))
 			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assertWorkspaceLastUsedAtUpdated(t, appDetails)
 		})
 
 		t.Run("SuffixWildcardNotMatch", func(t *testing.T) {
 			t.Parallel()
 
-			appDetails := setupProxyTest(t, &DeploymentOptions{
-				AppHost: "*-suffix.test.coder.com",
-			})
-
 			t.Run("NoSuffix", func(t *testing.T) {
+				t.Parallel()
+
+				appDetails := setupProxyTest(t, &DeploymentOptions{
+					AppHost: "*-suffix.test.coder.com",
+				})
+
 				ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 				defer cancel()
 
@@ -1020,10 +1142,15 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 				// It's probably rendering the dashboard or a 404 page, so only
 				// ensure that the body doesn't match.
 				require.NotContains(t, string(body), proxyTestAppBody)
+				assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
 			})
 
 			t.Run("DifferentSuffix", func(t *testing.T) {
 				t.Parallel()
+
+				appDetails := setupProxyTest(t, &DeploymentOptions{
+					AppHost: "*-suffix.test.coder.com",
+				})
 
 				ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 				defer cancel()
@@ -1042,7 +1169,70 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 				// It's probably rendering the dashboard, so only ensure that the body
 				// doesn't match.
 				require.NotContains(t, string(body), proxyTestAppBody)
+				assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
 			})
+		})
+
+		t.Run("BadJWT", func(t *testing.T) {
+			t.Parallel()
+
+			appDetails := setupProxyTest(t, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+			defer cancel()
+
+			u := appDetails.SubdomainAppURL(appDetails.Apps.Owner)
+			resp, err := requestWithRetries(ctx, t, appDetails.AppClient(t), http.MethodGet, u.String(), nil)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, proxyTestAppBody, string(body))
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			appTokenCookie := findCookie(resp.Cookies(), codersdk.SignedAppTokenCookie)
+			require.NotNil(t, appTokenCookie, "no signed token cookie in response")
+			require.Equal(t, appTokenCookie.Path, "/", "incorrect path on signed token cookie")
+
+			object, err := jose.ParseSigned(appTokenCookie.Value, []jose.SignatureAlgorithm{jwtutils.SigningAlgo})
+			require.NoError(t, err)
+			require.Len(t, object.Signatures, 1)
+
+			// Parse the payload.
+			var tok workspaceapps.SignedToken
+			//nolint:gosec
+			err = json.Unmarshal(object.UnsafePayloadWithoutVerification(), &tok)
+			require.NoError(t, err)
+
+			appTokenClient := appDetails.AppClient(t)
+			apiKey := appTokenClient.SessionToken()
+			appTokenClient.SetSessionToken("")
+			appTokenClient.HTTPClient.Jar, err = cookiejar.New(nil)
+			require.NoError(t, err)
+			// Sign the token with an old-style key.
+			appTokenCookie.Value = generateBadJWT(t, tok)
+			appTokenClient.HTTPClient.Jar.SetCookies(u,
+				[]*http.Cookie{
+					appTokenCookie,
+					{
+						Name:  codersdk.SubdomainAppSessionTokenCookie,
+						Value: apiKey,
+					},
+				},
+			)
+
+			// We should still be able to successfully proxy.
+			resp, err = requestWithRetries(ctx, t, appTokenClient, http.MethodGet, u.String(), nil)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err = io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, proxyTestAppBody, string(body))
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assertWorkspaceLastUsedAtUpdated(t, appDetails)
+
+			// Since the old token is invalid, the signed app token cookie should have a new value.
+			newTokenCookie := findCookie(resp.Cookies(), codersdk.SignedAppTokenCookie)
+			require.NotEqual(t, appTokenCookie.Value, newTokenCookie.Value)
 		})
 	})
 
@@ -1062,6 +1252,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusNotFound, resp.StatusCode)
+			assertWorkspaceLastUsedAtNotUpdated(t, appDetails)
 		})
 
 		t.Run("AuthenticatedOK", func(t *testing.T) {
@@ -1090,6 +1281,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assertWorkspaceLastUsedAtUpdated(t, appDetails)
 		})
 
 		t.Run("PublicOK", func(t *testing.T) {
@@ -1117,6 +1309,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assertWorkspaceLastUsedAtUpdated(t, appDetails)
 		})
 
 		t.Run("HTTPS", func(t *testing.T) {
@@ -1128,6 +1321,7 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			appDetails := setupProxyTest(t, &DeploymentOptions{
 				ServeHTTPS: true,
 			})
+			// using the fact that Apps.Port and Apps.PortHTTPS are the same port here
 			port, err := strconv.ParseInt(appDetails.Apps.Port.AppSlugOrPort, 10, 32)
 			require.NoError(t, err)
 			_, err = appDetails.SDKClient.UpsertWorkspaceAgentPortShare(ctx, appDetails.Workspace.ID, codersdk.UpsertWorkspaceAgentPortShareRequest{
@@ -1141,10 +1335,11 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			publicAppClient := appDetails.AppClient(t)
 			publicAppClient.SetSessionToken("")
 
-			resp, err := requestWithRetries(ctx, t, publicAppClient, http.MethodGet, appDetails.SubdomainAppURL(appDetails.Apps.Port).String(), nil)
+			resp, err := requestWithRetries(ctx, t, publicAppClient, http.MethodGet, appDetails.SubdomainAppURL(appDetails.Apps.PortHTTPS).String(), nil)
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assertWorkspaceLastUsedAtUpdated(t, appDetails)
 		})
 	})
 
@@ -1168,11 +1363,11 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 			// Create a template-admin user in the same org. We don't use an owner
 			// since they have access to everything.
 			ownerClient = appDetails.SDKClient
-			user, err := ownerClient.CreateUser(ctx, codersdk.CreateUserRequest{
-				Email:          "user@coder.com",
-				Username:       "user",
-				Password:       password,
-				OrganizationID: appDetails.FirstUser.OrganizationID,
+			user, err := ownerClient.CreateUserWithOrgs(ctx, codersdk.CreateUserRequestWithOrgs{
+				Email:           "user@coder.com",
+				Username:        "user",
+				Password:        password,
+				OrganizationIDs: []uuid.UUID{appDetails.FirstUser.OrganizationID},
 			})
 			require.NoError(t, err)
 
@@ -1220,11 +1415,11 @@ func Run(t *testing.T, appHostIsPrimary bool, factory DeploymentFactory) {
 				Name: "a-different-org",
 			})
 			require.NoError(t, err)
-			userInOtherOrg, err := ownerClient.CreateUser(ctx, codersdk.CreateUserRequest{
-				Email:          "no-template-access@coder.com",
-				Username:       "no-template-access",
-				Password:       password,
-				OrganizationID: otherOrg.ID,
+			userInOtherOrg, err := ownerClient.CreateUserWithOrgs(ctx, codersdk.CreateUserRequestWithOrgs{
+				Email:           "no-template-access@coder.com",
+				Username:        "no-template-access",
+				Password:        password,
+				OrganizationIDs: []uuid.UUID{otherOrg.ID},
 			})
 			require.NoError(t, err)
 
@@ -1650,7 +1845,7 @@ func (r *fakeStatsReporter) stats() []workspaceapps.StatsReport {
 	return r.s
 }
 
-func (r *fakeStatsReporter) Report(_ context.Context, stats []workspaceapps.StatsReport) error {
+func (r *fakeStatsReporter) ReportAppStats(_ context.Context, stats []workspaceapps.StatsReport) error {
 	r.mu.Lock()
 	r.s = append(r.s, stats...)
 	r.mu.Unlock()
@@ -1658,7 +1853,7 @@ func (r *fakeStatsReporter) Report(_ context.Context, stats []workspaceapps.Stat
 }
 
 func testReconnectingPTY(ctx context.Context, t *testing.T, client *codersdk.Client, agentID uuid.UUID, signedToken string) {
-	opts := codersdk.WorkspaceAgentReconnectingPTYOpts{
+	opts := workspacesdk.WorkspaceAgentReconnectingPTYOpts{
 		AgentID:   agentID,
 		Reconnect: uuid.New(),
 		Width:     80,
@@ -1683,7 +1878,7 @@ func testReconnectingPTY(ctx context.Context, t *testing.T, client *codersdk.Cli
 		return strings.Contains(line, "exit") || strings.Contains(line, "logout")
 	}
 
-	conn, err := client.WorkspaceAgentReconnectingPTY(ctx, opts)
+	conn, err := workspacesdk.New(client).AgentReconnectingPTY(ctx, opts)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -1692,7 +1887,7 @@ func testReconnectingPTY(ctx context.Context, t *testing.T, client *codersdk.Cli
 	// will sometimes put the command output on the same line as the command and the test will flake
 	require.NoError(t, tr.ReadUntil(ctx, matchPrompt), "find prompt")
 
-	data, err := json.Marshal(codersdk.ReconnectingPTYRequest{
+	data, err := json.Marshal(workspacesdk.ReconnectingPTYRequest{
 		Data: "echo test\r",
 	})
 	require.NoError(t, err)
@@ -1703,7 +1898,7 @@ func testReconnectingPTY(ctx context.Context, t *testing.T, client *codersdk.Cli
 	require.NoError(t, tr.ReadUntil(ctx, matchEchoOutput), "find echo output")
 
 	// Exit should cause the connection to close.
-	data, err = json.Marshal(codersdk.ReconnectingPTYRequest{
+	data, err = json.Marshal(workspacesdk.ReconnectingPTYRequest{
 		Data: "exit\r",
 	})
 	require.NoError(t, err)
@@ -1719,26 +1914,89 @@ func testReconnectingPTY(ctx context.Context, t *testing.T, client *codersdk.Cli
 }
 
 // Accessing an app should update the workspace's LastUsedAt.
-// NOTE: Despite our efforts with the flush channel, this is inherently racy.
+// NOTE: Despite our efforts with the flush channel, this is inherently racy when used with
+// parallel tests on the same workspace/app.
 func assertWorkspaceLastUsedAtUpdated(t testing.TB, details *Details) {
 	t.Helper()
 
-	// Wait for stats to fully flush.
+	require.NotNil(t, details.Workspace, "can't assert LastUsedAt on a nil workspace!")
+	before, err := details.SDKClient.Workspace(context.Background(), details.Workspace.ID)
+	require.NoError(t, err)
 	require.Eventually(t, func() bool {
+		// We may need to flush multiple times, since the stats from the app we are testing might be
+		// collected asynchronously from when we see the connection close, and thus, could race
+		// against being flushed.
 		details.FlushStats()
-		ws, err := details.SDKClient.Workspace(context.Background(), details.Workspace.ID)
-		assert.NoError(t, err)
-		return ws.LastUsedAt.After(details.Workspace.LastUsedAt)
-	}, testutil.WaitShort, testutil.IntervalMedium, "workspace LastUsedAt not updated when it should have been")
+		after, err := details.SDKClient.Workspace(context.Background(), details.Workspace.ID)
+		return assert.NoError(t, err) && after.LastUsedAt.After(before.LastUsedAt)
+	}, testutil.WaitShort, testutil.IntervalMedium)
 }
 
 // Except when it sometimes shouldn't (e.g. no access)
-// NOTE: Despite our efforts with the flush channel, this is inherently racy.
+// NOTE: Despite our efforts with the flush channel, this is inherently racy when used with
+// parallel tests on the same workspace/app.
 func assertWorkspaceLastUsedAtNotUpdated(t testing.TB, details *Details) {
 	t.Helper()
 
-	details.FlushStats()
-	ws, err := details.SDKClient.Workspace(context.Background(), details.Workspace.ID)
+	require.NotNil(t, details.Workspace, "can't assert LastUsedAt on a nil workspace!")
+	before, err := details.SDKClient.Workspace(context.Background(), details.Workspace.ID)
 	require.NoError(t, err)
-	require.Equal(t, ws.LastUsedAt, details.Workspace.LastUsedAt, "workspace LastUsedAt updated when it should not have been")
+	details.FlushStats()
+	after, err := details.SDKClient.Workspace(context.Background(), details.Workspace.ID)
+	require.NoError(t, err)
+	require.Equal(t, before.LastUsedAt, after.LastUsedAt, "workspace LastUsedAt updated when it should not have been")
+}
+
+func generateBadJWE(t *testing.T, claims interface{}) string {
+	t.Helper()
+	var buf [32]byte
+	_, err := rand.Read(buf[:])
+	require.NoError(t, err)
+	encrypt, err := jose.NewEncrypter(
+		jose.A256GCM,
+		jose.Recipient{
+			Algorithm: jose.A256GCMKW,
+			Key:       buf[:],
+		}, &jose.EncrypterOptions{
+			Compression: jose.DEFLATE,
+		},
+	)
+	require.NoError(t, err)
+	payload, err := json.Marshal(claims)
+	require.NoError(t, err)
+	signed, err := encrypt.Encrypt(payload)
+	require.NoError(t, err)
+	compact, err := signed.CompactSerialize()
+	require.NoError(t, err)
+	return compact
+}
+
+// generateBadJWT generates a JWT with a random key. It's intended to emulate the old-style JWT's we generated.
+func generateBadJWT(t *testing.T, claims interface{}) string {
+	t.Helper()
+
+	var buf [64]byte
+	_, err := rand.Read(buf[:])
+	require.NoError(t, err)
+	signer, err := jose.NewSigner(jose.SigningKey{
+		Algorithm: jose.HS512,
+		Key:       buf[:],
+	}, nil)
+	require.NoError(t, err)
+	payload, err := json.Marshal(claims)
+	require.NoError(t, err)
+	signed, err := signer.Sign(payload)
+	require.NoError(t, err)
+	compact, err := signed.CompactSerialize()
+	require.NoError(t, err)
+	return compact
+}
+
+func findCookie(cookies []*http.Cookie, name string) *http.Cookie {
+	for _, cookie := range cookies {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
 }

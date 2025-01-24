@@ -1,100 +1,75 @@
-import {
-  createContext,
-  type FC,
-  type PropsWithChildren,
-  useCallback,
-  useState,
-} from "react";
-import { useQuery } from "react-query";
 import { appearance } from "api/queries/appearance";
-import { buildInfo } from "api/queries/buildInfo";
 import { entitlements } from "api/queries/entitlements";
 import { experiments } from "api/queries/experiments";
+import { organizations } from "api/queries/organizations";
 import type {
-  AppearanceConfig,
-  BuildInfoResponse,
-  Entitlements,
-  Experiments,
+	AppearanceConfig,
+	Entitlements,
+	Experiments,
+	Organization,
 } from "api/typesGenerated";
-import { displayError } from "components/GlobalSnackbar/utils";
+import { ErrorAlert } from "components/Alert/ErrorAlert";
 import { Loader } from "components/Loader/Loader";
-import { hslToHex, isHexColor, isHslColor } from "utils/colors";
-
-interface Appearance {
-  config: AppearanceConfig;
-  isPreview: boolean;
-  setPreview: (config: AppearanceConfig) => void;
-}
+import { useEmbeddedMetadata } from "hooks/useEmbeddedMetadata";
+import { type FC, type PropsWithChildren, createContext } from "react";
+import { useQuery } from "react-query";
+import { selectFeatureVisibility } from "./entitlements";
 
 export interface DashboardValue {
-  buildInfo: BuildInfoResponse;
-  entitlements: Entitlements;
-  experiments: Experiments;
-  appearance: Appearance;
+	entitlements: Entitlements;
+	experiments: Experiments;
+	appearance: AppearanceConfig;
+	organizations: readonly Organization[];
+	showOrganizations: boolean;
 }
 
 export const DashboardContext = createContext<DashboardValue | undefined>(
-  undefined,
+	undefined,
 );
 
 export const DashboardProvider: FC<PropsWithChildren> = ({ children }) => {
-  const buildInfoQuery = useQuery(buildInfo());
-  const entitlementsQuery = useQuery(entitlements());
-  const experimentsQuery = useQuery(experiments());
-  const appearanceQuery = useQuery(appearance());
+	const { metadata } = useEmbeddedMetadata();
+	const entitlementsQuery = useQuery(entitlements(metadata.entitlements));
+	const experimentsQuery = useQuery(experiments(metadata.experiments));
+	const appearanceQuery = useQuery(appearance(metadata.appearance));
+	const organizationsQuery = useQuery(organizations());
 
-  const isLoading =
-    !buildInfoQuery.data ||
-    !entitlementsQuery.data ||
-    !appearanceQuery.data ||
-    !experimentsQuery.data;
+	const error =
+		entitlementsQuery.error ||
+		appearanceQuery.error ||
+		experimentsQuery.error ||
+		organizationsQuery.error;
 
-  const [configPreview, setConfigPreview] = useState<AppearanceConfig>();
+	if (error) {
+		return <ErrorAlert error={error} />;
+	}
 
-  // Centralizing the logic for catching malformed configs in one spot, just to
-  // be on the safe side; don't want to expose raw setConfigPreview outside
-  // the provider
-  const setPreview = useCallback((newConfig: AppearanceConfig) => {
-    // Have runtime safety nets in place, just because so much of the codebase
-    // relies on HSL for formatting, but server expects hex values. Can't catch
-    // color format mismatches at the type level
-    const incomingBg = newConfig.service_banner.background_color;
-    let configForDispatch = newConfig;
+	const isLoading =
+		!entitlementsQuery.data ||
+		!appearanceQuery.data ||
+		!experimentsQuery.data ||
+		!organizationsQuery.data;
 
-    if (typeof incomingBg === "string" && isHslColor(incomingBg)) {
-      configForDispatch = {
-        ...newConfig,
-        service_banner: {
-          ...newConfig.service_banner,
-          background_color: hslToHex(incomingBg),
-        },
-      };
-    } else if (typeof incomingBg === "string" && !isHexColor(incomingBg)) {
-      displayError(`The value ${incomingBg} is not a valid hex string`);
-      return;
-    }
+	if (isLoading) {
+		return <Loader fullscreen />;
+	}
 
-    setConfigPreview(configForDispatch);
-  }, []);
+	const hasMultipleOrganizations = organizationsQuery.data.length > 1;
+	const organizationsEnabled = selectFeatureVisibility(
+		entitlementsQuery.data,
+	).multiple_organizations;
 
-  if (isLoading) {
-    return <Loader fullscreen />;
-  }
-
-  return (
-    <DashboardContext.Provider
-      value={{
-        buildInfo: buildInfoQuery.data,
-        entitlements: entitlementsQuery.data,
-        experiments: experimentsQuery.data,
-        appearance: {
-          config: configPreview ?? appearanceQuery.data,
-          setPreview: setPreview,
-          isPreview: configPreview !== undefined,
-        },
-      }}
-    >
-      {children}
-    </DashboardContext.Provider>
-  );
+	return (
+		<DashboardContext.Provider
+			value={{
+				entitlements: entitlementsQuery.data,
+				experiments: experimentsQuery.data,
+				appearance: appearanceQuery.data,
+				organizations: organizationsQuery.data,
+				showOrganizations: hasMultipleOrganizations || organizationsEnabled,
+			}}
+		>
+			{children}
+		</DashboardContext.Provider>
+	);
 };

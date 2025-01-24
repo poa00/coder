@@ -9,7 +9,7 @@ tags: [vm, linux, aws, persistent, devcontainer]
 
 # Remote Development on AWS EC2 VMs using a Devcontainer
 
-Provision AWS EC2 VMs as [Coder workspaces](https://coder.com/docs/v2/latest) with this example template.
+Provision AWS EC2 VMs as [Coder workspaces](https://coder.com/docs) with this example template.
 ![Architecture Diagram](./architecture.svg)
 
 <!-- TODO: Add screenshot -->
@@ -31,50 +31,50 @@ instances provisioned by Coder:
 
 ```json
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "VisualEditor0",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:GetDefaultCreditSpecification",
-        "ec2:DescribeIamInstanceProfileAssociations",
-        "ec2:DescribeTags",
-        "ec2:DescribeInstances",
-        "ec2:DescribeInstanceTypes",
-        "ec2:CreateTags",
-        "ec2:RunInstances",
-        "ec2:DescribeInstanceCreditSpecifications",
-        "ec2:DescribeImages",
-        "ec2:ModifyDefaultCreditSpecification",
-        "ec2:DescribeVolumes"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "CoderResources",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:DescribeInstanceAttribute",
-        "ec2:UnmonitorInstances",
-        "ec2:TerminateInstances",
-        "ec2:StartInstances",
-        "ec2:StopInstances",
-        "ec2:DeleteTags",
-        "ec2:MonitorInstances",
-        "ec2:CreateTags",
-        "ec2:RunInstances",
-        "ec2:ModifyInstanceAttribute",
-        "ec2:ModifyInstanceCreditSpecification"
-      ],
-      "Resource": "arn:aws:ec2:*:*:instance/*",
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/Coder_Provisioned": "true"
-        }
-      }
-    }
-  ]
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "VisualEditor0",
+			"Effect": "Allow",
+			"Action": [
+				"ec2:GetDefaultCreditSpecification",
+				"ec2:DescribeIamInstanceProfileAssociations",
+				"ec2:DescribeTags",
+				"ec2:DescribeInstances",
+				"ec2:DescribeInstanceTypes",
+				"ec2:CreateTags",
+				"ec2:RunInstances",
+				"ec2:DescribeInstanceCreditSpecifications",
+				"ec2:DescribeImages",
+				"ec2:ModifyDefaultCreditSpecification",
+				"ec2:DescribeVolumes"
+			],
+			"Resource": "*"
+		},
+		{
+			"Sid": "CoderResources",
+			"Effect": "Allow",
+			"Action": [
+				"ec2:DescribeInstanceAttribute",
+				"ec2:UnmonitorInstances",
+				"ec2:TerminateInstances",
+				"ec2:StartInstances",
+				"ec2:StopInstances",
+				"ec2:DeleteTags",
+				"ec2:MonitorInstances",
+				"ec2:CreateTags",
+				"ec2:RunInstances",
+				"ec2:ModifyInstanceAttribute",
+				"ec2:ModifyInstanceCreditSpecification"
+			],
+			"Resource": "arn:aws:ec2:*:*:instance/*",
+			"Condition": {
+				"StringEquals": {
+					"aws:ResourceTag/Coder_Provisioned": "true"
+				}
+			}
+		}
+	]
 }
 ```
 
@@ -88,6 +88,21 @@ Coder uses `aws_ec2_instance_state` to start and stop the VM. This example templ
 
 > **Note**
 > This template is designed to be a starting point! Edit the Terraform to extend the template to support your use case.
+
+## Caching
+
+To speed up your builds, you can use a container registry as a cache.
+When creating the template, set the parameter `cache_repo` to a valid Docker repository in the form `host.tld/path/to/repo`.
+
+See the [Envbuilder Terraform Provider Examples](https://github.com/coder/terraform-provider-envbuilder/blob/main/examples/resources/envbuilder_cached_image/envbuilder_cached_image_resource.tf/) for a more complete example of how the provider works.
+
+> [!NOTE] We recommend using a registry cache with authentication enabled.
+> To allow Envbuilder to authenticate with a registry cache hosted on ECR, specify an IAM instance
+> profile that has read and write access to the given registry. For more information, see the
+> [AWS documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-ec2_instance-profiles.html).
+>
+> Alternatively, you can specify the variable `cache_repo_docker_config_path`
+> with the path to a Docker config `.json` on disk containing valid credentials for the registry.
 
 ## code-server
 

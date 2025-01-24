@@ -13,12 +13,17 @@ import (
 	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 
+	"github.com/go-jose/go-jose/v4/jwt"
+
 	"cdr.dev/slog"
+	"github.com/coder/coder/v2/coderd/cryptokeys"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/httpapi"
 	"github.com/coder/coder/v2/coderd/httpmw"
+	"github.com/coder/coder/v2/coderd/jwtutils"
 	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/policy"
 	"github.com/coder/coder/v2/codersdk"
 )
 
@@ -34,12 +39,20 @@ type DBTokenProvider struct {
 	DeploymentValues              *codersdk.DeploymentValues
 	OAuth2Configs                 *httpmw.OAuth2Configs
 	WorkspaceAgentInactiveTimeout time.Duration
-	SigningKey                    SecurityKey
+	Keycache                      cryptokeys.SigningKeycache
 }
 
 var _ SignedTokenProvider = &DBTokenProvider{}
 
-func NewDBTokenProvider(log slog.Logger, accessURL *url.URL, authz rbac.Authorizer, db database.Store, cfg *codersdk.DeploymentValues, oauth2Cfgs *httpmw.OAuth2Configs, workspaceAgentInactiveTimeout time.Duration, signingKey SecurityKey) SignedTokenProvider {
+func NewDBTokenProvider(log slog.Logger,
+	accessURL *url.URL,
+	authz rbac.Authorizer,
+	db database.Store,
+	cfg *codersdk.DeploymentValues,
+	oauth2Cfgs *httpmw.OAuth2Configs,
+	workspaceAgentInactiveTimeout time.Duration,
+	signer cryptokeys.SigningKeycache,
+) SignedTokenProvider {
 	if workspaceAgentInactiveTimeout == 0 {
 		workspaceAgentInactiveTimeout = 1 * time.Minute
 	}
@@ -52,12 +65,12 @@ func NewDBTokenProvider(log slog.Logger, accessURL *url.URL, authz rbac.Authoriz
 		DeploymentValues:              cfg,
 		OAuth2Configs:                 oauth2Cfgs,
 		WorkspaceAgentInactiveTimeout: workspaceAgentInactiveTimeout,
-		SigningKey:                    signingKey,
+		Keycache:                      signer,
 	}
 }
 
 func (p *DBTokenProvider) FromRequest(r *http.Request) (*SignedToken, bool) {
-	return FromRequest(r, p.SigningKey)
+	return FromRequest(r, p.Keycache)
 }
 
 func (p *DBTokenProvider) Issue(ctx context.Context, rw http.ResponseWriter, r *http.Request, issueReq IssueTokenRequest) (*SignedToken, string, bool) {
@@ -69,7 +82,7 @@ func (p *DBTokenProvider) Issue(ctx context.Context, rw http.ResponseWriter, r *
 	dangerousSystemCtx := dbauthz.AsSystemRestricted(ctx)
 
 	appReq := issueReq.AppRequest.Normalize()
-	err := appReq.Validate()
+	err := appReq.Check()
 	if err != nil {
 		WriteWorkspaceApp500(p.Logger, p.DashboardURL, rw, r, &appReq, err, "invalid app request")
 		return nil, "", false
@@ -85,7 +98,7 @@ func (p *DBTokenProvider) Issue(ctx context.Context, rw http.ResponseWriter, r *
 		DB:                          p.Database,
 		OAuth2Configs:               p.OAuth2Configs,
 		RedirectToLogin:             false,
-		DisableSessionExpiryRefresh: p.DeploymentValues.DisableSessionExpiryRefresh.Value(),
+		DisableSessionExpiryRefresh: p.DeploymentValues.Sessions.DisableExpiryRefresh.Value(),
 		// Optional is true to allow for public apps. If the authorization check
 		// (later on) fails and the user is not authenticated, they will be
 		// redirected to the login page or app auth endpoint using code below.
@@ -209,9 +222,11 @@ func (p *DBTokenProvider) Issue(ctx context.Context, rw http.ResponseWriter, r *
 		return nil, "", false
 	}
 
+	token.RegisteredClaims = jwtutils.RegisteredClaims{
+		Expiry: jwt.NewNumericDate(time.Now().Add(DefaultTokenExpiry)),
+	}
 	// Sign the token.
-	token.Expiry = time.Now().Add(DefaultTokenExpiry)
-	tokenStr, err := p.SigningKey.SignToken(token)
+	tokenStr, err := jwtutils.Sign(ctx, p.Keycache, token)
 	if err != nil {
 		WriteWorkspaceApp500(p.Logger, p.DashboardURL, rw, r, &appReq, err, "generate token")
 		return nil, "", false
@@ -224,7 +239,7 @@ func (p *DBTokenProvider) Issue(ctx context.Context, rw http.ResponseWriter, r *
 // are warnings that aid in debugging. These messages do not prevent authorization,
 // but may indicate that the request is not configured correctly.
 // If an error is returned, the request should be aborted with a 500 error.
-func (p *DBTokenProvider) authorizeRequest(ctx context.Context, roles *httpmw.Authorization, dbReq *databaseRequest) (bool, []string, error) {
+func (p *DBTokenProvider) authorizeRequest(ctx context.Context, roles *rbac.Subject, dbReq *databaseRequest) (bool, []string, error) {
 	var warnings []string
 	accessMethod := dbReq.AccessMethod
 	if accessMethod == "" {
@@ -267,12 +282,12 @@ func (p *DBTokenProvider) authorizeRequest(ctx context.Context, roles *httpmw.Au
 	// workspaces owned by different users.
 	if isPathApp &&
 		sharingLevel == database.AppSharingLevelOwner &&
-		dbReq.Workspace.OwnerID.String() != roles.Actor.ID &&
+		dbReq.Workspace.OwnerID.String() != roles.ID &&
 		!p.DeploymentValues.Dangerous.AllowPathAppSiteOwnerAccess.Value() {
 		// This is not ideal to check for the 'owner' role, but we are only checking
 		// to determine whether to show a warning for debugging reasons. This does
 		// not do any authz checks, so it is ok.
-		if roles != nil && slices.Contains(roles.Actor.Roles.Names(), rbac.RoleOwner()) {
+		if roles != nil && slices.Contains(roles.Roles.Names(), rbac.RoleOwner()) {
 			warnings = append(warnings, "path-based apps with \"owner\" share level are only accessible by the workspace owner (see --dangerous-allow-path-app-site-owner-access)")
 		}
 		return false, warnings, nil
@@ -281,16 +296,16 @@ func (p *DBTokenProvider) authorizeRequest(ctx context.Context, roles *httpmw.Au
 	// Figure out which RBAC resource to check. For terminals we use execution
 	// instead of application connect.
 	var (
-		rbacAction   rbac.Action = rbac.ActionCreate
-		rbacResource rbac.Object = dbReq.Workspace.ApplicationConnectRBAC()
+		rbacAction   policy.Action = policy.ActionApplicationConnect
+		rbacResource rbac.Object   = dbReq.Workspace.RBACObject()
 		// rbacResourceOwned is for the level "authenticated". We still need to
 		// make sure the API key has permissions to connect to the actor's own
 		// workspace. Scopes would prevent this.
-		rbacResourceOwned rbac.Object = rbac.ResourceWorkspaceApplicationConnect.WithOwner(roles.Actor.ID)
+		rbacResourceOwned rbac.Object = rbac.ResourceWorkspace.WithOwner(roles.ID)
 	)
 	if dbReq.AccessMethod == AccessMethodTerminal {
-		rbacResource = dbReq.Workspace.ExecutionRBAC()
-		rbacResourceOwned = rbac.ResourceWorkspaceExecution.WithOwner(roles.Actor.ID)
+		rbacAction = policy.ActionSSH
+		rbacResourceOwned = rbac.ResourceWorkspace.WithOwner(roles.ID)
 	}
 
 	// Do a standard RBAC check. This accounts for share level "owner" and any
@@ -299,7 +314,7 @@ func (p *DBTokenProvider) authorizeRequest(ctx context.Context, roles *httpmw.Au
 	// Regardless of share level or whether it's enabled or not, the owner of
 	// the workspace can always access applications (as long as their API key's
 	// scope allows it).
-	err := p.Authorizer.Authorize(ctx, roles.Actor, rbacAction, rbacResource)
+	err := p.Authorizer.Authorize(ctx, *roles, rbacAction, rbacResource)
 	if err == nil {
 		return true, []string{}, nil
 	}
@@ -312,7 +327,7 @@ func (p *DBTokenProvider) authorizeRequest(ctx context.Context, roles *httpmw.Au
 	case database.AppSharingLevelAuthenticated:
 		// Check with the owned resource to ensure the API key has permissions
 		// to connect to the actor's own workspace. This enforces scopes.
-		err := p.Authorizer.Authorize(ctx, roles.Actor, rbacAction, rbacResourceOwned)
+		err := p.Authorizer.Authorize(ctx, *roles, rbacAction, rbacResourceOwned)
 		if err == nil {
 			return true, []string{}, nil
 		}

@@ -5,15 +5,20 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 
 	"cdr.dev/slog"
 	"cdr.dev/slog/sloggers/sloghuman"
 	"cdr.dev/slog/sloggers/slogtest"
+	"github.com/coder/coder/v2/agent"
+	"github.com/coder/coder/v2/agent/agenttest"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbfake"
@@ -24,6 +29,10 @@ import (
 	"github.com/coder/coder/v2/testutil"
 )
 
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m, testutil.GoleakOptions...)
+}
+
 func TestRun(t *testing.T) {
 	t.Parallel()
 
@@ -31,7 +40,7 @@ func TestRun(t *testing.T) {
 		t.Parallel()
 		cfg := coderdtest.DeploymentValues(t)
 		cfg.Experiments = []string{"foo"}
-		ctx := testutil.Context(t, testutil.WaitShort)
+		ctx := testutil.Context(t, testutil.WaitLong)
 		client, db := coderdtest.NewWithDatabase(t, &coderdtest.Options{
 			DeploymentValues: cfg,
 			Logger:           ptr.Ref(slog.Make(sloghuman.Sink(io.Discard))),
@@ -41,37 +50,50 @@ func TestRun(t *testing.T) {
 
 		bun, err := support.Run(ctx, &support.Deps{
 			Client:      client,
-			Log:         slogtest.Make(t, nil).Named("bundle").Leveled(slog.LevelDebug),
+			Log:         testutil.Logger(t).Named("bundle"),
 			WorkspaceID: ws.ID,
 			AgentID:     agt.ID,
 		})
 		require.NoError(t, err)
-		require.NotEmpty(t, bun)
-		require.NotEmpty(t, bun.Deployment.BuildInfo)
-		require.NotEmpty(t, bun.Deployment.Config)
-		require.NotEmpty(t, bun.Deployment.Config.Options)
+		assertNotNilNotEmpty(t, bun, "bundle should be present")
+		assertNotNilNotEmpty(t, bun.Deployment.BuildInfo, "deployment build info should be present")
+		assertNotNilNotEmpty(t, bun.Deployment.Config, "deployment config should be present")
+		assertNotNilNotEmpty(t, bun.Deployment.Config.Options, "deployment config should be present")
 		assertSanitizedDeploymentConfig(t, bun.Deployment.Config)
-		require.NotEmpty(t, bun.Deployment.HealthReport)
-		require.NotEmpty(t, bun.Deployment.Experiments)
-		require.NotEmpty(t, bun.Network.CoordinatorDebug)
-		require.NotEmpty(t, bun.Network.TailnetDebug)
-		require.NotNil(t, bun.Network.NetcheckLocal)
-		require.NotNil(t, bun.Workspace.Workspace)
-		require.NotEmpty(t, bun.Workspace.BuildLogs)
-		require.NotNil(t, bun.Workspace.Agent)
-		require.NotEmpty(t, bun.Workspace.AgentStartupLogs)
-		require.NotEmpty(t, bun.Workspace.Template)
-		require.NotEmpty(t, bun.Workspace.TemplateVersion)
-		require.NotEmpty(t, bun.Workspace.TemplateFileBase64)
-		require.NotNil(t, bun.Workspace.Parameters)
-		require.NotEmpty(t, bun.Logs)
+		assertNotNilNotEmpty(t, bun.Deployment.HealthReport, "deployment health report should be present")
+		assertNotNilNotEmpty(t, bun.Deployment.Experiments, "deployment experiments should be present")
+		assertNotNilNotEmpty(t, bun.Network.ConnectionInfo, "agent connection info should be present")
+		assertNotNilNotEmpty(t, bun.Network.CoordinatorDebug, "network coordinator debug should be present")
+		assertNotNilNotEmpty(t, bun.Network.Netcheck, "network netcheck should be present")
+		assertNotNilNotEmpty(t, bun.Network.TailnetDebug, "network tailnet debug should be present")
+		assertNotNilNotEmpty(t, bun.Network.Interfaces, "network interfaces health should be present")
+		assertNotNilNotEmpty(t, bun.Workspace.Workspace, "workspace should be present")
+		assertSanitizedWorkspace(t, bun.Workspace.Workspace)
+		assertNotNilNotEmpty(t, bun.Workspace.BuildLogs, "workspace build logs should be present")
+		assertNotNilNotEmpty(t, bun.Workspace.Template, "workspace template should be present")
+		assertNotNilNotEmpty(t, bun.Workspace.TemplateVersion, "workspace template version should be present")
+		assertNotNilNotEmpty(t, bun.Workspace.TemplateFileBase64, "workspace template file should be present")
+		require.NotNil(t, bun.Workspace.Parameters, "workspace parameters should be present")
+		assertNotNilNotEmpty(t, bun.Agent.Agent, "agent should be present")
+		assertSanitizedEnv(t, bun.Agent.Agent.EnvironmentVariables)
+		assertNotNilNotEmpty(t, bun.Agent.ListeningPorts, "agent listening ports should be present")
+		assertNotNilNotEmpty(t, bun.Agent.Logs, "agent logs should be present")
+		assertNotNilNotEmpty(t, bun.Agent.Manifest, "agent manifest should be present")
+		assertSanitizedEnv(t, bun.Agent.Manifest.EnvironmentVariables)
+		assertNotNilNotEmpty(t, bun.Agent.AgentMagicsockHTML, "agent magicsock should be present")
+		assertNotNilNotEmpty(t, bun.Agent.ClientMagicsockHTML, "client magicsock should be present")
+		assertNotNilNotEmpty(t, bun.Agent.PeerDiagnostics, "agent peer diagnostics should be present")
+		assertNotNilNotEmpty(t, bun.Agent.PingResult, "agent ping result should be present")
+		assertNotNilNotEmpty(t, bun.Agent.Prometheus, "agent prometheus metrics should be present")
+		assertNotNilNotEmpty(t, bun.Agent.StartupLogs, "agent startup logs should be present")
+		assertNotNilNotEmpty(t, bun.Logs, "bundle logs should be present")
 	})
 
-	t.Run("OK_NoAgent", func(t *testing.T) {
+	t.Run("OK_NoWorkspace", func(t *testing.T) {
 		t.Parallel()
 		cfg := coderdtest.DeploymentValues(t)
 		cfg.Experiments = []string{"foo"}
-		ctx := testutil.Context(t, testutil.WaitShort)
+		ctx := testutil.Context(t, testutil.WaitLong)
 		client := coderdtest.New(t, &coderdtest.Options{
 			DeploymentValues: cfg,
 			Logger:           ptr.Ref(slog.Make(sloghuman.Sink(io.Discard))),
@@ -82,22 +104,26 @@ func TestRun(t *testing.T) {
 			Log:    slogtest.Make(t, &slogtest.Options{IgnoreErrors: true}).Named("bundle").Leveled(slog.LevelDebug),
 		})
 		require.NoError(t, err)
-		require.NotEmpty(t, bun)
-		require.NotEmpty(t, bun.Deployment.BuildInfo)
-		require.NotEmpty(t, bun.Deployment.Config)
-		require.NotEmpty(t, bun.Deployment.Config.Options)
+		assertNotNilNotEmpty(t, bun, "bundle should be present")
+		assertNotNilNotEmpty(t, bun.Deployment.BuildInfo, "deployment build info should be present")
+		assertNotNilNotEmpty(t, bun.Deployment.Config, "deployment config should be present")
+		assertNotNilNotEmpty(t, bun.Deployment.Config.Options, "deployment config should be present")
 		assertSanitizedDeploymentConfig(t, bun.Deployment.Config)
-		require.NotEmpty(t, bun.Deployment.HealthReport)
-		require.NotEmpty(t, bun.Deployment.Experiments)
-		require.NotEmpty(t, bun.Network.CoordinatorDebug)
-		require.NotEmpty(t, bun.Network.TailnetDebug)
-		require.NotNil(t, bun.Workspace)
-		require.NotEmpty(t, bun.Logs)
+		assertNotNilNotEmpty(t, bun.Deployment.HealthReport, "deployment health report should be present")
+		assertNotNilNotEmpty(t, bun.Deployment.Experiments, "deployment experiments should be present")
+		assertNotNilNotEmpty(t, bun.Network.ConnectionInfo, "agent connection info should be present")
+		assertNotNilNotEmpty(t, bun.Network.CoordinatorDebug, "network coordinator debug should be present")
+		assertNotNilNotEmpty(t, bun.Network.Netcheck, "network netcheck should be present")
+		assertNotNilNotEmpty(t, bun.Network.TailnetDebug, "network tailnet debug should be present")
+		assertNotNilNotEmpty(t, bun.Network.Interfaces, "network interfaces health should be present")
+		assert.Empty(t, bun.Workspace.Workspace, "did not expect workspace to be present")
+		assert.Empty(t, bun.Agent, "did not expect agent to be present")
+		assertNotNilNotEmpty(t, bun.Logs, "bundle logs should be present")
 	})
 
 	t.Run("NoAuth", func(t *testing.T) {
 		t.Parallel()
-		ctx := testutil.Context(t, testutil.WaitShort)
+		ctx := testutil.Context(t, testutil.WaitLong)
 		client := coderdtest.New(t, &coderdtest.Options{
 			Logger: ptr.Ref(slog.Make(sloghuman.Sink(io.Discard))),
 		})
@@ -115,7 +141,7 @@ func TestRun(t *testing.T) {
 
 	t.Run("MissingPrivilege", func(t *testing.T) {
 		t.Parallel()
-		ctx := testutil.Context(t, testutil.WaitShort)
+		ctx := testutil.Context(t, testutil.WaitLong)
 		client := coderdtest.New(t, &coderdtest.Options{
 			Logger: ptr.Ref(slog.Make(sloghuman.Sink(io.Discard))),
 		})
@@ -123,7 +149,7 @@ func TestRun(t *testing.T) {
 		memberClient, _ := coderdtest.CreateAnotherUser(t, client, admin.OrganizationID)
 		bun, err := support.Run(ctx, &support.Deps{
 			Client: memberClient,
-			Log:    slogtest.Make(t, nil).Named("bundle").Leveled(slog.LevelDebug),
+			Log:    testutil.Logger(t).Named("bundle"),
 		})
 		require.ErrorContains(t, err, "failed authorization check")
 		require.NotEmpty(t, bun)
@@ -137,6 +163,22 @@ func assertSanitizedDeploymentConfig(t *testing.T, dc *codersdk.DeploymentConfig
 		if opt.Annotations.IsSet("secret") {
 			assert.Empty(t, opt.Value.String())
 		}
+	}
+}
+
+func assertSanitizedWorkspace(t *testing.T, ws codersdk.Workspace) {
+	t.Helper()
+	for _, res := range ws.LatestBuild.Resources {
+		for _, agt := range res.Agents {
+			assertSanitizedEnv(t, agt.EnvironmentVariables)
+		}
+	}
+}
+
+func assertSanitizedEnv(t *testing.T, env map[string]string) {
+	t.Helper()
+	for k, v := range env {
+		assert.Equal(t, "***REDACTED***", v, "environment variable %q not sanitized", k)
 	}
 }
 
@@ -157,7 +199,7 @@ func setupWorkspaceAndAgent(ctx context.Context, t *testing.T, client *codersdk.
 			CreatedBy:      user.UserID,
 		}).
 		Do()
-	wbr := dbfake.WorkspaceBuild(t, db, database.Workspace{
+	wbr := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
 		OrganizationID: user.OrganizationID,
 		OwnerID:        user.UserID,
 		TemplateID:     tv.Template.ID,
@@ -187,5 +229,21 @@ func setupWorkspaceAndAgent(ctx context.Context, t *testing.T, client *codersdk.
 	})
 	require.NoError(t, err)
 
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "coder-agent.log")
+	require.NoError(t, os.WriteFile(logPath, []byte("hello from the agent"), 0o600))
+	_ = agenttest.New(t, client.URL, wbr.AgentToken, func(o *agent.Options) {
+		o.LogDir = tempDir
+	})
+	coderdtest.NewWorkspaceAgentWaiter(t, client, wbr.Workspace.ID).Wait()
+
 	return ws, agt
+}
+
+func assertNotNilNotEmpty[T any](t *testing.T, v T, msg string) {
+	t.Helper()
+
+	if assert.NotNil(t, v, msg+" but was nil") {
+		assert.NotEmpty(t, v, msg+" but was empty")
+	}
 }

@@ -3,7 +3,6 @@ package cli
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,22 +11,20 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/cli/safeexec"
+	"github.com/natefinch/atomic"
 	"github.com/pkg/diff"
 	"github.com/pkg/diff/write"
 	"golang.org/x/exp/constraints"
 	"golang.org/x/exp/slices"
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 
-	"github.com/coder/coder/v2/cli/clibase"
 	"github.com/coder/coder/v2/cli/cliui"
-	"github.com/coder/coder/v2/coderd/util/slice"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/serpent"
 )
 
 const (
@@ -54,6 +51,7 @@ type sshConfigOptions struct {
 	disableAutostart bool
 	header           []string
 	headerCommand    string
+	removedKeys      map[string]bool
 }
 
 // addOptions expects options in the form of "option=value" or "option value".
@@ -74,30 +72,20 @@ func (o *sshConfigOptions) addOption(option string) error {
 	if err != nil {
 		return err
 	}
-	for i, existing := range o.sshOptions {
-		// Override existing option if they share the same key.
-		// This is case-insensitive. Parsing each time might be a little slow,
-		// but it is ok.
-		existingKey, _, err := codersdk.ParseSSHConfigOption(existing)
-		if err != nil {
-			// Don't mess with original values if there is an error.
-			// This could have come from the user's manual edits.
-			continue
-		}
-		if strings.EqualFold(existingKey, key) {
-			if value == "" {
-				// Delete existing option.
-				o.sshOptions = append(o.sshOptions[:i], o.sshOptions[i+1:]...)
-			} else {
-				// Override existing option.
-				o.sshOptions[i] = option
-			}
-			return nil
-		}
+	lowerKey := strings.ToLower(key)
+	if o.removedKeys != nil && o.removedKeys[lowerKey] {
+		// Key marked as removed, skip.
+		return nil
 	}
-	// Only append the option if it is not empty.
+	// Only append the option if it is not empty
+	// (we interpret empty as removal).
 	if value != "" {
 		o.sshOptions = append(o.sshOptions, option)
+	} else {
+		if o.removedKeys == nil {
+			o.removedKeys = make(map[string]bool)
+		}
+		o.removedKeys[lowerKey] = true
 	}
 	return nil
 }
@@ -147,75 +135,7 @@ func (o sshConfigOptions) asList() (list []string) {
 	return list
 }
 
-type sshWorkspaceConfig struct {
-	Name  string
-	Hosts []string
-}
-
-func sshFetchWorkspaceConfigs(ctx context.Context, client *codersdk.Client) ([]sshWorkspaceConfig, error) {
-	res, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
-		Owner: codersdk.Me,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	var errGroup errgroup.Group
-	workspaceConfigs := make([]sshWorkspaceConfig, len(res.Workspaces))
-	for i, workspace := range res.Workspaces {
-		i := i
-		workspace := workspace
-		errGroup.Go(func() error {
-			resources, err := client.TemplateVersionResources(ctx, workspace.LatestBuild.TemplateVersionID)
-			if err != nil {
-				return err
-			}
-
-			wc := sshWorkspaceConfig{Name: workspace.Name}
-			var agents []codersdk.WorkspaceAgent
-			for _, resource := range resources {
-				if resource.Transition != codersdk.WorkspaceTransitionStart {
-					continue
-				}
-				agents = append(agents, resource.Agents...)
-			}
-
-			// handle both WORKSPACE and WORKSPACE.AGENT syntax
-			if len(agents) == 1 {
-				wc.Hosts = append(wc.Hosts, workspace.Name)
-			}
-			for _, agent := range agents {
-				hostname := workspace.Name + "." + agent.Name
-				wc.Hosts = append(wc.Hosts, hostname)
-			}
-
-			workspaceConfigs[i] = wc
-
-			return nil
-		})
-	}
-	err = errGroup.Wait()
-	if err != nil {
-		return nil, err
-	}
-
-	return workspaceConfigs, nil
-}
-
-func sshPrepareWorkspaceConfigs(ctx context.Context, client *codersdk.Client) (receive func() ([]sshWorkspaceConfig, error)) {
-	wcC := make(chan []sshWorkspaceConfig, 1)
-	errC := make(chan error, 1)
-	go func() {
-		wc, err := sshFetchWorkspaceConfigs(ctx, client)
-		wcC <- wc
-		errC <- err
-	}()
-	return func() ([]sshWorkspaceConfig, error) {
-		return <-wcC, <-errC
-	}
-}
-
-func (r *RootCmd) configSSH() *clibase.Cmd {
+func (r *RootCmd) configSSH() *serpent.Command {
 	var (
 		sshConfigFile       string
 		sshConfigOpts       sshConfigOptions
@@ -226,25 +146,27 @@ func (r *RootCmd) configSSH() *clibase.Cmd {
 		coderCliPath        string
 	)
 	client := new(codersdk.Client)
-	cmd := &clibase.Cmd{
+	cmd := &serpent.Command{
 		Annotations: workspaceCommand,
 		Use:         "config-ssh",
 		Short:       "Add an SSH Host entry for your workspaces \"ssh coder.workspace\"",
-		Long: formatExamples(
-			example{
+		Long: FormatExamples(
+			Example{
 				Description: "You can use -o (or --ssh-option) so set SSH options to be used for all your workspaces",
 				Command:     "coder config-ssh -o ForwardAgent=yes",
 			},
-			example{
+			Example{
 				Description: "You can use --dry-run (or -n) to see the changes that would be made",
 				Command:     "coder config-ssh --dry-run",
 			},
 		),
-		Middleware: clibase.Chain(
-			clibase.RequireNArgs(0),
+		Middleware: serpent.Chain(
+			serpent.RequireNArgs(0),
 			r.InitClient(client),
 		),
-		Handler: func(inv *clibase.Invocation) error {
+		Handler: func(inv *serpent.Invocation) error {
+			ctx := inv.Context()
+
 			if sshConfigOpts.waitEnum != "auto" && skipProxyCommand {
 				// The wait option is applied to the ProxyCommand. If the user
 				// specifies skip-proxy-command, then wait cannot be applied.
@@ -253,7 +175,12 @@ func (r *RootCmd) configSSH() *clibase.Cmd {
 			sshConfigOpts.header = r.header
 			sshConfigOpts.headerCommand = r.headerCommand
 
-			recvWorkspaceConfigs := sshPrepareWorkspaceConfigs(inv.Context(), client)
+			// Talk to the API early to prevent the version mismatch
+			// warning from being printed in the middle of a prompt.
+			// This is needed because the asynchronous requests issued
+			// by sshPrepareWorkspaceConfigs may otherwise trigger the
+			// warning at any time.
+			_, _ = client.BuildInfo(ctx)
 
 			out := inv.Stdout
 			if dryRun {
@@ -370,12 +297,7 @@ func (r *RootCmd) configSSH() *clibase.Cmd {
 			newline := len(before) > 0
 			sshConfigWriteSectionHeader(buf, newline, sshConfigOpts)
 
-			workspaceConfigs, err := recvWorkspaceConfigs()
-			if err != nil {
-				return xerrors.Errorf("fetch workspace configs failed: %w", err)
-			}
-
-			coderdConfig, err := client.SSHConfiguration(inv.Context())
+			coderdConfig, err := client.SSHConfiguration(ctx)
 			if err != nil {
 				// If the error is 404, this deployment does not support
 				// this endpoint yet. Do not error, just assume defaults.
@@ -393,87 +315,78 @@ func (r *RootCmd) configSSH() *clibase.Cmd {
 				coderdConfig.HostnamePrefix = sshConfigOpts.userHostPrefix
 			}
 
-			// Ensure stable sorting of output.
-			slices.SortFunc(workspaceConfigs, func(a, b sshWorkspaceConfig) int {
-				return slice.Ascending(a.Name, b.Name)
-			})
-			for _, wc := range workspaceConfigs {
-				sort.Strings(wc.Hosts)
-				// Write agent configuration.
-				for _, workspaceHostname := range wc.Hosts {
-					sshHostname := fmt.Sprintf("%s%s", coderdConfig.HostnamePrefix, workspaceHostname)
-					defaultOptions := []string{
-						"HostName " + sshHostname,
-						"ConnectTimeout=0",
-						"StrictHostKeyChecking=no",
-						// Without this, the "REMOTE HOST IDENTITY CHANGED"
-						// message will appear.
-						"UserKnownHostsFile=/dev/null",
-						// This disables the "Warning: Permanently added 'hostname' (RSA) to the list of known hosts."
-						// message from appearing on every SSH. This happens because we ignore the known hosts.
-						"LogLevel ERROR",
-					}
+			// Write agent configuration.
+			defaultOptions := []string{
+				"ConnectTimeout=0",
+				"StrictHostKeyChecking=no",
+				// Without this, the "REMOTE HOST IDENTITY CHANGED"
+				// message will appear.
+				"UserKnownHostsFile=/dev/null",
+				// This disables the "Warning: Permanently added 'hostname' (RSA) to the list of known hosts."
+				// message from appearing on every SSH. This happens because we ignore the known hosts.
+				"LogLevel ERROR",
+			}
 
-					if !skipProxyCommand {
-						rootFlags := fmt.Sprintf("--global-config %s", escapedGlobalConfig)
-						for _, h := range sshConfigOpts.header {
-							rootFlags += fmt.Sprintf(" --header %q", h)
-						}
-						if sshConfigOpts.headerCommand != "" {
-							rootFlags += fmt.Sprintf(" --header-command %q", sshConfigOpts.headerCommand)
-						}
+			if !skipProxyCommand {
+				rootFlags := fmt.Sprintf("--global-config %s", escapedGlobalConfig)
+				for _, h := range sshConfigOpts.header {
+					rootFlags += fmt.Sprintf(" --header %q", h)
+				}
+				if sshConfigOpts.headerCommand != "" {
+					rootFlags += fmt.Sprintf(" --header-command %q", sshConfigOpts.headerCommand)
+				}
 
-						flags := ""
-						if sshConfigOpts.waitEnum != "auto" {
-							flags += " --wait=" + sshConfigOpts.waitEnum
-						}
-						if sshConfigOpts.disableAutostart {
-							flags += " --disable-autostart=true"
-						}
-						defaultOptions = append(defaultOptions, fmt.Sprintf(
-							"ProxyCommand %s %s ssh --stdio%s %s",
-							escapedCoderBinary, rootFlags, flags, workspaceHostname,
-						))
-					}
+				flags := ""
+				if sshConfigOpts.waitEnum != "auto" {
+					flags += " --wait=" + sshConfigOpts.waitEnum
+				}
+				if sshConfigOpts.disableAutostart {
+					flags += " --disable-autostart=true"
+				}
+				defaultOptions = append(defaultOptions, fmt.Sprintf(
+					"ProxyCommand %s %s ssh --stdio%s --ssh-host-prefix %s %%h",
+					escapedCoderBinary, rootFlags, flags, coderdConfig.HostnamePrefix,
+				))
+			}
 
-					// Create a copy of the options so we can modify them.
-					configOptions := sshConfigOpts
-					configOptions.sshOptions = nil
+			// Create a copy of the options so we can modify them.
+			configOptions := sshConfigOpts
+			configOptions.sshOptions = nil
 
-					// Add standard options.
-					err := configOptions.addOptions(defaultOptions...)
-					if err != nil {
-						return err
-					}
-
-					// Override with deployment options
-					for k, v := range coderdConfig.SSHConfigOptions {
-						opt := fmt.Sprintf("%s %s", k, v)
-						err := configOptions.addOptions(opt)
-						if err != nil {
-							return xerrors.Errorf("add coderd config option %q: %w", opt, err)
-						}
-					}
-					// Override with flag options
-					for _, opt := range sshConfigOpts.sshOptions {
-						err := configOptions.addOptions(opt)
-						if err != nil {
-							return xerrors.Errorf("add flag config option %q: %w", opt, err)
-						}
-					}
-
-					hostBlock := []string{
-						"Host " + sshHostname,
-					}
-					// Prefix with '\t'
-					for _, v := range configOptions.sshOptions {
-						hostBlock = append(hostBlock, "\t"+v)
-					}
-
-					_, _ = buf.WriteString(strings.Join(hostBlock, "\n"))
-					_ = buf.WriteByte('\n')
+			// User options first (SSH only uses the first
+			// option unless it can be given multiple times)
+			for _, opt := range sshConfigOpts.sshOptions {
+				err := configOptions.addOptions(opt)
+				if err != nil {
+					return xerrors.Errorf("add flag config option %q: %w", opt, err)
 				}
 			}
+
+			// Deployment options second, allow them to
+			// override standard options.
+			for k, v := range coderdConfig.SSHConfigOptions {
+				opt := fmt.Sprintf("%s %s", k, v)
+				err := configOptions.addOptions(opt)
+				if err != nil {
+					return xerrors.Errorf("add coderd config option %q: %w", opt, err)
+				}
+			}
+
+			// Finally, add the standard options.
+			if err := configOptions.addOptions(defaultOptions...); err != nil {
+				return err
+			}
+
+			hostBlock := []string{
+				"Host " + coderdConfig.HostnamePrefix + "*",
+			}
+			// Prefix with '\t'
+			for _, v := range configOptions.sshOptions {
+				hostBlock = append(hostBlock, "\t"+v)
+			}
+
+			_, _ = buf.WriteString(strings.Join(hostBlock, "\n"))
+			_ = buf.WriteByte('\n')
 
 			sshConfigWriteSectionEnd(buf)
 
@@ -521,16 +434,24 @@ func (r *RootCmd) configSSH() *clibase.Cmd {
 			}
 
 			if !bytes.Equal(configRaw, configModified) {
-				err = writeWithTempFileAndMove(sshConfigFile, bytes.NewReader(configModified))
+				err = atomic.WriteFile(sshConfigFile, bytes.NewReader(configModified))
 				if err != nil {
 					return xerrors.Errorf("write ssh config failed: %w", err)
 				}
 				_, _ = fmt.Fprintf(out, "Updated %q\n", sshConfigFile)
 			}
 
-			if len(workspaceConfigs) > 0 {
+			res, err := client.Workspaces(ctx, codersdk.WorkspaceFilter{
+				Owner: codersdk.Me,
+				Limit: 1,
+			})
+			if err != nil {
+				return xerrors.Errorf("fetch workspaces failed: %w", err)
+			}
+
+			if len(res.Workspaces) > 0 {
 				_, _ = fmt.Fprintln(out, "You should now be able to ssh into your workspace.")
-				_, _ = fmt.Fprintf(out, "For example, try running:\n\n\t$ ssh %s%s\n", coderdConfig.HostnamePrefix, workspaceConfigs[0].Name)
+				_, _ = fmt.Fprintf(out, "For example, try running:\n\n\t$ ssh %s%s\n", coderdConfig.HostnamePrefix, res.Workspaces[0].Name)
 			} else {
 				_, _ = fmt.Fprint(out, "You don't have any workspaces yet, try creating one with:\n\n\t$ coder create <workspace>\n")
 			}
@@ -538,13 +459,13 @@ func (r *RootCmd) configSSH() *clibase.Cmd {
 		},
 	}
 
-	cmd.Options = clibase.OptionSet{
+	cmd.Options = serpent.OptionSet{
 		{
 			Flag:        "ssh-config-file",
 			Env:         "CODER_SSH_CONFIG_FILE",
 			Default:     sshDefaultConfigFileName,
 			Description: "Specifies the path to an SSH config.",
-			Value:       clibase.StringOf(&sshConfigFile),
+			Value:       serpent.StringOf(&sshConfigFile),
 		},
 		{
 			Flag:    "coder-binary-path",
@@ -552,7 +473,7 @@ func (r *RootCmd) configSSH() *clibase.Cmd {
 			Default: "",
 			Description: "Optionally specify the absolute path to the coder binary used in ProxyCommand. " +
 				"By default, the binary invoking this command ('config ssh') is used.",
-			Value: clibase.Validate(clibase.StringOf(&coderCliPath), func(value *clibase.String) error {
+			Value: serpent.Validate(serpent.StringOf(&coderCliPath), func(value *serpent.String) error {
 				if runtime.GOOS == goosWindows {
 					// For some reason filepath.IsAbs() does not work on windows.
 					return nil
@@ -569,46 +490,46 @@ func (r *RootCmd) configSSH() *clibase.Cmd {
 			FlagShorthand: "o",
 			Env:           "CODER_SSH_CONFIG_OPTS",
 			Description:   "Specifies additional SSH options to embed in each host stanza.",
-			Value:         clibase.StringArrayOf(&sshConfigOpts.sshOptions),
+			Value:         serpent.StringArrayOf(&sshConfigOpts.sshOptions),
 		},
 		{
 			Flag:          "dry-run",
 			FlagShorthand: "n",
 			Env:           "CODER_SSH_DRY_RUN",
 			Description:   "Perform a trial run with no changes made, showing a diff at the end.",
-			Value:         clibase.BoolOf(&dryRun),
+			Value:         serpent.BoolOf(&dryRun),
 		},
 		{
 			Flag:        "skip-proxy-command",
 			Env:         "CODER_SSH_SKIP_PROXY_COMMAND",
 			Description: "Specifies whether the ProxyCommand option should be skipped. Useful for testing.",
-			Value:       clibase.BoolOf(&skipProxyCommand),
+			Value:       serpent.BoolOf(&skipProxyCommand),
 			Hidden:      true,
 		},
 		{
 			Flag:        "use-previous-options",
 			Env:         "CODER_SSH_USE_PREVIOUS_OPTIONS",
 			Description: "Specifies whether or not to keep options from previous run of config-ssh.",
-			Value:       clibase.BoolOf(&usePreviousOpts),
+			Value:       serpent.BoolOf(&usePreviousOpts),
 		},
 		{
 			Flag:        "ssh-host-prefix",
 			Env:         "CODER_CONFIGSSH_SSH_HOST_PREFIX",
 			Description: "Override the default host prefix.",
-			Value:       clibase.StringOf(&sshConfigOpts.userHostPrefix),
+			Value:       serpent.StringOf(&sshConfigOpts.userHostPrefix),
 		},
 		{
 			Flag:        "wait",
 			Env:         "CODER_CONFIGSSH_WAIT", // Not to be mixed with CODER_SSH_WAIT.
 			Description: "Specifies whether or not to wait for the startup script to finish executing. Auto means that the agent startup script behavior configured in the workspace template is used.",
 			Default:     "auto",
-			Value:       clibase.EnumOf(&sshConfigOpts.waitEnum, "yes", "no", "auto"),
+			Value:       serpent.EnumOf(&sshConfigOpts.waitEnum, "yes", "no", "auto"),
 		},
 		{
 			Flag:        "disable-autostart",
 			Description: "Disable starting the workspace automatically when connecting via SSH.",
 			Env:         "CODER_CONFIGSSH_DISABLE_AUTOSTART",
-			Value:       clibase.BoolOf(&sshConfigOpts.disableAutostart),
+			Value:       serpent.BoolOf(&sshConfigOpts.disableAutostart),
 			Default:     "false",
 		},
 		{
@@ -617,7 +538,7 @@ func (r *RootCmd) configSSH() *clibase.Cmd {
 			Description: "By default, 'config-ssh' uses the os path separator when writing the ssh config. " +
 				"This might be an issue in Windows machine that use a unix-like shell. " +
 				"This flag forces the use of unix file paths (the forward slash '/').",
-			Value: clibase.BoolOf(&forceUnixSeparators),
+			Value: serpent.BoolOf(&forceUnixSeparators),
 			// On non-windows showing this command is useless because it is a noop.
 			// Hide vs disable it though so if a command is copied from a Windows
 			// machine to a unix machine it will still work and not throw an
@@ -753,50 +674,6 @@ func sshConfigSplitOnCoderSection(data []byte) (before, section []byte, after []
 	}
 
 	return data, nil, nil, nil
-}
-
-// writeWithTempFileAndMove writes to a temporary file in the same
-// directory as path and renames the temp file to the file provided in
-// path. This ensure we avoid trashing the file we are writing due to
-// unforeseen circumstance like filesystem full, command killed, etc.
-func writeWithTempFileAndMove(path string, r io.Reader) (err error) {
-	dir := filepath.Dir(path)
-	name := filepath.Base(path)
-
-	// Ensure that e.g. the ~/.ssh directory exists.
-	if err = os.MkdirAll(dir, 0o700); err != nil {
-		return xerrors.Errorf("create directory: %w", err)
-	}
-
-	// Create a tempfile in the same directory for ensuring write
-	// operation does not fail.
-	f, err := os.CreateTemp(dir, fmt.Sprintf(".%s.", name))
-	if err != nil {
-		return xerrors.Errorf("create temp file failed: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			_ = os.Remove(f.Name()) // Cleanup in case a step failed.
-		}
-	}()
-
-	_, err = io.Copy(f, r)
-	if err != nil {
-		_ = f.Close()
-		return xerrors.Errorf("write temp file failed: %w", err)
-	}
-
-	err = f.Close()
-	if err != nil {
-		return xerrors.Errorf("close temp file failed: %w", err)
-	}
-
-	err = os.Rename(f.Name(), path)
-	if err != nil {
-		return xerrors.Errorf("rename temp file failed: %w", err)
-	}
-
-	return nil
 }
 
 // sshConfigExecEscape quotes the string if it contains spaces, as per

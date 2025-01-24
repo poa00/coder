@@ -19,7 +19,7 @@ func TestGenerator(t *testing.T) {
 		t.Parallel()
 		db := dbmem.New()
 		_ = dbgen.AuditLog(t, db, database.AuditLog{})
-		logs := must(db.GetAuditLogsOffset(context.Background(), database.GetAuditLogsOffsetParams{Limit: 1}))
+		logs := must(db.GetAuditLogsOffset(context.Background(), database.GetAuditLogsOffsetParams{LimitOpt: 1}))
 		require.Len(t, logs, 1)
 	})
 
@@ -102,10 +102,10 @@ func TestGenerator(t *testing.T) {
 		db := dbmem.New()
 		g := dbgen.Group(t, db, database.Group{})
 		u := dbgen.User(t, db, database.User{})
-		exp := []database.User{u}
-		dbgen.GroupMember(t, db, database.GroupMember{GroupID: g.ID, UserID: u.ID})
+		gm := dbgen.GroupMember(t, db, database.GroupMemberTable{GroupID: g.ID, UserID: u.ID})
+		exp := []database.GroupMember{gm}
 
-		require.Equal(t, exp, must(db.GetGroupMembers(context.Background(), g.ID)))
+		require.Equal(t, exp, must(db.GetGroupMembersByGroupID(context.Background(), g.ID)))
 	})
 
 	t.Run("Organization", func(t *testing.T) {
@@ -119,17 +119,17 @@ func TestGenerator(t *testing.T) {
 		t.Parallel()
 		db := dbmem.New()
 		exp := dbgen.OrganizationMember(t, db, database.OrganizationMember{})
-		require.Equal(t, exp, must(db.GetOrganizationMemberByUserID(context.Background(), database.GetOrganizationMemberByUserIDParams{
+		require.Equal(t, exp, must(database.ExpectOne(db.OrganizationMembers(context.Background(), database.OrganizationMembersParams{
 			OrganizationID: exp.OrganizationID,
 			UserID:         exp.UserID,
-		})))
+		}))).OrganizationMember)
 	})
 
 	t.Run("Workspace", func(t *testing.T) {
 		t.Parallel()
 		db := dbmem.New()
-		exp := dbgen.Workspace(t, db, database.Workspace{})
-		require.Equal(t, exp, must(db.GetWorkspaceByID(context.Background(), exp.ID)))
+		exp := dbgen.Workspace(t, db, database.WorkspaceTable{})
+		require.Equal(t, exp, must(db.GetWorkspaceByID(context.Background(), exp.ID)).WorkspaceTable())
 	})
 
 	t.Run("WorkspaceAgent", func(t *testing.T) {

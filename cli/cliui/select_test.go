@@ -6,10 +6,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/coder/coder/v2/cli/clibase"
 	"github.com/coder/coder/v2/cli/cliui"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/pty/ptytest"
+	"github.com/coder/serpent"
 )
 
 func TestSelect(t *testing.T) {
@@ -31,8 +31,8 @@ func TestSelect(t *testing.T) {
 
 func newSelect(ptty *ptytest.PTY, opts cliui.SelectOptions) (string, error) {
 	value := ""
-	cmd := &clibase.Cmd{
-		Handler: func(inv *clibase.Invocation) error {
+	cmd := &serpent.Command{
+		Handler: func(inv *serpent.Invocation) error {
 			var err error
 			value, err = cliui.Select(inv, opts)
 			return err
@@ -72,8 +72,8 @@ func TestRichSelect(t *testing.T) {
 
 func newRichSelect(ptty *ptytest.PTY, opts cliui.RichSelectOptions) (string, error) {
 	value := ""
-	cmd := &clibase.Cmd{
-		Handler: func(inv *clibase.Invocation) error {
+	cmd := &serpent.Command{
+		Handler: func(inv *serpent.Invocation) error {
 			richOption, err := cliui.RichSelect(inv, opts)
 			if err == nil {
 				value = richOption.Value
@@ -101,13 +101,49 @@ func TestMultiSelect(t *testing.T) {
 		}()
 		require.Equal(t, items, <-msgChan)
 	})
+
+	t.Run("MultiSelectWithCustomInput", func(t *testing.T) {
+		t.Parallel()
+		items := []string{"Code", "Chairs", "Whale", "Diamond", "Carrot"}
+		ptty := ptytest.New(t)
+		msgChan := make(chan []string)
+		go func() {
+			resp, err := newMultiSelectWithCustomInput(ptty, items)
+			assert.NoError(t, err)
+			msgChan <- resp
+		}()
+		require.Equal(t, items, <-msgChan)
+	})
+}
+
+func newMultiSelectWithCustomInput(ptty *ptytest.PTY, items []string) ([]string, error) {
+	var values []string
+	cmd := &serpent.Command{
+		Handler: func(inv *serpent.Invocation) error {
+			selectedItems, err := cliui.MultiSelect(inv, cliui.MultiSelectOptions{
+				Options:           items,
+				Defaults:          items,
+				EnableCustomInput: true,
+			})
+			if err == nil {
+				values = selectedItems
+			}
+			return err
+		},
+	}
+	inv := cmd.Invoke()
+	ptty.Attach(inv)
+	return values, inv.Run()
 }
 
 func newMultiSelect(ptty *ptytest.PTY, items []string) ([]string, error) {
 	var values []string
-	cmd := &clibase.Cmd{
-		Handler: func(inv *clibase.Invocation) error {
-			selectedItems, err := cliui.MultiSelect(inv, items)
+	cmd := &serpent.Command{
+		Handler: func(inv *serpent.Invocation) error {
+			selectedItems, err := cliui.MultiSelect(inv, cliui.MultiSelectOptions{
+				Options:  items,
+				Defaults: items,
+			})
 			if err == nil {
 				values = selectedItems
 			}

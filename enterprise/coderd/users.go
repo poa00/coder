@@ -14,20 +14,18 @@ import (
 	"github.com/coder/coder/v2/codersdk"
 )
 
+const TimeFormatHHMM = "15:04"
+
 func (api *API) autostopRequirementEnabledMW(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// Entitlement must be enabled.
-		api.entitlementsMu.RLock()
-		entitled := api.entitlements.Features[codersdk.FeatureAdvancedTemplateScheduling].Entitlement != codersdk.EntitlementNotEntitled
-		enabled := api.entitlements.Features[codersdk.FeatureAdvancedTemplateScheduling].Enabled
-		api.entitlementsMu.RUnlock()
-		if !entitled {
+		feature, ok := api.Entitlements.Feature(codersdk.FeatureAdvancedTemplateScheduling)
+		if !ok || !feature.Entitlement.Entitled() {
 			httpapi.Write(r.Context(), rw, http.StatusForbidden, codersdk.Response{
 				Message: "Advanced template scheduling (and user quiet hours schedule) is an Enterprise feature. Contact sales!",
 			})
 			return
 		}
-		if !enabled {
+		if !feature.Enabled {
 			httpapi.Write(r.Context(), rw, http.StatusForbidden, codersdk.Response{
 				Message: "Advanced template scheduling (and user quiet hours schedule) is not enabled.",
 			})
@@ -66,7 +64,7 @@ func (api *API) userQuietHoursSchedule(rw http.ResponseWriter, r *http.Request) 
 		RawSchedule: opts.Schedule.String(),
 		UserSet:     opts.UserSet,
 		UserCanSet:  opts.UserCanSet,
-		Time:        opts.Schedule.TimeParsed().Format("15:40"),
+		Time:        opts.Schedule.TimeParsed().Format(TimeFormatHHMM),
 		Timezone:    opts.Schedule.Location().String(),
 		Next:        opts.Schedule.Next(time.Now().In(opts.Schedule.Location())),
 	})
@@ -118,7 +116,7 @@ func (api *API) putUserQuietHoursSchedule(rw http.ResponseWriter, r *http.Reques
 		RawSchedule: opts.Schedule.String(),
 		UserSet:     opts.UserSet,
 		UserCanSet:  opts.UserCanSet,
-		Time:        opts.Schedule.TimeParsed().Format("15:40"),
+		Time:        opts.Schedule.TimeParsed().Format(TimeFormatHHMM),
 		Timezone:    opts.Schedule.Location().String(),
 		Next:        opts.Schedule.Next(time.Now().In(opts.Schedule.Location())),
 	})

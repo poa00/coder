@@ -9,7 +9,7 @@ tags: [nomad, container]
 
 # Remote Development on Nomad
 
-Provision Nomad Jobs as [Coder workspaces](https://coder.com/docs/v2/latest/workspaces) with this example template. This example shows how to use Nomad service tasks to be used as a development environment using docker and host csi volumes.
+Provision Nomad Jobs as [Coder workspaces](https://coder.com/docs/workspaces) with this example template. This example shows how to use Nomad service tasks to be used as a development environment using docker and host csi volumes.
 
 <!-- TODO: Add screenshot -->
 
@@ -31,7 +31,7 @@ The CSI Host Volume plugin is used to mount host volumes into Nomad tasks. This 
 
 2. Append the following stanza to your Nomad server configuration file and restart the nomad service.
 
-   ```hcl
+   ```tf
    plugin "docker" {
      config {
        allow_privileged = true
@@ -45,7 +45,7 @@ The CSI Host Volume plugin is used to mount host volumes into Nomad tasks. This 
 
 3. Create a file `hostpath.nomad` with following content:
 
-   ```hcl
+   ```tf
    job "hostpath-csi-plugin" {
      datacenters = ["dc1"]
      type = "system"

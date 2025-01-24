@@ -15,6 +15,8 @@ USAGE:
 
 SUBCOMMANDS:
     autoupdate        Toggle auto-update policy for a workspace
+    completion        Install or update shell completion scripts for the
+                      detected or chosen shell.
     config-ssh        Add an SSH Host entry for your workspaces "ssh
                       coder.workspace"
     create            Create a workspace
@@ -27,10 +29,13 @@ SUBCOMMANDS:
     login             Authenticate with Coder deployment
     logout            Unauthenticate your local session
     netcheck          Print network debug information for DERP and STUN
+    notifications     Manage Coder notifications
     open              Open a workspace
+    organizations     Organization related commands
     ping              Ping a workspace
     port-forward      Forward ports from a workspace to the local machine. For
                       reverse port forwarding, use "coder ssh -R".
+    provisioner       View and manage provisioner daemons and jobs
     publickey         Output your Coder public key used for Git operations
     rename            Rename a workspace
     reset-password    Directly connect to the database to reset a user's
@@ -46,6 +51,8 @@ SUBCOMMANDS:
     stat              Show resource usage for the current workspace.
     state             Manually manage Terraform state to fix broken workspaces
     stop              Stop a workspace
+    support           Commands for troubleshooting issues with a Coder
+                      deployment.
     templates         Manage templates
     tokens            Manage personal access tokens
     unfavorite        Remove a workspace from your favorites
@@ -53,6 +60,7 @@ SUBCOMMANDS:
                       date
     users             Manage users
     version           Show coder version
+    whoami            Fetch authenticated user info for Coder deployment
 
 GLOBAL OPTIONS: 
 Global options are applied to all commands. They can be set using environment
@@ -63,6 +71,13 @@ variables or flags.
 
       --disable-direct-connections bool, $CODER_DISABLE_DIRECT_CONNECTIONS
           Disable direct (P2P) connections to workspaces.
+
+      --disable-network-telemetry bool, $CODER_DISABLE_NETWORK_TELEMETRY
+          Disable network telemetry. Network telemetry is collected when
+          connecting to workspaces using the CLI, and is forwarded to the
+          server. If telemetry is also enabled on the server, it may be sent to
+          Coder. Network telemetry is used to measure network quality and detect
+          regressions.
 
       --global-config string, $CODER_CONFIG_DIR (default: ~/.config/coderv2)
           Path to the global `coder` config directory.
@@ -81,10 +96,6 @@ variables or flags.
 
       --no-version-warning bool, $CODER_NO_VERSION_WARNING
           Suppress warning when client and server versions do not match.
-
-  -z, --organization string, $CODER_ORGANIZATION
-          Select which organization (uuid or name) to use This overrides what is
-          present in the config file.
 
       --token string, $CODER_SESSION_TOKEN
           Specify an authentication token. For security reasons setting

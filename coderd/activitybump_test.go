@@ -8,7 +8,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent/agenttest"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
@@ -16,6 +15,7 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/schedule"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/coder/v2/provisioner/echo"
 	"github.com/coder/coder/v2/testutil"
 )
@@ -31,10 +31,6 @@ func TestWorkspaceActivityBump(t *testing.T) {
 	setupActivityTest := func(t *testing.T, deadline ...time.Duration) (client *codersdk.Client, workspace codersdk.Workspace, assertBumped func(want bool)) {
 		t.Helper()
 		const ttl = time.Hour
-		maxTTL := time.Duration(0)
-		if len(deadline) > 0 {
-			maxTTL = deadline[0]
-		}
 
 		db, pubsub := dbtestutil.NewDB(t)
 		client = coderdtest.New(t, &coderdtest.Options{
@@ -66,15 +62,15 @@ func TestWorkspaceActivityBump(t *testing.T) {
 		})
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
-		workspace = coderdtest.CreateWorkspace(t, client, user.OrganizationID, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
+		workspace = coderdtest.CreateWorkspace(t, client, template.ID, func(cwr *codersdk.CreateWorkspaceRequest) {
 			cwr.TTLMillis = &ttlMillis
 		})
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		var maxDeadline time.Time
 		// Update the max deadline.
-		if maxTTL != 0 {
-			maxDeadline = dbtime.Now().Add(maxTTL)
+		if len(deadline) > 0 {
+			maxDeadline = dbtime.Now().Add(deadline[0])
 		}
 
 		err := db.UpdateWorkspaceBuildDeadlineByID(ctx, database.UpdateWorkspaceBuildDeadlineByIDParams{
@@ -99,9 +95,9 @@ func TestWorkspaceActivityBump(t *testing.T) {
 		)
 		firstDeadline := workspace.LatestBuild.Deadline.Time
 
-		if maxTTL != 0 {
+		if !maxDeadline.IsZero() {
 			require.WithinDuration(t,
-				time.Now().Add(maxTTL),
+				maxDeadline,
 				workspace.LatestBuild.MaxDeadline.Time,
 				testutil.WaitMedium,
 			)
@@ -127,21 +123,56 @@ func TestWorkspaceActivityBump(t *testing.T) {
 				return
 			}
 
-			var updatedAfter time.Time
+			// maxTimeDrift is how long we are willing wait for a deadline to
+			// be increased. Since it could have been bumped at the initial
+			maxTimeDrift := testutil.WaitMedium
+
+			updatedAfter := dbtime.Now()
+			// waitedFor is purely for debugging failed tests. If a test fails,
+			// it helps to know how long it took for the deadline bump to be
+			// detected. The longer this takes, the more likely time drift will
+			// affect the results.
+			waitedFor := time.Now()
+			// lastChecked is for logging within the Eventually loop.
+			// Debouncing log lines to every second to prevent spam.
+			lastChecked := time.Time{}
+			// checks is for keeping track of the average check time.
+			// If CI is running slow, this could be useful to know checks
+			// are taking longer than expected.
+			checks := 0
+
 			// The Deadline bump occurs asynchronously.
 			require.Eventuallyf(t,
 				func() bool {
+					checks++
 					workspace, err = client.Workspace(ctx, workspace.ID)
 					require.NoError(t, err)
-					updatedAfter = dbtime.Now()
-					if workspace.LatestBuild.Deadline.Time.Equal(firstDeadline) {
-						updatedAfter = time.Now()
-						return false
+
+					hasBumped := !workspace.LatestBuild.Deadline.Time.Equal(firstDeadline)
+
+					// Always make sure to log this information, even on the last check.
+					// The last check is the most important, as if this loop is acting
+					// slow, the last check could be the cause of the failure.
+					if time.Since(lastChecked) > time.Second || hasBumped {
+						avgCheckTime := time.Since(waitedFor) / time.Duration(checks)
+						t.Logf("deadline detect: bumped=%t since_last_check=%s avg_check_dur=%s checks=%d deadline=%v",
+							hasBumped, time.Since(updatedAfter), avgCheckTime, checks, workspace.LatestBuild.Deadline.Time)
+						lastChecked = time.Now()
 					}
-					return true
+
+					updatedAfter = dbtime.Now()
+					return hasBumped
 				},
-				testutil.WaitLong, testutil.IntervalFast,
+				//nolint: gocritic // maxTimeDrift is a testutil time
+				maxTimeDrift, testutil.IntervalFast,
 				"deadline %v never updated", firstDeadline,
+			)
+
+			// This log line helps establish how long it took for the deadline
+			// to be detected as bumped.
+			t.Logf("deadline bump detected: %v, waited for %s",
+				workspace.LatestBuild.Deadline.Time,
+				time.Since(waitedFor),
 			)
 
 			require.Greater(t, workspace.LatestBuild.Deadline.Time, updatedAfter)
@@ -159,7 +190,7 @@ func TestWorkspaceActivityBump(t *testing.T) {
 				firstDeadline, workspace.LatestBuild.Deadline.Time, now,
 				now.Sub(workspace.LatestBuild.Deadline.Time),
 			)
-			require.WithinDuration(t, dbtime.Now().Add(ttl), workspace.LatestBuild.Deadline.Time, testutil.WaitShort)
+			require.WithinDuration(t, now.Add(ttl), workspace.LatestBuild.Deadline.Time, maxTimeDrift)
 		}
 	}
 
@@ -169,9 +200,10 @@ func TestWorkspaceActivityBump(t *testing.T) {
 		client, workspace, assertBumped := setupActivityTest(t)
 
 		resources := coderdtest.AwaitWorkspaceAgents(t, client, workspace.ID)
-		conn, err := client.DialWorkspaceAgent(ctx, resources[0].Agents[0].ID, &codersdk.DialWorkspaceAgentOptions{
-			Logger: slogtest.Make(t, nil),
-		})
+		conn, err := workspacesdk.New(client).
+			DialAgent(ctx, resources[0].Agents[0].ID, &workspacesdk.DialAgentOptions{
+				Logger: testutil.Logger(t),
+			})
 		require.NoError(t, err)
 		defer conn.Close()
 
@@ -206,9 +238,10 @@ func TestWorkspaceActivityBump(t *testing.T) {
 
 		// Bump by dialing the workspace and sending traffic.
 		resources := coderdtest.AwaitWorkspaceAgents(t, client, workspace.ID)
-		conn, err := client.DialWorkspaceAgent(ctx, resources[0].Agents[0].ID, &codersdk.DialWorkspaceAgentOptions{
-			Logger: slogtest.Make(t, nil),
-		})
+		conn, err := workspacesdk.New(client).
+			DialAgent(ctx, resources[0].Agents[0].ID, &workspacesdk.DialAgentOptions{
+				Logger: testutil.Logger(t),
+			})
 		require.NoError(t, err)
 		defer conn.Close()
 
@@ -218,6 +251,6 @@ func TestWorkspaceActivityBump(t *testing.T) {
 		require.NoError(t, err)
 		_ = sshConn.Close()
 
-		assertBumped(true) // also asserts max ttl not exceeded
+		assertBumped(true)
 	})
 }

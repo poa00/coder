@@ -12,6 +12,8 @@ import (
 	"github.com/coder/coder/v2/cli/clitest"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
+	"github.com/coder/coder/v2/coderd/database/dbtestutil"
+	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/pty/ptytest"
 	"github.com/coder/coder/v2/testutil"
@@ -27,7 +29,7 @@ func TestDelete(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, member, owner.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, member, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 		inv, root := clitest.New(t, "delete", workspace.Name, "-y")
 		clitest.SetupConfig(t, member, root)
@@ -52,7 +54,7 @@ func TestDelete(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, owner.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 		inv, root := clitest.New(t, "delete", workspace.Name, "-y", "--orphan")
 
@@ -86,8 +88,7 @@ func TestDelete(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
-
-		workspace := coderdtest.CreateWorkspace(t, deleteMeClient, owner.OrganizationID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, deleteMeClient, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, deleteMeClient, workspace.LatestBuild.ID)
 
 		// The API checks if the user has any workspaces, so we cannot delete a user
@@ -128,7 +129,7 @@ func TestDelete(t *testing.T) {
 		version := coderdtest.CreateTemplateVersion(t, adminClient, orgID, nil)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, adminClient, version.ID)
 		template := coderdtest.CreateTemplate(t, adminClient, orgID, version.ID)
-		workspace := coderdtest.CreateWorkspace(t, client, orgID, template.ID)
+		workspace := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
 
 		inv, root := clitest.New(t, "delete", user.Username+"/"+workspace.Name, "-y")
@@ -163,6 +164,49 @@ func TestDelete(t *testing.T) {
 			err := inv.Run()
 			assert.ErrorContains(t, err, "invalid workspace name: \"a/b/c\"")
 		}()
+		<-doneChan
+	})
+
+	t.Run("WarnNoProvisioners", func(t *testing.T) {
+		t.Parallel()
+		if !dbtestutil.WillUsePostgres() {
+			t.Skip("this test requires postgres")
+		}
+
+		store, ps, db := dbtestutil.NewDBWithSQLDB(t)
+		client, closeDaemon := coderdtest.NewWithProvisionerCloser(t, &coderdtest.Options{
+			Database:                 store,
+			Pubsub:                   ps,
+			IncludeProvisionerDaemon: true,
+		})
+
+		// Given: a user, template, and workspace
+		user := coderdtest.CreateFirstUser(t, client)
+		templateAdmin, _ := coderdtest.CreateAnotherUser(t, client, user.OrganizationID, rbac.RoleTemplateAdmin())
+		version := coderdtest.CreateTemplateVersion(t, templateAdmin, user.OrganizationID, nil)
+		coderdtest.AwaitTemplateVersionJobCompleted(t, templateAdmin, version.ID)
+		template := coderdtest.CreateTemplate(t, templateAdmin, user.OrganizationID, version.ID)
+		workspace := coderdtest.CreateWorkspace(t, templateAdmin, template.ID)
+		coderdtest.AwaitWorkspaceBuildJobCompleted(t, templateAdmin, workspace.LatestBuild.ID)
+
+		// When: all provisioner daemons disappear
+		require.NoError(t, closeDaemon.Close())
+		_, err := db.Exec("DELETE FROM provisioner_daemons;")
+		require.NoError(t, err)
+
+		// Then: the workspace deletion should warn about no provisioners
+		inv, root := clitest.New(t, "delete", workspace.Name, "-y")
+		pty := ptytest.New(t).Attach(inv)
+		clitest.SetupConfig(t, templateAdmin, root)
+		doneChan := make(chan struct{})
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+		defer cancel()
+		go func() {
+			defer close(doneChan)
+			_ = inv.WithContext(ctx).Run()
+		}()
+		pty.ExpectMatch("there are no provisioners that accept the required tags")
+		cancel()
 		<-doneChan
 	})
 }

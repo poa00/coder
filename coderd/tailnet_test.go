@@ -20,14 +20,13 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"tailscale.com/tailcfg"
 
-	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent"
 	"github.com/coder/coder/v2/agent/agenttest"
 	"github.com/coder/coder/v2/agent/proto"
 	"github.com/coder/coder/v2/coderd"
-	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/coderd/workspaceapps/appurl"
 	"github.com/coder/coder/v2/codersdk/agentsdk"
+	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/coder/v2/tailnet"
 	"github.com/coder/coder/v2/tailnet/tailnettest"
 	"github.com/coder/coder/v2/testutil"
@@ -68,6 +67,35 @@ func TestServerTailnet_AgentConn_NoSTUN(t *testing.T) {
 	assert.True(t, conn.AwaitReachable(ctx))
 }
 
+//nolint:paralleltest // t.Setenv
+func TestServerTailnet_ReverseProxy_ProxyEnv(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://169.254.169.254:12345")
+
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+	defer cancel()
+
+	agents, serverTailnet := setupServerTailnetAgent(t, 1)
+	a := agents[0]
+
+	u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", workspacesdk.AgentHTTPAPIServerPort))
+	require.NoError(t, err)
+
+	rp := serverTailnet.ReverseProxy(u, u, a.id, appurl.ApplicationURL{}, "")
+
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodGet,
+		u.String(),
+		nil,
+	).WithContext(ctx)
+
+	rp.ServeHTTP(rw, req)
+	res := rw.Result()
+	defer res.Body.Close()
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
+}
+
 func TestServerTailnet_ReverseProxy(t *testing.T) {
 	t.Parallel()
 
@@ -80,10 +108,10 @@ func TestServerTailnet_ReverseProxy(t *testing.T) {
 		agents, serverTailnet := setupServerTailnetAgent(t, 1)
 		a := agents[0]
 
-		u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", codersdk.WorkspaceAgentHTTPAPIServerPort))
+		u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", workspacesdk.AgentHTTPAPIServerPort))
 		require.NoError(t, err)
 
-		rp := serverTailnet.ReverseProxy(u, u, a.id)
+		rp := serverTailnet.ReverseProxy(u, u, a.id, appurl.ApplicationURL{}, "")
 
 		rw := httptest.NewRecorder()
 		req := httptest.NewRequest(
@@ -111,10 +139,10 @@ func TestServerTailnet_ReverseProxy(t *testing.T) {
 		registry := prometheus.NewRegistry()
 		require.NoError(t, registry.Register(serverTailnet))
 
-		u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", codersdk.WorkspaceAgentHTTPAPIServerPort))
+		u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", workspacesdk.AgentHTTPAPIServerPort))
 		require.NoError(t, err)
 
-		rp := serverTailnet.ReverseProxy(u, u, a.id)
+		rp := serverTailnet.ReverseProxy(u, u, a.id, appurl.ApplicationURL{}, "")
 
 		rw := httptest.NewRecorder()
 		req := httptest.NewRequest(
@@ -145,10 +173,10 @@ func TestServerTailnet_ReverseProxy(t *testing.T) {
 		agents, serverTailnet := setupServerTailnetAgent(t, 1)
 		a := agents[0]
 
-		u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", codersdk.WorkspaceAgentHTTPAPIServerPort))
+		u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", workspacesdk.AgentHTTPAPIServerPort))
 		require.NoError(t, err)
 
-		rp := serverTailnet.ReverseProxy(u, u, a.id)
+		rp := serverTailnet.ReverseProxy(u, u, a.id, appurl.ApplicationURL{}, "")
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		require.NoError(t, err)
@@ -156,7 +184,9 @@ func TestServerTailnet_ReverseProxy(t *testing.T) {
 		// Ensure the reverse proxy director rewrites the url host to the agent's IP.
 		rp.Director(req)
 		assert.Equal(t,
-			fmt.Sprintf("[%s]:%d", tailnet.IPFromUUID(a.id).String(), codersdk.WorkspaceAgentHTTPAPIServerPort),
+			fmt.Sprintf("[%s]:%d",
+				tailnet.TailscaleServicePrefix.AddrFromUUID(a.id).String(),
+				workspacesdk.AgentHTTPAPIServerPort),
 			req.URL.Host,
 		)
 	})
@@ -193,7 +223,7 @@ func TestServerTailnet_ReverseProxy(t *testing.T) {
 		u, err := url.Parse("http://127.0.0.1" + port)
 		require.NoError(t, err)
 
-		rp := serverTailnet.ReverseProxy(u, u, a.id)
+		rp := serverTailnet.ReverseProxy(u, u, a.id, appurl.ApplicationURL{}, "")
 
 		for i := 0; i < 5; i++ {
 			rw := httptest.NewRecorder()
@@ -250,7 +280,7 @@ func TestServerTailnet_ReverseProxy(t *testing.T) {
 		require.NoError(t, err)
 
 		for i, ag := range agents {
-			rp := serverTailnet.ReverseProxy(u, u, ag.id)
+			rp := serverTailnet.ReverseProxy(u, u, ag.id, appurl.ApplicationURL{}, "")
 
 			rw := httptest.NewRecorder()
 			req := httptest.NewRequest(
@@ -288,7 +318,7 @@ func TestServerTailnet_ReverseProxy(t *testing.T) {
 		uri, err := url.Parse(s.URL)
 		require.NoError(t, err)
 
-		rp := serverTailnet.ReverseProxy(uri, uri, a.id)
+		rp := serverTailnet.ReverseProxy(uri, uri, a.id, appurl.ApplicationURL{}, "")
 
 		rw := httptest.NewRecorder()
 		req := httptest.NewRequest(
@@ -315,10 +345,10 @@ func TestServerTailnet_ReverseProxy(t *testing.T) {
 
 		require.True(t, serverTailnet.Conn().GetBlockEndpoints(), "expected BlockEndpoints to be set")
 
-		u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", codersdk.WorkspaceAgentHTTPAPIServerPort))
+		u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", workspacesdk.AgentHTTPAPIServerPort))
 		require.NoError(t, err)
 
-		rp := serverTailnet.ReverseProxy(u, u, a.id)
+		rp := serverTailnet.ReverseProxy(u, u, a.id, appurl.ApplicationURL{}, "")
 
 		rw := httptest.NewRecorder()
 		req := httptest.NewRequest(
@@ -360,13 +390,15 @@ type agentWithID struct {
 }
 
 func setupServerTailnetAgent(t *testing.T, agentNum int, opts ...tailnettest.DERPAndStunOption) ([]agentWithID, *coderd.ServerTailnet) {
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	derpMap, derpServer := tailnettest.RunDERPAndSTUN(t, opts...)
 
 	coord := tailnet.NewCoordinator(logger)
 	t.Cleanup(func() {
 		_ = coord.Close()
 	})
+	coordPtr := atomic.Pointer[tailnet.Coordinator]{}
+	coordPtr.Store(&coord)
 
 	agents := []agentWithID{}
 
@@ -398,13 +430,18 @@ func setupServerTailnetAgent(t *testing.T, agentNum int, opts ...tailnettest.DER
 		agents = append(agents, agentWithID{id: manifest.AgentID, Agent: ag})
 	}
 
+	dialer := &coderd.InmemTailnetDialer{
+		CoordPtr: &coordPtr,
+		DERPFn:   func() *tailcfg.DERPMap { return derpMap },
+		Logger:   logger,
+		ClientID: uuid.UUID{5},
+	}
 	serverTailnet, err := coderd.NewServerTailnet(
 		context.Background(),
 		logger,
 		derpServer,
-		func() *tailcfg.DERPMap { return derpMap },
+		dialer,
 		false,
-		func(context.Context) (tailnet.MultiAgentConn, error) { return coord.ServeMultiAgent(uuid.New()), nil },
 		!derpMap.HasSTUN(),
 		trace.NewNoopTracerProvider(),
 	)

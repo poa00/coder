@@ -32,7 +32,7 @@ func TestViewSubsetTemplate(t *testing.T) {
 	tableFields := allFields(table)
 	joinedFields := allFields(joined)
 	if !assert.Subset(t, fieldNames(joinedFields), fieldNames(tableFields), "table is not subset") {
-		t.Log("Some fields were added to the Template Table without updating the 'template_with_users' view.")
+		t.Log("Some fields were added to the Template Table without updating the 'template_with_names' view.")
 		t.Log("See migration 000138_join_users.up.sql to create the view.")
 	}
 }
@@ -62,6 +62,20 @@ func TestViewSubsetWorkspaceBuild(t *testing.T) {
 	if !assert.Subset(t, fieldNames(joinedFields), fieldNames(tableFields), "table is not subset") {
 		t.Log("Some fields were added to the WorkspaceBuild Table without updating the 'workspace_build_with_user' view.")
 		t.Log("See migration 000141_join_users_build_version.up.sql to create the view.")
+	}
+}
+
+// TestViewSubsetWorkspace ensures WorkspaceTable is a subset of Workspace
+func TestViewSubsetWorkspace(t *testing.T) {
+	t.Parallel()
+	table := reflect.TypeOf(database.WorkspaceTable{})
+	joined := reflect.TypeOf(database.Workspace{})
+
+	tableFields := allFields(table)
+	joinedFields := allFields(joined)
+	if !assert.Subset(t, fieldNames(joinedFields), fieldNames(tableFields), "table is not subset") {
+		t.Log("Some fields were added to the Workspace Table without updating the 'workspaces_expanded' view.")
+		t.Log("See migration 000262_workspace_with_names.up.sql to create the view.")
 	}
 }
 

@@ -14,22 +14,29 @@ import (
 type ResourceType string
 
 const (
-	ResourceTypeTemplate          ResourceType = "template"
-	ResourceTypeTemplateVersion   ResourceType = "template_version"
-	ResourceTypeUser              ResourceType = "user"
-	ResourceTypeWorkspace         ResourceType = "workspace"
-	ResourceTypeWorkspaceBuild    ResourceType = "workspace_build"
-	ResourceTypeGitSSHKey         ResourceType = "git_ssh_key"
-	ResourceTypeAPIKey            ResourceType = "api_key"
-	ResourceTypeGroup             ResourceType = "group"
-	ResourceTypeLicense           ResourceType = "license"
-	ResourceTypeConvertLogin      ResourceType = "convert_login"
-	ResourceTypeHealthSettings    ResourceType = "health_settings"
-	ResourceTypeWorkspaceProxy    ResourceType = "workspace_proxy"
-	ResourceTypeOrganization      ResourceType = "organization"
-	ResourceTypeOAuth2ProviderApp ResourceType = "oauth2_provider_app"
+	ResourceTypeTemplate              ResourceType = "template"
+	ResourceTypeTemplateVersion       ResourceType = "template_version"
+	ResourceTypeUser                  ResourceType = "user"
+	ResourceTypeWorkspace             ResourceType = "workspace"
+	ResourceTypeWorkspaceBuild        ResourceType = "workspace_build"
+	ResourceTypeGitSSHKey             ResourceType = "git_ssh_key"
+	ResourceTypeAPIKey                ResourceType = "api_key"
+	ResourceTypeGroup                 ResourceType = "group"
+	ResourceTypeLicense               ResourceType = "license"
+	ResourceTypeConvertLogin          ResourceType = "convert_login"
+	ResourceTypeHealthSettings        ResourceType = "health_settings"
+	ResourceTypeNotificationsSettings ResourceType = "notifications_settings"
+	ResourceTypeWorkspaceProxy        ResourceType = "workspace_proxy"
+	ResourceTypeOrganization          ResourceType = "organization"
+	ResourceTypeOAuth2ProviderApp     ResourceType = "oauth2_provider_app"
 	// nolint:gosec // This is not a secret.
-	ResourceTypeOAuth2ProviderAppSecret ResourceType = "oauth2_provider_app_secret"
+	ResourceTypeOAuth2ProviderAppSecret     ResourceType = "oauth2_provider_app_secret"
+	ResourceTypeCustomRole                  ResourceType = "custom_role"
+	ResourceTypeOrganizationMember          ResourceType = "organization_member"
+	ResourceTypeNotificationTemplate        ResourceType = "notification_template"
+	ResourceTypeIdpSyncSettingsOrganization ResourceType = "idp_sync_settings_organization"
+	ResourceTypeIdpSyncSettingsGroup        ResourceType = "idp_sync_settings_group"
+	ResourceTypeIdpSyncSettingsRole         ResourceType = "idp_sync_settings_role"
 )
 
 func (r ResourceType) FriendlyString() string {
@@ -62,10 +69,24 @@ func (r ResourceType) FriendlyString() string {
 		return "organization"
 	case ResourceTypeHealthSettings:
 		return "health_settings"
+	case ResourceTypeNotificationsSettings:
+		return "notifications_settings"
 	case ResourceTypeOAuth2ProviderApp:
 		return "oauth2 app"
 	case ResourceTypeOAuth2ProviderAppSecret:
 		return "oauth2 app secret"
+	case ResourceTypeCustomRole:
+		return "custom role"
+	case ResourceTypeOrganizationMember:
+		return "organization member"
+	case ResourceTypeNotificationTemplate:
+		return "notification template"
+	case ResourceTypeIdpSyncSettingsOrganization:
+		return "settings"
+	case ResourceTypeIdpSyncSettingsGroup:
+		return "settings"
+	case ResourceTypeIdpSyncSettingsRole:
+		return "settings"
 	default:
 		return "unknown"
 	}
@@ -74,14 +95,15 @@ func (r ResourceType) FriendlyString() string {
 type AuditAction string
 
 const (
-	AuditActionCreate   AuditAction = "create"
-	AuditActionWrite    AuditAction = "write"
-	AuditActionDelete   AuditAction = "delete"
-	AuditActionStart    AuditAction = "start"
-	AuditActionStop     AuditAction = "stop"
-	AuditActionLogin    AuditAction = "login"
-	AuditActionLogout   AuditAction = "logout"
-	AuditActionRegister AuditAction = "register"
+	AuditActionCreate               AuditAction = "create"
+	AuditActionWrite                AuditAction = "write"
+	AuditActionDelete               AuditAction = "delete"
+	AuditActionStart                AuditAction = "start"
+	AuditActionStop                 AuditAction = "stop"
+	AuditActionLogin                AuditAction = "login"
+	AuditActionLogout               AuditAction = "logout"
+	AuditActionRegister             AuditAction = "register"
+	AuditActionRequestPasswordReset AuditAction = "request_password_reset"
 )
 
 func (a AuditAction) Friendly() string {
@@ -102,6 +124,8 @@ func (a AuditAction) Friendly() string {
 		return "logged out"
 	case AuditActionRegister:
 		return "registered"
+	case AuditActionRequestPasswordReset:
+		return "password reset requested"
 	default:
 		return "unknown"
 	}
@@ -116,14 +140,13 @@ type AuditDiffField struct {
 }
 
 type AuditLog struct {
-	ID             uuid.UUID    `json:"id" format:"uuid"`
-	RequestID      uuid.UUID    `json:"request_id" format:"uuid"`
-	Time           time.Time    `json:"time" format:"date-time"`
-	OrganizationID uuid.UUID    `json:"organization_id" format:"uuid"`
-	IP             netip.Addr   `json:"ip"`
-	UserAgent      string       `json:"user_agent"`
-	ResourceType   ResourceType `json:"resource_type"`
-	ResourceID     uuid.UUID    `json:"resource_id" format:"uuid"`
+	ID           uuid.UUID    `json:"id" format:"uuid"`
+	RequestID    uuid.UUID    `json:"request_id" format:"uuid"`
+	Time         time.Time    `json:"time" format:"date-time"`
+	IP           netip.Addr   `json:"ip"`
+	UserAgent    string       `json:"user_agent"`
+	ResourceType ResourceType `json:"resource_type"`
+	ResourceID   uuid.UUID    `json:"resource_id" format:"uuid"`
 	// ResourceTarget is the name of the resource.
 	ResourceTarget   string          `json:"resource_target"`
 	ResourceIcon     string          `json:"resource_icon"`
@@ -134,6 +157,11 @@ type AuditLog struct {
 	Description      string          `json:"description"`
 	ResourceLink     string          `json:"resource_link"`
 	IsDeleted        bool            `json:"is_deleted"`
+
+	// Deprecated: Use 'organization.id' instead.
+	OrganizationID uuid.UUID `json:"organization_id" format:"uuid"`
+
+	Organization *MinimalOrganization `json:"organization,omitempty"`
 
 	User *User `json:"user"`
 }
@@ -155,6 +183,7 @@ type CreateTestAuditLogRequest struct {
 	AdditionalFields json.RawMessage `json:"additional_fields,omitempty"`
 	Time             time.Time       `json:"time,omitempty" format:"date-time"`
 	BuildReason      BuildReason     `json:"build_reason,omitempty" enums:"autostart,autostop,initiator"`
+	OrganizationID   uuid.UUID       `json:"organization_id,omitempty" format:"uuid"`
 }
 
 // AuditLogs retrieves audit logs from the given page.

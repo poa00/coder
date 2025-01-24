@@ -1,15 +1,17 @@
 # Authz
 
-Package `authz` implements AuthoriZation for Coder.
+Package `rbac` implements Role-Based Access Control for Coder.
+
+See [USAGE.md](USAGE.md) for a hands-on approach to using this package.
 
 ## Overview
 
 Authorization defines what **permission** a **subject** has to perform **actions** to **objects**:
 
 - **Permission** is binary: _yes_ (allowed) or _no_ (denied).
-- **Subject** in this case is anything that implements interface `authz.Subject`.
-- **Action** here is an enumerated list of actions, but we stick to `Create`, `Read`, `Update`, and `Delete` here.
-- **Object** here is anything that implements `authz.Object`.
+- **Subject** in this case is anything that implements interface `rbac.Subject`.
+- **Action** here is an enumerated list of actions. Actions can differ for each object type. They typically read like, `Create`, `Read`, `Update`, `Delete`, etc.
+- **Object** here is anything that implements `rbac.Object`.
 
 ## Permission Structure
 
@@ -34,11 +36,11 @@ Both **negative** and **positive** permissions override **abstain** at the same 
 This can be represented by the following truth table, where Y represents _positive_, N represents _negative_, and \_ represents _abstain_:
 
 | Action | Positive | Negative | Result |
-| ------ | -------- | -------- | ------ |
+|--------|----------|----------|--------|
 | read   | Y        | \_       | Y      |
 | read   | Y        | N        | N      |
 | read   | \_       | \_       | \_     |
-| read   | \_       | N        | Y      |
+| read   | \_       | N        | N      |
 
 ## Permission Representation
 
@@ -49,11 +51,11 @@ This can be represented by the following truth table, where Y represents _positi
 - `object` is any valid resource type.
 - `id` is any valid UUID v4.
 - `id` is included in the permission syntax, however only scopes may use `id` to specify a specific object.
-- `action` is `create`, `read`, `modify`, or `delete`.
+- `action` is typically `create`, `read`, `modify`, `delete`, but you can define other verbs as needed.
 
 ## Example Permissions
 
-- `+site.*.*.read`: allowed to perform the `read` action against all objects of type `app` in a given Coder deployment.
+- `+site.app.*.read`: allowed to perform the `read` action against all objects of type `app` in a given Coder deployment.
 - `-user.workspace.*.create`: user is not allowed to create workspaces.
 
 ## Roles
@@ -61,10 +63,10 @@ This can be represented by the following truth table, where Y represents _positi
 A _role_ is a set of permissions. When evaluating a role's permission to form an action, all the relevant permissions for the role are combined at each level. Permissions at a higher level override permissions at a lower level.
 
 The following table shows the per-level role evaluation.
-Y indicates that the role provides positive permissions, N indicates the role provides negative permissions, and _ indicates the role does not provide positive or negative permissions. YN_ indicates that the value in the cell does not matter for the access result.
+Y indicates that the role provides positive permissions, N indicates the role provides negative permissions, and _indicates the role does not provide positive or negative permissions. YN_ indicates that the value in the cell does not matter for the access result.
 
 | Role (example)  | Site | Org  | User | Result |
-| --------------- | ---- | ---- | ---- | ------ |
+|-----------------|------|------|------|--------|
 | site-admin      | Y    | YN\_ | YN\_ | Y      |
 | no-permission   | N    | YN\_ | YN\_ | N      |
 | org-admin       | \_   | Y    | YN\_ | Y      |
@@ -100,13 +102,15 @@ Example of a scope for a workspace agent token, using an `allow_list` containing
     }
 ```
 
-# Testing
+## Testing
 
 You can test outside of golang by using the `opa` cli.
 
 **Evaluation**
 
-opa eval --format=pretty 'false' -d policy.rego -i input.json
+```bash
+opa eval --format=pretty "data.authz.allow" -d policy.rego -i input.json
+```
 
 **Partial Evaluation**
 
